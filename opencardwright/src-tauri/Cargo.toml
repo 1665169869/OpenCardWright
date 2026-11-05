@@ -1,0 +1,36 @@
+[package]
+name = "opencardwright"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "AGPL-3.0-or-later"
+description = "Open-source card issuing console for 125 kHz hotel door locks"
+
+[workspace]
+members = ["crates/ocw-device", "crates/ocw-store"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+argon2 = "0.5"
+# argon2 的 SaltString::generate 需要一个带 getrandom 的 OsRng
+rand_core = { version = "0.6", features = ["getrandom"] }
+ocw-device = { path = "crates/ocw-device" }
+ocw-store = { path = "crates/ocw-store" }
+
+[features]
+# 发布构建必须带上：不打这个 feature，程序会当成 dev 壳去连 devUrl（localhost:5173），
+# 而不是加载内嵌的 dist 资源。`tauri build` 会自动带；手工 cargo build 要显式加。
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

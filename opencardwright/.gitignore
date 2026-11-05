@@ -1,0 +1,20 @@
+# 构建产物
+dist/
+node_modules/
+src-tauri/target/
+src-tauri/resources/sdk/
+release/
+.tmp/
+
+# 运行时数据（绝不入库）
+*.db
+*.db-wal
+*.db-shm
+*.keyloom
+logs/
+
+# 编辑器
+.vs/
+.vscode/
+.idea/
+*.user

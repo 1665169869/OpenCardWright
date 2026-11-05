@@ -1,0 +1,322 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Alert, App as AntdApp, Button, Layout, Space, Spin, Tabs, Tag, Typography } from 'antd'
+import {
+  api,
+  describeError,
+  formatCardNo,
+  formatTime,
+  isAdmin,
+  type AppInfo,
+  type AuthStatus,
+  type CardNoStatus,
+  type ExpiringCard,
+  type ReminderSettings,
+} from './api'
+import AuthGate from './pages/AuthGate'
+import ReadCard from './pages/ReadCard'
+import RoomManager from './pages/RoomManager'
+import AdminCards from './pages/AdminCards'
+import DevicePanel from './pages/DevicePanel'
+import Settings from './pages/Settings'
+import ExpiryBell from './components/ExpiryBell'
+import { playAlert, unlockSound } from './utils/sound'
+
+const { Header, Content } = Layout
+const { Title, Text } = Typography
+
+/** 到期提醒轮询间隔：30 秒。 */
+const REMINDER_POLL_MS = 30_000
+
+export default function App() {
+  const { notification } = AntdApp.useApp()
+  const [auth, setAuth] = useState<AuthStatus | null>(null)
+  const [bootError, setBootError] = useState<string | null>(null)
+  const [info, setInfo] = useState<AppInfo | null>(null)
+  const [status, setStatus] = useState<CardNoStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  // 房间列表的版本号：房间页一变就 +1，让发卡页/管理卡页重新拉列表
+  const [roomsVersion, setRoomsVersion] = useState(0)
+
+  // 到期提醒
+  const [reminder, setReminder] = useState<ReminderSettings | null>(null)
+  const [reminders, setReminders] = useState<ExpiringCard[]>([])
+  const alerted = useRef<Set<number>>(new Set())
+
+  // 第一次点击任何地方就解锁音频（浏览器自动播放策略）
+  useEffect(() => {
+    const handler = () => {
+      unlockSound()
+      document.removeEventListener('pointerdown', handler)
+    }
+    document.addEventListener('pointerdown', handler)
+    return () => document.removeEventListener('pointerdown', handler)
+  }, [])
+
+  useEffect(() => {
+    api
+      .authStatus()
+      .then(setAuth)
+      .catch((e: unknown) => setBootError(describeError(e)))
+  }, [])
+
+  const refreshStatus = useCallback(() => {
+    api
+      .cardNoStatus()
+      .then(setStatus)
+      .catch(() => setStatus(null))
+  }, [])
+
+  const refreshInfo = useCallback(() => {
+    api
+      .appInfo()
+      .then(setInfo)
+      .catch((e: unknown) => setError(describeError(e)))
+    refreshStatus()
+  }, [refreshStatus])
+
+  const loggedIn = auth?.loggedIn === true
+  useEffect(() => {
+    if (loggedIn) refreshInfo()
+  }, [loggedIn, refreshInfo])
+
+  // 登录后加载提醒设置
+  useEffect(() => {
+    if (!loggedIn) {
+      setReminder(null)
+      setReminders([])
+      return
+    }
+    api
+      .getReminderSettings()
+      .then(setReminder)
+      .catch(() => setReminder(null))
+  }, [loggedIn])
+
+  // 到期提醒轮询：只有开提醒才跑，避免无谓的数据库查询
+  useEffect(() => {
+    if (!loggedIn || !reminder?.enabled) {
+      setReminders([])
+      return
+    }
+    let alive = true
+
+    const tick = async () => {
+      try {
+        const list = await api.expiringCards(reminder.minutes)
+        if (!alive) return
+        setReminders(list)
+        for (const c of list) {
+          if (alerted.current.has(c.issuanceId)) continue
+          alerted.current.add(c.issuanceId)
+          const expired = new Date(c.expiresAt).getTime() < Date.now()
+          notification.warning({
+            key: `expiry-${c.issuanceId}`,
+            message: `${expired ? '客房卡已过期' : '客房卡即将到期'}：${c.roomNo ?? '未知房号'}`,
+            description: `${c.kind} · 卡号 ${formatCardNo(c.cardNo)} · 到期 ${formatTime(c.expiresAt)}（按发卡时间估算）`,
+            duration: 20,
+            placement: 'topRight',
+          })
+          if (reminder.sound) playAlert()
+        }
+      } catch {
+        // 轮询失败静默，下一轮再试；不要用弹窗骚扰前台
+      }
+    }
+
+    void tick()
+    const timer = window.setInterval(() => {
+      void tick()
+    }, REMINDER_POLL_MS)
+    return () => {
+      alive = false
+      window.clearInterval(timer)
+    }
+  }, [loggedIn, reminder, notification])
+
+  const onRoomsChanged = useCallback(() => {
+    setRoomsVersion((v) => v + 1)
+    refreshStatus()
+  }, [refreshStatus])
+
+  const logout = async () => {
+    try {
+      const next = await api.logout()
+      setAuth(next)
+      setInfo(null)
+      setStatus(null)
+    } catch (e) {
+      setError(describeError(e))
+    }
+  }
+
+  if (bootError) {
+    return (
+      <div style={{ padding: 48 }}>
+        <Alert type="error" showIcon message="启动失败" description={bootError} />
+      </div>
+    )
+  }
+
+  if (!auth) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>
+        <Space direction="vertical" align="center" size="small">
+          <Spin size="large" />
+          <Text type="secondary">正在检查本机状态…</Text>
+        </Space>
+      </div>
+    )
+  }
+
+  if (!auth.loggedIn) {
+    return <AuthGate auth={auth} onSuccess={setAuth} />
+  }
+
+  const admin = isAdmin(auth)
+
+  const tabs = [
+    // 房间放最前面：前台最常用的是"选房间 → 发卡/退房"，
+    // 读卡更多是偶尔核对一张卡时才用。
+    {
+      key: 'rooms',
+      label: '房间',
+      children: <RoomManager onRoomsChanged={onRoomsChanged} canAdmin={admin} />,
+    },
+    { key: 'read', label: '读卡', children: <ReadCard /> },
+  ]
+
+  if (admin) {
+    tabs.push(
+      {
+        key: 'admin',
+        label: '管理卡',
+        children: (
+          <AdminCards
+            roomsVersion={roomsVersion}
+            onChanged={() => {
+              refreshStatus()
+              refreshInfo()
+            }}
+          />
+        ),
+      },
+      { key: 'device', label: '设备', children: <DevicePanel onChanged={refreshInfo} /> },
+      {
+        key: 'settings',
+        label: '设置',
+        children: (
+          <Settings
+            onChanged={() => {
+              refreshInfo()
+              // 水位警戒线、退房后房态这些设置改完，顶部的状态条要跟着变
+              refreshStatus()
+              api
+                .getReminderSettings()
+                .then(setReminder)
+                .catch(() => undefined)
+            }}
+          />
+        ),
+      },
+    )
+  }
+
+  return (
+    <Layout style={{ minHeight: '100%' }}>
+      <Header
+        style={{
+          background: '#fff',
+          borderBottom: '1px solid #f0f0f0',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          paddingInline: 24,
+        }}
+      >
+        <Space size="middle" align="center">
+          <Title level={4} style={{ margin: 0 }}>
+            OpenCardWright
+          </Title>
+          <Text type="secondary">门锁发卡台</Text>
+          {info ? <Tag>v{info.version}</Tag> : null}
+          {info?.simulation ? <Tag color="orange">模拟设备</Tag> : info ? <Tag color="green">设备就绪</Tag> : null}
+        </Space>
+
+        <Space size="middle">
+          <ExpiryBell items={reminders} />
+          <Text
+            style={{
+              fontSize: 12,
+              color:
+                status?.level === 'blocked'
+                  ? '#cf1322'
+                  : status?.level === 'warn'
+                    ? '#d46b08'
+                    : undefined,
+              fontWeight: status && status.level !== 'normal' ? 600 : undefined,
+            }}
+            type={status && status.level !== 'normal' ? undefined : 'secondary'}
+          >
+            水位 {status ? formatCardNo(status.current) : '—'}
+            {status ? ` / 警戒 ${formatCardNo(status.warnAt)}` : ''}
+          </Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            驱动 {info?.driverSha256 ? info.driverSha256.slice(0, 12).toLowerCase() : '未识别'}
+          </Text>
+          <Tag color={admin ? 'blue' : 'default'}>
+            {auth.displayName || auth.login} · {admin ? '管理员' : '前台'}
+          </Tag>
+          <Button size="small" onClick={logout}>
+            退出
+          </Button>
+        </Space>
+      </Header>
+
+      <Content className="ocw-content">
+        {error ? (
+          <Alert type="error" showIcon style={{ marginBottom: 16 }} message="出错了" description={error} />
+        ) : null}
+
+        {info?.simulation ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="当前是模拟设备模式"
+            description="没有找到内置的 PMSLockCard.exe（或设置了 OCW_SIM）。操作会返回样本数据，便于开发与演示。注意：样本卡号是固定的，不会推进真实计数器/水位。"
+          />
+        ) : null}
+
+        {!admin ? (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="当前是前台账号"
+            description="可以读卡、发客卡、查记录；管理卡、房间维护、设备设置需要管理员账号。"
+          />
+        ) : null}
+
+        {status && status.level !== 'normal' ? (
+          <Alert
+            type={status.level === 'blocked' ? 'error' : 'warning'}
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={
+              status.level === 'blocked'
+                ? `卡号水位已到 ${formatCardNo(status.current)}，已停止发客卡`
+                : `卡号水位已过警戒线 ${formatCardNo(status.warnAt)}（当前 ${formatCardNo(status.current)}）`
+            }
+            description={
+              status.level === 'blocked'
+                ? '继续发卡会让部分旧卡被锁拒开。请先给全部门锁各刷一次复位卡，然后到「设置 → 水位」重置到低位。'
+                : '请给全部门锁各刷一次复位卡（把各房的有效卡号归零），然后到「设置 → 水位」把水位重置到低位；没刷复位就拨低，新卡会被锁当成旧卡拒开。'
+            }
+          />
+        ) : null}
+
+        <Tabs defaultActiveKey="rooms" items={tabs} />
+      </Content>
+    </Layout>
+  )
+}

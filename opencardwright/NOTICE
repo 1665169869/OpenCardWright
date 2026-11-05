@@ -1,0 +1,17 @@
+OpenCardWright
+Copyright (C) 2026 OpenCardWright contributors
+
+This product bundles a card-issuing SDK (PMSLockCard.exe / PMSLockSDK.dll) that was
+written from scratch by this project's author after reverse engineering the card
+format and the serial protocol. It is original code, released under the same
+license as the rest of this repository.
+
+The vendor reader driver (LC32RFRW.dll) is shipped alongside for interoperability
+with the hardware it was built for. It is not covered by this project's copyright
+and no warranty of any kind is given for it.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+Full license text: see LICENSE (GNU AGPL-3.0).

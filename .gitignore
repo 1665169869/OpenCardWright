@@ -1,0 +1,39 @@
+# ---------------- 依赖与构建产物 ----------------
+node_modules/
+opencardwright/node_modules/
+
+# Rust 构建目录（本项目用 CARGO_TARGET_DIR 指到 C:\ocw-target，这里兜底）
+target/
+opencardwright/src-tauri/target/
+
+# 前端构建与打包产物
+opencardwright/dist/
+opencardwright/release/
+
+# 构建脚本生成的 SDK 运行副本（由 sdk/*.cs 现编，不入库）
+opencardwright/src-tauri/resources/sdk/
+
+# ---------------- 调试 / 临时 ----------------
+.tmp/
+opencardwright/.tmp/
+*.log
+*.TMP
+*~RF*
+
+# 数据库备份（现场数据不进仓库）
+*.bak
+*.bak-*
+*.reset-bak
+*.before-*.bak
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 本地 agent 记忆
+.ai-memory/

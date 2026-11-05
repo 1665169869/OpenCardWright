@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths: ['opencardwright/**', '.github/workflows/ci.yml']
+  pull_request:
+    paths: ['opencardwright/**']
+
+defaults:
+  run:
+    working-directory: opencardwright
+
+jobs:
+  windows:
+    # 必须在 Windows 上跑：csc.exe 只有 Windows 版，Tauri 的 MSVC 目标也只有 Windows 能验
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: opencardwright/package-lock.json
+
+      # 首次提交还没有 lockfile，用 install；lockfile 入库后应改成 npm ci
+      - name: Install frontend deps
+        run: npm install --no-audit --no-fund
+
+      # 门禁 1：编译 ../sdk 并跑 27 条黄金向量（纯字节，不需要硬件）
+      - name: Build SDK + selftest gate
+        run: npm run build:sdk
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: opencardwright/src-tauri
+
+      # 门禁 2：解析器、存储、命令层的单元测试（含真实 selftest 集成测试）
+      - name: Cargo test (workspace)
+        run: cargo test --workspace
+
+      # 门禁 3：Tauri 应用本体能否编译
+      - name: Cargo check (app)
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      # 门禁 4：前端类型检查与构建
+      - name: Frontend typecheck + build
+        run: |
+          npx tsc --noEmit
+          npx vite build
