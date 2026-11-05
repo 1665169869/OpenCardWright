@@ -8,29 +8,46 @@ use ocw_store::DbConnection as Connection;
 
 use crate::auth::Session;
 
-/// 设备后端。真实机器走 `Cli`（子进程），CI/无驱动环境走 `Sim`（回放样本）。
+/// 设备后端。真实机器走 `Cli`（子进程），CI/无驱动环境走 `Sim`。
+///
+/// `Sim` 也带运行时目录：发客卡时会调用 `OCWCardBuild.exe` 离线构包并推进 `CardNo.state`，
+/// 所以模拟环境下的卡号与水位也会像真机一样自增。
 #[derive(Clone)]
 pub enum Device {
     Cli(CliDevice),
-    Sim,
+    Sim(SimDevice),
 }
 
 impl Device {
     pub fn is_sim(&self) -> bool {
-        matches!(self, Self::Sim)
+        matches!(self, Self::Sim(_))
+    }
+
+    /// 模拟设备专用：离线构一张客卡。真机返回 `None`，调用方继续走 CLI。
+    pub fn sim_issue_guest(
+        &self,
+        room_index: u8,
+        room_no: &str,
+        days: u16,
+        hours: u16,
+    ) -> Option<Result<CardSnapshot, DeviceError>> {
+        match self {
+            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours),
+            Self::Cli(_) => None,
+        }
     }
 
     pub fn read_card(&self) -> Result<CardSnapshot, DeviceError> {
         match self {
             Self::Cli(d) => d.read_card(),
-            Self::Sim => SimDevice::new().read_card(),
+            Self::Sim(d) => d.read_card(),
         }
     }
 
     pub fn issue(&self, args: &[&str]) -> Result<CardSnapshot, DeviceError> {
         match self {
             Self::Cli(d) => d.issue(args),
-            Self::Sim => {
+            Self::Sim(_) => {
                 let sample = if args.contains(&"install") {
                     ocw_device::sim::INSTALL_JSON
                 } else {
@@ -44,14 +61,14 @@ impl Device {
     pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
         match self {
             Self::Cli(d) => d.selftest(),
-            Self::Sim => SimDevice::new().selftest(),
+            Self::Sim(d) => d.selftest(),
         }
     }
 
     pub fn probe_ports(&self) -> Result<Vec<PortProbe>, DeviceError> {
         match self {
             Self::Cli(d) => d.probe_ports(),
-            Self::Sim => SimDevice::new().probe_ports(),
+            Self::Sim(d) => d.probe_ports(),
         }
     }
 }
@@ -59,11 +76,11 @@ impl Device {
 /// 按运行时目录构造设备。`OCW_SIM=1` 或 SDK 不存在时退化为模拟设备。
 pub fn build_device(runtime_dir: &Path, port: u8) -> Device {
     if std::env::var_os("OCW_SIM").is_some() {
-        return Device::Sim;
+        return Device::Sim(SimDevice::at(runtime_dir));
     }
     let exe = runtime_dir.join("PMSLockCard.exe");
     if !exe.is_file() {
-        return Device::Sim;
+        return Device::Sim(SimDevice::at(runtime_dir));
     }
     Device::Cli(CliDevice::new(
         exe,
@@ -109,7 +126,7 @@ impl AppState {
     pub fn device(&self) -> Device {
         match self.slot.lock() {
             Ok(s) => s.device.clone(),
-            Err(_) => Device::Sim,
+            Err(_) => Device::Sim(SimDevice::default()),
         }
     }
 

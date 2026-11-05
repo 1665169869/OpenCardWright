@@ -84,7 +84,7 @@ export default function AuthGate({
             <Text type="secondary">
               {firstRun
                 ? '这台机器还没有账号。请为超级管理员 admin 设置密码，之后用它管理房间、管理卡和设备。'
-                : '发卡台需要登录后使用。默认管理员账号是 admin。'}
+                : '开源酒店门锁发卡台：房间格子视图与房态管理、客房卡与管理卡发行、续住与退房、到期提醒。所有数据只保存在本机。'}
             </Text>
           </div>
 

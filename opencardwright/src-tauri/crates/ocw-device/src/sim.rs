@@ -29,10 +29,15 @@ pub const SELFTEST_BAD: &str = "自检结果: 26 通过, 1 失败\n";
 /// 两个口，第二个能用。
 pub const PORTS_TEXT: &str = "COM6  可打开但异常  读卡器握手失败\nCOM7  可用   读卡器=4E57520492008A7F\n";
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct SimDevice {
     /// 下一次 `read_card` 返回哪个样本；None 用默认的日租卡。
     pub next_read: Option<&'static str>,
+    /// 运行时目录（含 `OCWCardBuild.exe` 与 `CardNo.state`）。
+    /// 给了它，`issue_guest` 就会像真机一样**离线构包并推进计数器**；没给则退回固定样本。
+    pub runtime: Option<std::path::PathBuf>,
+    /// 计数器起点（CardNo.state 缺失时用）
+    pub start: u16,
 }
 
 impl SimDevice {
@@ -40,8 +45,66 @@ impl SimDevice {
         Self::default()
     }
 
+    /// 绑定运行时目录：模拟发卡会用这里的构包器和计数器。
+    pub fn at(runtime: &std::path::Path) -> Self {
+        Self {
+            runtime: Some(runtime.to_path_buf()),
+            start: 0x2403,
+            ..Self::default()
+        }
+    }
+
     pub fn read_card(&self) -> Result<CardSnapshot, DeviceError> {
         parse::parse_card(self.next_read.unwrap_or(GUEST_DAY_JSON), 0)
+    }
+
+    /// 模拟发卡：调用 `OCWCardBuild.exe`（内部用 SDK 的 CardBuilder + CardNoStore）。
+    ///
+    /// 返回 `None` 表示"没有可用的构包器"，调用方应退回固定样本。
+    pub fn issue_guest(
+        &self,
+        room_index: u8,
+        room_no: &str,
+        days: u16,
+        hours: u16,
+    ) -> Option<Result<CardSnapshot, DeviceError>> {
+        let dir = self.runtime.as_ref()?;
+        let exe = dir.join("OCWCardBuild.exe");
+        if !exe.is_file() {
+            return None;
+        }
+
+        let state = dir.join("CardNo.state");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--state")
+            .arg(&state)
+            .arg("--start")
+            .arg(format!("{:04X}", self.start))
+            .arg("--index")
+            .arg(room_index.to_string());
+        if hours > 0 {
+            cmd.arg("--hours").arg(hours.to_string());
+        } else {
+            cmd.arg("--days").arg(days.to_string());
+        }
+        // 不弹黑框（和 CLI 设备保持一致）
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+
+        let out = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let raw = json_field(&text, "raw")?;
+        let card_no = json_field(&text, "cardNo")?;
+
+        // 复用 CLI 的 JSON 形状，交给现有解析器，避免这里再造一份样本结构
+        let kind = if hours > 0 { "钟点客卡" } else { "日租客卡" };
+        let json = format!(
+            r#"{{"ok":true,"card":{{"kind":"{kind}","room":"{room_no}","roomIndex":{room_index},"days":{days},"hours":{hours},"cardNo":"{card_no}","raw":"{raw}"}}}}"#
+        );
+        Some(parse::parse_card(&json, 0))
     }
 
     pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
@@ -51,6 +114,22 @@ impl SimDevice {
     pub fn probe_ports(&self) -> Result<Vec<PortProbe>, DeviceError> {
         Ok(parse::parse_ports(PORTS_TEXT))
     }
+}
+
+/// 从构包器的 JSON 里抠一个字符串/数字字段（输出形状是我们自己定的，够用）。
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":\"");
+    if let Some(start) = text.find(&needle) {
+        let rest = &text[start + needle.len()..];
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    // 数字字段（roomIndex）
+    let needle = format!("\"{key}\":");
+    let start = text.find(&needle)? + needle.len();
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c == ',' || c == '}')?;
+    Some(rest[..end].trim().to_string())
 }
 
 #[cfg(test)]

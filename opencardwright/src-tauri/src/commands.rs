@@ -278,6 +278,9 @@ pub async fn issue_install_card(
     let db = state.db.clone();
     let room_no = room_no.trim().to_string();
 
+    // 写卡前统一先读卡：没卡就别进设备层才发现
+    pre_read_card(&device)?;
+
     blocking(move || {
         let room = {
             let conn = lock_db(&db)?;
@@ -355,6 +358,29 @@ pub async fn probe_ports(
     require_login(&state)?;
     let device = state.device();
     blocking(move || Ok(device.probe_ports()?)).await
+}
+
+/// 写卡前统一先读一次卡。
+///
+/// 发卡 / 续住 / 安装卡 / 管理卡都必须先过这一步：
+/// 一是确认读卡器上确实有卡（否则错误会在设备层才冒出来，提示很含糊），
+/// 二是把原卡信息打进日志，方便排查"这次到底写的是哪张卡"。
+fn pre_read_card(device: &crate::state::Device) -> Result<CardSnapshot, CommandError> {
+    match device.read_card() {
+        Ok(card) => {
+            let no = card
+                .card_no
+                .map(|v| format!("0x{v:04X}"))
+                .unwrap_or_else(|| "无卡号".to_string());
+            eprintln!("[write] 写卡前预读：{} · {no}", card.kind_label);
+            Ok(card)
+        }
+        Err(e) => Err(CommandError::new(
+            e.exit_code(),
+            format!("写卡前读卡失败：{e}"),
+            "先把卡放到读卡器上，确认串口没被原门锁软件占用，然后重试",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------- 管理卡
@@ -479,6 +505,9 @@ pub async fn issue_admin_card(
     let label = request.label().to_string();
     let device = state.device();
     let db = state.db.clone();
+
+    // 写卡前统一先读卡
+    pre_read_card(&device)?;
 
     blocking(move || {
         let args = request.to_args()?;
@@ -940,12 +969,24 @@ pub async fn issue_guest(
             ));
         }
 
+        // 4) 写卡前统一先读卡：确认卡在机器上，并记录原卡信息
+        pre_read_card(&device)?;
+
         // 4) 发卡（设备调用期间不持锁）
         let started = Instant::now();
         let amount_text = amount.to_string();
         let flag = if use_days { "--days" } else { "--hours" };
         let args = vec!["--room", room_no.as_str(), flag, amount_text.as_str()];
-        let card = device.issue(&args)?;
+        // 模拟设备会离线构包并推进 CardNo.state；真机返回 None，继续走 CLI
+        let card = match device.sim_issue_guest(
+            room.room_index,
+            &room_no,
+            if use_days { amount } else { 0 },
+            if use_days { 0 } else { amount },
+        ) {
+            Some(res) => res?,
+            None => device.issue(&args)?,
+        };
 
         // 5) 落库（含客人身份信息；身份信息只存库，不写卡）
         {

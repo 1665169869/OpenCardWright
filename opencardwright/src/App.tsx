@@ -283,7 +283,7 @@ export default function App() {
             showIcon
             style={{ marginBottom: 16 }}
             message="当前是模拟设备模式"
-            description="没有找到内置的 PMSLockCard.exe（或设置了 OCW_SIM）。操作会返回样本数据，便于开发与演示。注意：样本卡号是固定的，不会推进真实计数器/水位。"
+            description="没有找到内置的 PMSLockCard.exe（或设置了 OCW_SIM）。发卡会用 SDK 的 CardBuilder 离线构包并推进卡号计数器（卡号、序号、字节都与真机一致），只是不会真的写卡。"
           />
         ) : null}
 

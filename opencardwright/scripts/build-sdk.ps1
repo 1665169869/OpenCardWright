@@ -98,6 +98,17 @@ Invoke-Csc $csc (@(
 ))
 Write-Ok 'PMSLockCard.exe'
 
+# 模拟设备用的离线构包器：只调用 SDK 的 CardBuilder / CardNoStore，不碰硬件。
+# 有了它，OCW_SIM 下的发卡也会像真机一样推进卡号计数器。
+Write-Step '编译 OCWCardBuild.exe（模拟设备离线构包）'
+$cardBuild = Join-Path $outDir 'OCWCardBuild.exe'
+$cardBuildSrc = Join-Path $productRoot 'tools\CardBuild.cs'
+Invoke-Csc $csc (@(
+    '/nologo', '/target:exe', '/platform:x86', '/codepage:65001', '/warn:4', '/nowarn:1591',
+    "/out:$cardBuild", "/r:$dll", $cardBuildSrc
+))
+Write-Ok 'OCWCardBuild.exe'
+
 # ---------------------------------------------------------------- 资源
 
 Write-Step '复制运行资源'
