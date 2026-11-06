@@ -160,6 +160,8 @@ fn main() {
             commands::card_history,
             commands::export_issuances_csv,
             commands::import_rooms,
+            commands::get_onboarding_status,
+            commands::complete_onboarding,
             commands::get_checkout_status,
             commands::set_checkout_status,
             commands::log_frontend,

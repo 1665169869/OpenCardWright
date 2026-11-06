@@ -234,6 +234,12 @@ export interface BackupSettings {
   dir: string
 }
 
+/** 首启向导状态：`done=false` 才需要弹。 */
+export interface OnboardingStatus {
+  done: boolean
+  rooms: number
+}
+
 /** 房间导入结果 */
 export interface ImportReport {
   added: number
@@ -449,6 +455,11 @@ export const api = {
     invoke<BackupResult>('backup_database', { dir: dir ?? null }),
   /** 列出已有备份（管理员） */
   listBackups: () => invoke<BackupEntry[]>('list_backups'),
+  /** 是否需要跑首启向导 */
+  getOnboardingStatus: () => invoke<OnboardingStatus>('get_onboarding_status'),
+  /** 标记向导已完成（"跳过"也调它，免得每次开机都弹） */
+  completeOnboarding: () => invoke<void>('complete_onboarding'),
+
   /** 导入初始房间（管理员）：传字节，后端按后缀识别 CSV / ini */
   importRooms: (fileName: string, bytes: number[]) =>
     invoke<ImportReport>('import_rooms', { fileName, bytes }),

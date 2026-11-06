@@ -34,6 +34,7 @@ import {
 import AuthGate from './pages/AuthGate'
 import ReadCard from './pages/ReadCard'
 import Logs from './pages/Logs'
+import FirstRunWizard from './components/FirstRunWizard'
 import RoomManager from './pages/RoomManager'
 import AdminCards from './pages/AdminCards'
 import Settings from './pages/Settings'
@@ -63,6 +64,8 @@ export default function App() {
   const [reminder, setReminder] = useState<ReminderSettings | null>(null)
   const [reminders, setReminders] = useState<ExpiringCard[]>([])
   const alerted = useRef<Set<number>>(new Set())
+  /** 首启向导：登录后查一次，只在空库且没做过时弹 */
+  const [needWizard, setNeedWizard] = useState(false)
 
   // 第一次点击任何地方就解锁音频（浏览器自动播放策略）
   useEffect(() => {
@@ -100,6 +103,18 @@ export default function App() {
   useEffect(() => {
     if (loggedIn) refreshInfo()
   }, [loggedIn, refreshInfo])
+
+  // 登录后查一次首启向导状态（只在"没做过"时弹）
+  useEffect(() => {
+    if (!loggedIn) {
+      setNeedWizard(false)
+      return
+    }
+    api
+      .getOnboardingStatus()
+      .then((s) => setNeedWizard(!s.done))
+      .catch(() => setNeedWizard(false))
+  }, [loggedIn])
 
   // 登录后加载提醒设置
   useEffect(() => {
@@ -356,6 +371,7 @@ export default function App() {
         ) : null}
 
         <Tabs defaultActiveKey="rooms" items={tabs} />
+        <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
       </Content>
     </Layout>
   )

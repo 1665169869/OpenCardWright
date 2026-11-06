@@ -774,7 +774,23 @@ export default function RoomManager({
           {notice ? <Alert type="success" showIcon message={notice} /> : null}
 
           {visible.length === 0 ? (
-            <Empty description="没有符合条件的房间" />
+            // 空库和"筛空了"是两件事：空库要给下一步怎么做，不能让前台以为软件坏了
+            rooms.length === 0 ? (
+              <Empty
+                description={
+                  <Space direction="vertical" size={4}>
+                    <Text>还没有房间。</Text>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {canAdmin
+                        ? '到 设置 → 房间 导入房号表（CSV / ini），或点右上角「新增房间」一个个加。'
+                        : '请让管理员在 设置 → 房间 导入房号表，或先新增房间。'}
+                    </Text>
+                  </Space>
+                }
+              />
+            ) : (
+              <Empty description="没有符合筛选条件的房间" />
+            )
           ) : (
             <div
               style={{

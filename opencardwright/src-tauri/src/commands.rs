@@ -2978,6 +2978,58 @@ pub async fn import_rooms(
     .await
 }
 
+// ---------------------------------------------------------------- 首启向导
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingStatus {
+    pub done: bool,
+    pub rooms: i64,
+}
+
+/// 是否需要跑首启向导。
+///
+/// 判定带兼容分支：没有 `onboardingDone` 这个 setting 但库里已有房间 → 视为已完成，
+/// 免得升级用户一开机就被向导拦住。
+#[tauri::command]
+pub async fn get_onboarding_status(
+    state: State<'_, AppState>,
+) -> Result<OnboardingStatus, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let flag = ocw_store::get_setting(&conn, "onboardingDone")?;
+        let rooms = ocw_store::list_rooms(&conn)?.len() as i64;
+        let done = match flag.as_deref() {
+            Some(v) => v == "1",
+            None => rooms > 0,
+        };
+        Ok(OnboardingStatus { done, rooms })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn complete_onboarding(state: State<'_, AppState>) -> Result<(), CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_setting(&conn, "onboardingDone", "1")?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "complete_onboarding",
+            None,
+            None,
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3121,6 +3173,7 @@ mod tests {
         ("list_issuances", Level::Login),
         ("list_audits", Level::Login),
         ("card_history", Level::Login),
+        ("get_onboarding_status", Level::Login),
         // 管理员
         ("set_port", Level::Admin),
         ("create_room", Level::Admin),
@@ -3156,6 +3209,7 @@ mod tests {
         ("export_diagnostics", Level::Admin),
         ("export_issuances_csv", Level::Admin),
         ("import_rooms", Level::Admin),
+        ("complete_onboarding", Level::Admin),
     ];
 
     /// 从源码里按 `#[tauri::command]` 切出每个命令的函数名与函数体（到顶格 `}` 为止）。
@@ -3232,8 +3286,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (34, 21, 6));
-        assert_eq!(command_bodies().len(), 61, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (35, 22, 6));
+        assert_eq!(command_bodies().len(), 63, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {
