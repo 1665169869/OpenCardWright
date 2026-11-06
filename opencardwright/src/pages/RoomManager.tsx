@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   AppstoreOutlined,
+  CalendarOutlined,
   CheckSquareOutlined,
   CloseCircleOutlined,
   DeleteOutlined,
@@ -441,6 +442,20 @@ export default function RoomManager({
     }
   }
 
+  /** 预定房间：只把房态改成「预定房」，不记预定时间、不写卡（Q-201 已定 A）。 */
+  const reserveRoom = async (room: Room) => {
+    setNotice(null)
+    setError(null)
+    try {
+      await api.setRoomStatus(room.roomNo, 'reserved')
+      await reload()
+      onRoomsChanged?.()
+      setNotice(`${room.roomNo} 已标记为预定房；预定房不能发卡，客人到了再改成空净房发卡。`)
+    } catch (e) {
+      setError(describeError(e))
+    }
+  }
+
   const doInstall = async () => {
     if (!active) return
     const room = active
@@ -620,6 +635,13 @@ export default function RoomManager({
               ),
             },
           ]),
+      // 房态 key 是 `reserved`（schema.sql 的 room_status 表），不是 booked —— 写错会被后端拒成「未知房态」
+      {
+        key: 'reserve',
+        icon: <CalendarOutlined />,
+        label: room.status === 'reserved' ? '已是预定房' : '预定房间',
+        disabled: room.status === 'reserved',
+      },
       { key: 'issue', icon: <IdcardOutlined />, label: '发行房间门卡', disabled: !canIssueCard },
       { key: 'renew', icon: <FieldTimeOutlined />, label: '续住写卡', disabled: !canIssueCard },
       {
@@ -786,6 +808,8 @@ export default function RoomManager({
                           setIssueRoom(room)
                         } else if (key === 'move') {
                           void openMove(room)
+                        } else if (key === 'reserve') {
+                          void reserveRoom(room)
                         }
                       },
                     }}
