@@ -1272,7 +1272,7 @@ fn row_to_room_type(r: &Row<'_>) -> rusqlite::Result<RoomType> {
 pub fn list_room_types(conn: &Connection) -> Result<Vec<RoomType>> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.name, t.sort_order, t.created_at, t.color,
-                (SELECT COUNT(*) FROM room r WHERE r.room_type_id = t.id)
+                (SELECT COUNT(*) FROM room r WHERE r.room_type_id = t.id AND r.active = 1)
            FROM room_type t ORDER BY t.sort_order, t.id",
     )?;
     let rows = stmt.query_map([], row_to_room_type)?;
@@ -1378,7 +1378,7 @@ pub fn rename_room_type(conn: &Connection, id: i64, name: &str) -> Result<()> {
 /// 删除房型。仍有房间在用就拒绝 —— 避免房间悄无声息地掉分类。
 pub fn delete_room_type(conn: &Connection, id: i64) -> Result<()> {
     let used: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM room WHERE room_type_id = ?1",
+        "SELECT COUNT(*) FROM room WHERE room_type_id = ?1 AND active = 1",
         params![id],
         |r| r.get(0),
     )?;
@@ -1387,6 +1387,11 @@ pub fn delete_room_type(conn: &Connection, id: i64) -> Result<()> {
             "还有 {used} 个房间使用该房型，先把它们改到别的房型再删"
         )));
     }
+    // 只剩已逻辑删除的房间在引用它：先摘掉引用再删，否则外键挡住（且这些房不展示，摘掉无副作用）
+    conn.execute(
+        "UPDATE room SET room_type_id = NULL WHERE room_type_id = ?1",
+        params![id],
+    )?;
     conn.execute("DELETE FROM room_type WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -2287,6 +2292,36 @@ mod tests {
         assert!(err.to_string().contains("不是 OpenCardWright"), "错误文案要指明原因：{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 房型的「N 间」必须排除已逻辑删除的房间（否则删过房的酒店数字永远对不上）。
+    #[test]
+    fn room_type_count_excludes_deleted_room() {
+        let (conn, path) = temp_db();
+        let t = insert_room_type(&conn, "大床房", 0).unwrap();
+        insert_room(&conn, "701", Some(71), None, None, Some(t.id)).unwrap();
+        assert_eq!(list_room_types(&conn).unwrap()[0].room_count, 1);
+
+        deactivate_room(&conn, "701").unwrap();
+        assert_eq!(
+            list_room_types(&conn).unwrap()[0].room_count,
+            0,
+            "逻辑删除的房间不该再算进房型间数"
+        );
+        cleanup(conn, path);
+    }
+
+    /// 房间全删光后，该房型应当可以删除（占用检查与展示口径一致）。
+    #[test]
+    fn deleted_room_frees_room_type() {
+        let (conn, path) = temp_db();
+        let t = insert_room_type(&conn, "标间", 0).unwrap();
+        insert_room(&conn, "702", Some(72), None, None, Some(t.id)).unwrap();
+        assert!(delete_room_type(&conn, t.id).is_err(), "在用房型不该能删");
+
+        deactivate_room(&conn, "702").unwrap();
+        delete_room_type(&conn, t.id).expect("房间已删，房型应可删");
+        cleanup(conn, path);
     }
 
 }
