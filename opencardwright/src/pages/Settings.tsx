@@ -31,6 +31,7 @@ import {
 import { tryPreview } from '../utils/sound'
 import PasswordRules from '../components/PasswordRules'
 import DevicePanel from './DevicePanel'
+import RoomsPanel from './RoomsPanel'
 import { confirmIssue, passwordIssues } from '../utils/password'
 import { loginIssue, textIssue } from '../utils/validate'
 import { ICON_CHOICES, statusIcon } from '../components/StatusIcon'
@@ -52,6 +53,7 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
           { key: 'roomstatus', label: '房态', children: <RoomStatusPanel onChanged={onChanged} /> },
           { key: 'water', label: '水位', children: <WaterPanel onChanged={onChanged} /> },
+          { key: 'rooms', label: '房间', children: <RoomsPanel onChanged={onChanged} /> },
           { key: 'backup', label: '备份', children: <BackupPanel onChanged={onChanged} /> },
         ]}
       />

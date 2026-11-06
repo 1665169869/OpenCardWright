@@ -2933,6 +2933,51 @@ pub async fn export_issuances_csv(
     .await
 }
 
+// ---------------------------------------------------------------- 房间导入
+
+/// 导入房间（管理员）：前端读文件字节传进来（本机没有文件选择插件）。
+#[tauri::command]
+pub async fn import_rooms(
+    state: State<'_, AppState>,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<crate::room_import::ImportReport, CommandError> {
+    const MAX_BYTES: usize = 2 * 1024 * 1024;
+    let me = require_admin(&state)?;
+    if bytes.is_empty() {
+        return Err(CommandError::new(1, "文件是空的", "选择 CSV 或 ini 文件"));
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(CommandError::new(
+            1,
+            "文件过大（房间表通常只有几 KB）",
+            "确认选对了文件",
+        ));
+    }
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let report = crate::room_import::import_bytes(&conn, &file_name, &bytes)
+            .map_err(|m| CommandError::new(1, m, "确认文件是 CSV（房号,序号,房型,楼层）或 ini（房号=序号）"))?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "import_rooms",
+            None,
+            Some(&format!(
+                "added={} revived={} skipped={} failed={}",
+                report.added,
+                report.revived,
+                report.skipped,
+                report.failed.len()
+            )),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(report)
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3110,6 +3155,7 @@ mod tests {
         ("import_backup_file", Level::Admin),
         ("export_diagnostics", Level::Admin),
         ("export_issuances_csv", Level::Admin),
+        ("import_rooms", Level::Admin),
     ];
 
     /// 从源码里按 `#[tauri::command]` 切出每个命令的函数名与函数体（到顶格 `}` 为止）。
@@ -3186,8 +3232,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (33, 21, 6));
-        assert_eq!(command_bodies().len(), 60, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (34, 21, 6));
+        assert_eq!(command_bodies().len(), 61, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {

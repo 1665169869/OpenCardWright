@@ -234,6 +234,14 @@ export interface BackupSettings {
   dir: string
 }
 
+/** 房间导入结果 */
+export interface ImportReport {
+  added: number
+  revived: number
+  skipped: number
+  failed: Array<{ line: number; reason: string }>
+}
+
 /** 诊断包导出结果：zip 路径、大小、以及"压缩失败"等告警。 */
 export interface DiagnosticsResult {
   path: string
@@ -441,6 +449,9 @@ export const api = {
     invoke<BackupResult>('backup_database', { dir: dir ?? null }),
   /** 列出已有备份（管理员） */
   listBackups: () => invoke<BackupEntry[]>('list_backups'),
+  /** 导入初始房间（管理员）：传字节，后端按后缀识别 CSV / ini */
+  importRooms: (fileName: string, bytes: number[]) =>
+    invoke<ImportReport>('import_rooms', { fileName, bytes }),
   /** 导出诊断包（管理员）：脱敏库副本 + 清单 + 日志，打包成 zip */
   exportDiagnostics: () => invoke<DiagnosticsResult>('export_diagnostics'),
   /** 用备份覆盖当前库（管理员）：先只读校验，再把当前库另存为 .before-restore-*.bak */

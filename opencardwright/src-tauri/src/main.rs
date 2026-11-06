@@ -9,6 +9,7 @@ mod logging;
 #[cfg(debug_assertions)]
 mod demo_import;
 mod provision;
+mod room_import;
 mod rules;
 mod state;
 
@@ -158,6 +159,7 @@ fn main() {
             commands::list_audits,
             commands::card_history,
             commands::export_issuances_csv,
+            commands::import_rooms,
             commands::get_checkout_status,
             commands::set_checkout_status,
             commands::log_frontend,
