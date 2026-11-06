@@ -22,7 +22,7 @@ import {
   api,
   describeError,
   formatCardNo,
-  formatTime,
+  formatExpiry,
   isAdmin,
   type AppInfo,
   type AuthStatus,
@@ -131,7 +131,7 @@ export default function App() {
           notification.warning({
             key: `expiry-${c.issuanceId}`,
             message: `${expired ? '客房卡已过期' : '客房卡即将到期'}：${c.roomNo ?? '未知房号'}`,
-            description: `${c.kind} · 卡号 ${formatCardNo(c.cardNo)} · 到期 ${formatTime(c.expiresAt)}（按发卡时间估算）`,
+            description: `${c.kind} · 卡号 ${formatCardNo(c.cardNo)} · ${formatExpiry(c.expiresAt) ?? '到期时间未知'}`,
             duration: 20,
             placement: 'topRight',
           })

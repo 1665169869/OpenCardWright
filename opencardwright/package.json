@@ -1,7 +1,7 @@
 {
   "name": "opencardwright",
   "private": true,
-  "version": "2026.11.6+0036",
+  "version": "2026.11.6+0039",
   "type": "module",
   "description": "Open-source card issuing console for 125 kHz hotel door locks",
   "license": "AGPL-3.0-or-later",

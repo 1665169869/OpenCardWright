@@ -93,24 +93,27 @@ impl CardSnapshot {
         if self.raw_hex.len() != 56 {
             return self;
         }
-        // 只有被 SDK 误判成客卡的才需要纠正；空白卡（全 FF）的 B3 也是 FF，不能碰。
-        if !matches!(self.kind, CardKind::GuestDay | CardKind::GuestHour) {
-            return self;
-        }
-
         let byte = |i: usize| u8::from_str_radix(&self.raw_hex[i * 2..i * 2 + 2], 16).ok();
         let (Some(_b2), Some(b3), Some(d0)) = (byte(2), byte(3), byte(4)) else {
             return self;
         };
-        if b3 != 0xFF {
+
+        // 只有被 SDK 误判成客卡的才需要纠正卡型；空白卡（全 FF）的 B3 也是 FF，不能碰。
+        if matches!(self.kind, CardKind::GuestDay | CardKind::GuestHour) {
+            if b3 != 0xFF {
+                return self;
+            }
+            self.kind = CardKind::Master;
+            self.kind_label = "总控卡".to_string();
+            self.room = None;
+            self.room_index = -1;
+        } else if self.kind != CardKind::Master {
+            // 复位/清除/安装/空白等其它卡型不动。
             return self;
         }
 
-        self.kind = CardKind::Master;
-        self.kind_label = "总控卡".to_string();
-        self.room = None;
-        self.room_index = -1;
-
+        // SDK 的读侧不解码总控卡时长码（实测 0x81 总控卡 → days=0, hours=0），
+        // 只要最终是总控卡，就按总控编码统一补算时长。
         match d0 & 0xC0 {
             0x40 => {
                 self.hours = (d0 & 0x3F) as i32;
@@ -590,5 +593,55 @@ mod tests {
         assert_eq!(c.kind, CardKind::GuestDay, "B3=0x00 的普通房卡不能被改写");
         assert_eq!(c.room_index, 15);
         assert_eq!(c.days, 1);
+    }
+
+    /// 真机样本（2026-11-06）：SDK 正确识别的总控卡（页1 `F0FF`）**不经过**纠错分支，
+    /// 而 SDK 读侧对总控时长码不解码（0x81 → days=0）。只要最终是总控卡，
+    /// 就必须补算时长，否则读卡页「有效期」显示「—」。
+    #[test]
+    fn sdk_recognised_master_card_gets_duration_decoded() {
+        // 页2 0x81 → 总控 1 天（SDK 原样返回 days=0, hours=0）
+        let raw = format!("5BECF0FF811024AB{}", "0".repeat(40));
+        let json = format!(
+            r#"{{"ok":true,"card":{{"kind":"总控卡","room":null,"roomIndex":-1,"days":0,"hours":0,"cardNo":"0x2410","raw":"{raw}"}}}}"#
+        );
+        let c = parse_card(&json, 0).unwrap();
+        assert_eq!(c.kind, CardKind::Master);
+        assert_eq!(c.days, 1, "SDK 识别出的总控卡也要解码天数");
+        assert_eq!(c.hours, 0);
+    }
+
+    #[test]
+    fn sdk_recognised_master_card_hour_and_month_codes() {
+        // 页2 0x42 → 总控 2 小时（客卡 0x42 是 1 小时，总控不加 1）
+        let raw_h = format!("5BECF0FF42C72BAB{}", "0".repeat(40));
+        let json_h = format!(
+            r#"{{"ok":true,"card":{{"kind":"总控卡","room":null,"roomIndex":-1,"days":0,"hours":0,"cardNo":"0x2BC7","raw":"{raw_h}"}}}}"#
+        );
+        let c = parse_card(&json_h, 0).unwrap();
+        assert_eq!(c.hours, 2, "总控小时码不加 1");
+        assert_eq!(c.days, 0);
+
+        // 页2 0xC3 → 月码 3 → 约 93 天（只用于展示）
+        let raw_m = format!("5BECF0FFC3C82BAB{}", "0".repeat(40));
+        let json_m = format!(
+            r#"{{"ok":true,"card":{{"kind":"总控卡","room":null,"roomIndex":-1,"days":0,"hours":0,"cardNo":"0x2BC8","raw":"{raw_m}"}}}}"#
+        );
+        let c = parse_card(&json_m, 0).unwrap();
+        assert_eq!(c.days, 93, "月码 ×31");
+        assert_eq!(c.hours, 0);
+    }
+
+    /// 复位卡 / 空白卡等非总控卡型不能被时长补算误伤。
+    #[test]
+    fn non_master_kinds_keep_zero_duration() {
+        // 复位卡：页2 首字节 0x00
+        let raw = format!("5BEC0A00004124AB{}", "0".repeat(40));
+        let json = format!(
+            r#"{{"ok":true,"card":{{"kind":"复位卡","room":null,"roomIndex":-1,"days":0,"hours":0,"cardNo":null,"raw":"{raw}"}}}}"#
+        );
+        let c = parse_card(&json, 0).unwrap();
+        assert_eq!(c.days, 0);
+        assert_eq!(c.hours, 0);
     }
 }

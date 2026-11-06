@@ -37,6 +37,8 @@ export interface IssuanceRecord {
   result: string
   errorCode: number | null
   createdAt: string
+  /** 到期时间（UTC ISO8601）。凡带时长的卡型都有，无时长卡型为 null。 */
+  expiresAt: string | null
   // 客人身份信息（只存库，不写卡）
   guestName: string | null
   guestGender: string | null
@@ -137,6 +139,21 @@ export interface CheckoutResult {
   roomNo: string
   cardsClosed: number
   status: string
+}
+
+/**
+ * 换房预览：源房能带走什么。
+ *
+ * `latest` 是源房最近一张仍有效的客卡记录 —— 换房时把客人信息和时长带到新房，
+ * 前台不用重填。没有有效卡时全是空值。
+ */
+export interface RoomMovePreview {
+  roomNo: string
+  cards: number
+  activeUntil: string | null
+  latest: IssuanceRecord | null
+  /** 源房当前所有有效客卡的卡号：换房前读卡核对"是不是本房原卡"用 */
+  activeCardNos: number[]
 }
 
 export interface CheckoutCardResult {
@@ -263,6 +280,8 @@ export type AdminCardRequest =
 export interface IssuedCard {
   card: CardSnapshot
   room: Room | null
+  /** 到期时间（UTC ISO8601 估算值）；无时长的卡型为 null。 */
+  expiresAt: string | null
 }
 
 /** Rust 端 `CommandError` 的结构；invoke 抛出来就是它。 */
@@ -310,6 +329,16 @@ export const api = {
   updateRoomStatusStyle: (key: string, icon: string, color: string) =>
     invoke<void>('update_room_status_style', { key, icon, color }),
   checkoutRoom: (roomNo: string) => invoke<CheckoutResult>('checkout_room', { roomNo }),
+  /** 换房第一步：查源房的有效卡 / 客人 / 到期时间（只读，不改库） */
+  roomMovePreview: (roomNo: string) =>
+    invoke<RoomMovePreview>('room_move_preview', { roomNo }),
+  /**
+   * 换房第二步：把源房全部有效客卡登记退房（+ 房态转退房态 + 审计）。
+   * 卡里的房间序号是写死的，旧卡仍能开源房的门；新房必须重新写一张卡。
+   * `cardNo` 是换房前读到的卡号，只用于审计留痕（非原卡经二次确认后同样带上）。
+   */
+  moveRoomOut: (roomNo: string, toRoomNo: string, cardNo?: number | null) =>
+    invoke<CheckoutResult>('room_move_out', { roomNo, toRoomNo, cardNo: cardNo ?? null }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
   checkoutCard: (cardNo: number) => invoke<CheckoutCardResult>('checkout_card', { cardNo }),
   /**
@@ -437,4 +466,29 @@ export function formatTime(iso: string | null | undefined): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleString('zh-CN', { hour12: false })
+}
+
+/** 本地时间 `YYYY-MM-DD HH:mm`（分钟精度）。日期时间相关展示统一用它。 */
+export function formatMinute(iso: string | null | undefined): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/**
+ * 到期时间统一文案：`有效期至 2026-11-06 12:00（按发卡时间估算）`。
+ *
+ * 全系统只有这一个地方拼这句话 —— 读卡页、退房弹窗、发卡结果、顶栏提醒都用它，
+ * 避免各处"有的显示发卡时间、有的显示到期时间、有的只有时长"。
+ *
+ * 为什么要标"估算"：卡内只有时长码，没有绝对到期时刻，锁实际从**首次刷卡**起算；
+ * 这里显示的到期时刻是按**发卡时间 + 时长**推算的。无到期时间返回 null，调用方不渲染。
+ */
+export function formatExpiry(expiresAt: string | null | undefined): string | null {
+  if (!expiresAt) return null
+  const d = new Date(expiresAt)
+  if (Number.isNaN(d.getTime())) return `有效期至 ${expiresAt}`
+  return `有效期至 ${formatMinute(expiresAt)}（按发卡时间估算）`
 }

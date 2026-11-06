@@ -1,5 +1,5 @@
 import { Badge, Button, Empty, List, Popover, Space, Tag, Typography } from 'antd'
-import { formatCardNo, formatTime, type ExpiringCard } from '../api'
+import { formatCardNo, formatExpiry, type ExpiringCard } from '../api'
 
 const { Text } = Typography
 
@@ -48,7 +48,7 @@ export default function ExpiryBell({ items }: { items: ExpiringCard[] }) {
                   <Tag color={r.expired ? 'red' : 'orange'}>{r.text}</Tag>
                 </Space>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  到期 {formatTime(c.expiresAt)}（按发卡时间估算）
+                  {formatExpiry(c.expiresAt)}
                 </Text>
               </Space>
             </List.Item>

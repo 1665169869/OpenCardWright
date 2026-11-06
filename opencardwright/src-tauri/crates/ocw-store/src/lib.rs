@@ -79,6 +79,10 @@ pub struct IssuanceRecord {
     pub result: String,
     pub error_code: Option<i64>,
     pub created_at: String,
+    /// 到期时间（UTC ISO8601）。按发卡时间 + days/hours 推算的估算值
+    /// （卡内只有时长码，锁实际从首次刷卡起算）。凡 days/hours>0 的卡型都有值，
+    /// 复位/清除/安装卡等无时长卡型为 NULL。
+    pub expires_at: Option<String>,
     // 客人身份信息（只存库，不写卡；全部可空）
     pub guest_name: Option<String>,
     pub guest_gender: Option<String>,
@@ -114,6 +118,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v4(conn)?;
     apply_v5(conn)?;
     apply_v6(conn)?;
+    apply_v7(conn)?;
     Ok(())
 }
 
@@ -241,6 +246,30 @@ fn apply_v6(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v6 → v7：到期时间统一口径。
+///
+/// v2 只给客卡回填了 expires_at，管理卡（总控卡等）虽然有 days/hours 但一直是 NULL。
+/// 现在改为「凡带时长的卡型都有到期时间」，这里把历史 NULL 记录按同一规则补上。
+///
+/// 幂等靠 `expires_at IS NULL`：已回填过的行（含 v2 回填的客卡）不会被覆写。
+/// 失效/失败记录（result != 'ok'）不动 —— 那类行没有"到期"语义。
+fn apply_v7(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE issuance
+            SET expires_at = strftime(
+                  '%Y-%m-%dT%H:%M:%SZ', created_at,
+                  CASE WHEN days > 0 THEN '+' || days || ' days'
+                       WHEN hours > 0 THEN '+' || hours || ' hours'
+                  END)
+          WHERE expires_at IS NULL
+            AND result = 'ok'
+            AND (days > 0 OR hours > 0)",
+        [],
+    )?;
+    conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (7)", [])?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 房间
 
 fn row_to_room(r: &Row<'_>) -> rusqlite::Result<Room> {
@@ -267,11 +296,13 @@ const ROOM_SELECT: &str = "SELECT r.room_no, r.room_index, r.building, r.floor, 
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
                                       AND i.card_no IS NOT NULL AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
+                                      AND i.kind IN ('日租客卡','钟点客卡') \
                                       AND i.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), \
                                   (SELECT MAX(i.expires_at) FROM issuance i \
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
                                       AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
+                                      AND i.kind IN ('日租客卡','钟点客卡') \
                                       AND i.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) \
                              FROM room r LEFT JOIN room_type t ON t.id = r.room_type_id";
 
@@ -330,6 +361,7 @@ pub fn set_room_max_cards(conn: &Connection, room_no: &str, max_cards: Option<i6
 /// 该房间当前仍有效的客卡张数（按卡号去重，已过期的算作无效）。
 ///
 /// 到期时间是按发卡时间估算的，所以这里的"有效"也是估算口径。
+/// 显式只算客卡：管理卡现在也有 expires_at，但不应计入房间占用。
 pub fn count_active_cards(conn: &Connection, room_no: &str) -> Result<i64> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(DISTINCT card_no)
@@ -339,11 +371,59 @@ pub fn count_active_cards(conn: &Connection, room_no: &str) -> Result<i64> {
             AND card_no IS NOT NULL
             AND expires_at IS NOT NULL
             AND checked_out_at IS NULL
+            AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![room_no],
         |r| r.get(0),
     )?;
     Ok(n)
+}
+
+/// 该房间最近一张**仍有效**的客卡记录。换房时用它把客人信息/时长带到新房。
+///
+/// "有效"口径与 [`count_active_cards`] 完全一致（客卡、未退房、未过期），
+/// 否则会出现"格子显示有卡、换房却查不到客人"的矛盾。
+pub fn latest_active_guest_card(
+    conn: &Connection,
+    room_no: &str,
+) -> Result<Option<IssuanceRecord>> {
+    let sql = format!(
+        "SELECT {ISSUANCE_COLUMNS} FROM issuance
+          WHERE room_no = ?1
+            AND result = 'ok'
+            AND checked_out_at IS NULL
+            AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          ORDER BY created_at DESC, id DESC LIMIT 1"
+    );
+    Ok(conn
+        .query_row(&sql, params![room_no], row_to_issuance)
+        .optional()?)
+}
+
+/// 该房间当前所有**有效客卡的卡号**（去重）。
+///
+/// 换房要先读卡核对"这张卡是不是本房的原卡"，判据就是读到的卡号在不在这个集合里。
+/// 口径与 [`count_active_cards`] / [`latest_active_guest_card`] 完全一致。
+pub fn active_guest_card_nos(conn: &Connection, room_no: &str) -> Result<Vec<u16>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT card_no FROM issuance
+          WHERE room_no = ?1
+            AND result = 'ok'
+            AND card_no IS NOT NULL
+            AND checked_out_at IS NULL
+            AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          ORDER BY card_no",
+    )?;
+    let rows = stmt.query_map(params![room_no], |r| r.get::<_, i64>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r? as u16);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- 房态
@@ -377,6 +457,7 @@ pub fn checkout_card(
             AND result = 'ok'
             AND checked_out_at IS NULL
             AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![card_no as i64],
     )?;
@@ -484,6 +565,7 @@ pub fn checkout_room(conn: &Connection, room_no: &str, dirty_status: &str) -> Re
             AND result = 'ok'
             AND checked_out_at IS NULL
             AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![room_no],
     )?;
@@ -669,13 +751,15 @@ fn row_to_issuance(r: &Row<'_>) -> rusqlite::Result<IssuanceRecord> {
         guest_address: r.get(17)?,
         guest_birth_date: r.get(18)?,
         guest_note: r.get(19)?,
+        expires_at: r.get(20)?,
     })
 }
 
 const ISSUANCE_COLUMNS: &str = "id, uuid, room_no, kind, days, hours, card_no, raw_hex, \
                                 operator_id, result, error_code, created_at, \
                                 guest_name, guest_gender, guest_id_type, guest_id_number, \
-                                guest_nation, guest_address, guest_birth_date, guest_note";
+                                guest_nation, guest_address, guest_birth_date, guest_note, \
+                                expires_at";
 
 pub struct NewIssuance<'a> {
     pub room_no: Option<&'a str>,
@@ -780,8 +864,9 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
 
     let id = conn.last_insert_rowid();
 
-    // 只有客卡有到期时间。用 SQLite 的日期运算，保证和 created_at 同格式（ISO UTC）。
-    if let Some(modifier) = expiry_modifier(new.kind, new.days, new.hours) {
+    // 凡带时长的卡型（客卡、总控卡等）都写到期时间。用 SQLite 的日期运算，
+    // 保证和 created_at 同格式（ISO UTC）。
+    if let Some(modifier) = expiry_modifier(new.days, new.hours) {
         conn.execute(
             "UPDATE issuance
                 SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, ?1)
@@ -793,15 +878,17 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
     Ok(id)
 }
 
-/// 客卡的过期偏移量（`+90 days` / `+3 hours`）。管理卡一律 None。
+/// 带时长的卡型的过期偏移量（`+90 days` / `+3 hours`）。无时长（0/0）的卡型一律 None。
 ///
 /// 注意：这是按**发卡时间**算的估算值 —— 卡内只有时长码，没有绝对到期时间，
 /// 而锁实际是从"首次刷卡"起算（见 docs/TEMIC门锁卡技术规格.md §11.1）。
-pub fn expiry_modifier(kind: &str, days: i64, hours: i64) -> Option<String> {
-    match kind {
-        "日租客卡" if days > 0 => Some(format!("+{days} days")),
-        "钟点客卡" if hours > 0 => Some(format!("+{hours} hours")),
-        _ => None,
+pub fn expiry_modifier(days: i64, hours: i64) -> Option<String> {
+    if days > 0 {
+        Some(format!("+{days} days"))
+    } else if hours > 0 {
+        Some(format!("+{hours} hours"))
+    } else {
+        None
     }
 }
 
@@ -832,6 +919,7 @@ pub fn expiring_cards(conn: &Connection, within_minutes: i64) -> Result<Vec<Expi
               WHERE room_no IS NOT NULL
                 AND expires_at IS NOT NULL
                 AND result = 'ok'
+                AND kind IN ('日租客卡','钟点客卡')
               GROUP BY room_no, kind
          )
          SELECT i.id, i.room_no, r.room_index, i.card_no, i.kind, i.expires_at, i.days, i.hours
@@ -870,6 +958,14 @@ pub fn latest_issuance_for_card(conn: &Connection, card_no: u16) -> Result<Optio
     );
     Ok(conn
         .query_row(&sql, params![card_no as i64], row_to_issuance)
+        .optional()?)
+}
+
+/// 按主键取一条发卡记录。发卡命令刚写入后用它取回 expires_at 等完整字段。
+pub fn find_issuance(conn: &Connection, id: i64) -> Result<Option<IssuanceRecord>> {
+    let sql = format!("SELECT {ISSUANCE_COLUMNS} FROM issuance WHERE id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], row_to_issuance)
         .optional()?)
 }
 
@@ -1599,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_card_gets_expiry_admin_card_does_not() {
+    fn any_card_kind_with_duration_gets_expiry() {
         let (conn, path) = temp_db();
         let guest = record_issuance(&conn, &sample_issuance(Some("220"), "日租客卡", 1, 0)).unwrap();
         let expires: Option<String> = conn
@@ -1607,22 +1703,169 @@ mod tests {
             .unwrap();
         assert!(expires.is_some(), "客卡必须有到期时间");
 
-        let admin = record_issuance(&conn, &sample_issuance(None, "复位卡", 0, 0)).unwrap();
+        // 总控卡也带时长 → 也要有到期时间（读卡页/管理卡结果统一显示）
+        let master = record_issuance(&conn, &sample_issuance(None, "总控卡", 1, 0)).unwrap();
         let expires: Option<String> = conn
-            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![admin], |r| r.get(0))
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![master], |r| r.get(0))
             .unwrap();
-        assert!(expires.is_none(), "管理卡不该有到期时间");
+        assert!(expires.is_some(), "总控卡带时长就该有到期时间");
+
+        // 无时长的管理卡仍然没有
+        let reset = record_issuance(&conn, &sample_issuance(None, "复位卡", 0, 0)).unwrap();
+        let expires: Option<String> = conn
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![reset], |r| r.get(0))
+            .unwrap();
+        assert!(expires.is_none(), "无时长的管理卡不该有到期时间");
 
         cleanup(conn, path);
     }
 
     #[test]
-    fn expiry_modifier_only_for_guest_cards() {
-        assert_eq!(expiry_modifier("日租客卡", 1, 0).as_deref(), Some("+1 days"));
-        assert_eq!(expiry_modifier("钟点客卡", 0, 3).as_deref(), Some("+3 hours"));
-        assert_eq!(expiry_modifier("复位卡", 0, 0), None);
-        assert_eq!(expiry_modifier("总控卡", 1, 0), None, "总控卡不参与到期提醒");
-        assert_eq!(expiry_modifier("日租客卡", 0, 0), None, "时长为 0 不产生到期时间");
+    fn master_card_expiry_equals_created_plus_days() {
+        let (conn, path) = temp_db();
+        let id = record_issuance(&conn, &sample_issuance(None, "总控卡", 30, 0)).unwrap();
+        let (created, expires): (String, String) = conn
+            .query_row(
+                "SELECT created_at, expires_at FROM issuance WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let expected: String = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1, '+30 days')",
+                params![created],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(expires, expected, "总控卡到期 = 发卡时间 + 天数");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn expiry_modifier_is_kind_agnostic() {
+        assert_eq!(expiry_modifier(1, 0).as_deref(), Some("+1 days"));
+        assert_eq!(expiry_modifier(0, 3).as_deref(), Some("+3 hours"));
+        assert_eq!(expiry_modifier(0, 0), None, "时长为 0 不产生到期时间");
+        assert_eq!(expiry_modifier(30, 2).as_deref(), Some("+30 days"), "天优先于小时");
+    }
+
+    #[test]
+    fn v7_backfill_fills_null_expiry_and_is_idempotent() {
+        let (conn, path) = temp_db();
+        // 直接插一条「v2 时代留下」的总控卡：有天数但没有 expires_at
+        conn.execute(
+            "INSERT INTO issuance (uuid, kind, days, hours, card_no, result, created_at)
+             VALUES (?1, '总控卡', 30, 0, 900, 'ok', '2026-01-01T00:00:00Z')",
+            params![uuid::Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        migrate(&conn).expect("迁移不应报错");
+        let first: Option<String> = conn
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first.as_deref(), Some("2026-01-31T00:00:00Z"), "v7 要补上历史总控卡");
+
+        // 再跑一次：已有值不被改写（这里把值改成明显不同的时间，确认迁移不覆盖）
+        conn.execute(
+            "UPDATE issuance SET expires_at = '2026-02-02T00:00:00Z' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        migrate(&conn).expect("重复迁移不应报错");
+        let second: Option<String> = conn
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(second.as_deref(), Some("2026-02-02T00:00:00Z"), "已有到期时间不得被覆写");
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn active_cards_and_room_stats_ignore_admin_cards() {
+        let (conn, path) = temp_db();
+        let room = insert_room(&conn, "401", Some(41), None, None, None).unwrap();
+        // 一张客卡
+        record_issuance(&conn, &sample_issuance(Some("401"), "日租客卡", 1, 0)).unwrap();
+        // 一张挂在房间上的总控卡（极端情况：将来管理卡带房号）
+        let master = record_issuance(&conn, &sample_issuance(Some("401"), "总控卡", 30, 0)).unwrap();
+        // 确保它有 expires_at，证明过滤不是靠 NULL 侥幸
+        let master_expires: Option<String> = conn
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![master], |r| r.get(0))
+            .unwrap();
+        assert!(master_expires.is_some());
+
+        assert_eq!(count_active_cards(&conn, "401").unwrap(), 1, "总控卡不计入房间有效卡");
+        assert_eq!(room.active_cards, 0, "新建房间初始为 0");
+
+        let rooms = list_rooms(&conn).unwrap();
+        let r = rooms.iter().find(|r| r.room_no == "401").unwrap();
+        assert_eq!(r.active_cards, 1, "房间格子只数客卡");
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn expiring_cards_excludes_admin_kinds() {
+        let (conn, path) = temp_db();
+        // 一条 30 分钟后到期的总控卡（带房号，模拟最坏情况）
+        conn.execute(
+            "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
+             VALUES (?1, '402', '总控卡', 1, 0, 901, 'ok',
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+30 minutes'))",
+            params![uuid::Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+
+        let cards = expiring_cards(&conn, 60).unwrap();
+        assert!(cards.is_empty(), "总控卡不该出现在到期提醒里");
+        cleanup(conn, path);
+    }
+
+    /// 换房取源房"能带走什么"：只认仍有效的客卡，过期卡/管理卡都不能带。
+    #[test]
+    fn latest_active_guest_card_skips_expired_and_admin() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "501", Some(51), None, None, None).unwrap();
+
+        // 一张已过期的客卡
+        conn.execute(
+            "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
+             VALUES (?1, '501', '日租客卡', 1, 0, 801, 'ok',
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours'))",
+            params![uuid::Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+        assert!(
+            latest_active_guest_card(&conn, "501").unwrap().is_none(),
+            "已过期的卡不能带入换房"
+        );
+
+        // 一张有效客卡（带客人信息）
+        let id = record_issuance(&conn, &sample_issuance(Some("501"), "日租客卡", 1, 0)).unwrap();
+        update_guest_identity(
+            &conn,
+            id,
+            &GuestIdentity {
+                name: Some("张三"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // 一张挂在该房的总控卡：不能盖过客卡
+        record_issuance(&conn, &sample_issuance(Some("501"), "总控卡", 30, 0)).unwrap();
+
+        let latest = latest_active_guest_card(&conn, "501").unwrap().expect("应查到有效客卡");
+        assert_eq!(latest.guest_name.as_deref(), Some("张三"));
+        assert_eq!(latest.kind, "日租客卡");
+
+        // 换房核对用的卡号集合：只含有效客卡（过期卡 801 与总控卡都不能进来）
+        let nos = active_guest_card_nos(&conn, "501").unwrap();
+        assert_eq!(nos, vec![1], "只应有那张有效客卡（sample_issuance 的卡号是 1）");
+
+        cleanup(conn, path);
     }
 
     #[test]

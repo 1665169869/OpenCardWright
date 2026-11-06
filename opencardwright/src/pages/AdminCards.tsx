@@ -18,6 +18,7 @@ import {
   dayOptions,
   describeError,
   formatCardNo,
+  formatExpiry,
   hourOptions,
   MASTER_MAX_DAYS,
   MASTER_MAX_HOURS,
@@ -268,6 +269,11 @@ export default function AdminCards({
                   children: result.room ? result.room.roomNo : '—（不适用）',
                 },
                 { key: 'cardNo', label: '卡号', children: formatCardNo(result.card.cardNo) },
+                {
+                  key: 'expiry',
+                  label: '到期',
+                  children: formatExpiry(result.expiresAt) ?? '—（无时长）',
+                },
               ]}
             />
             <div style={{ marginTop: 12 }}>

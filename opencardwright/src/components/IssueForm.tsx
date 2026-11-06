@@ -5,6 +5,7 @@ import {
   dayOptions,
   describeError,
   formatCardNo,
+  formatExpiry,
   formatTime,
   GENDERS,
   hourOptions,
@@ -32,6 +33,9 @@ export default function IssueForm({
   onIssued,
   defaultDays = 1,
   renewFrom,
+  initialGuest,
+  defaultMode = 'day',
+  moveNotice = false,
 }: {
   room: Room
   onIssued?: () => void
@@ -39,13 +43,19 @@ export default function IssueForm({
   defaultDays?: number
   /** 续住时的"当前有效期至"，只用于提示 */
   renewFrom?: string | null
+  /** 换房带入的客人信息（只存库，不写卡） */
+  initialGuest?: GuestInput
+  /** 换房带入的时长模式（日租 / 钟点） */
+  defaultMode?: Mode
+  /** 换房场景：提示旧卡仍能开源房的门，需收回 */
+  moveNotice?: boolean
 }) {
-  const [mode, setMode] = useState<Mode>('day')
+  const [mode, setMode] = useState<Mode>(defaultMode)
   const [amount, setAmount] = useState<number>(defaultDays)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<IssuedCard | null>(null)
-  const [guest, setGuest] = useState<GuestInput>({})
+  const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
 
   const setGuestField = (key: keyof GuestInput, value: string) => {
     setGuest((prev) => ({ ...prev, [key]: value }))
@@ -107,11 +117,19 @@ export default function IssueForm({
       }
     >
       <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        {moveNotice ? (
+          <Alert
+            type="warning"
+            showIcon
+            message="换房：客人信息与时长已从原房间带入"
+            description="源房已登记退房。旧卡仍能打开原房间的门，到期前请收回；这张新卡写完后请交给客人。房态不会自动变，写完请按实际改目标房房态。"
+          />
+        ) : null}
         {renewFrom ? (
           <Alert
             type="warning"
             showIcon
-            message={`续住：该房当前有效期至 ${formatTime(renewFrom)}`}
+            message={`续住：该房当前${formatExpiry(renewFrom) ?? `有效期至 ${formatTime(renewFrom)}`}`}
             description="写一张天数更长的新卡（卡号比旧卡大，门锁会认）。天数已按「剩余天数 + 1」预填，可以改。"
           />
         ) : null}
@@ -236,13 +254,18 @@ export default function IssueForm({
                 { key: 'kind', label: '卡型', children: result.card.kindLabel },
                 {
                   key: 'duration',
-                  label: '有效期',
+                  label: '时长',
                   children:
                     result.card.days > 0
                       ? `${result.card.days} 天`
                       : result.card.hours > 0
                         ? `${result.card.hours} 小时`
                         : '—',
+                },
+                {
+                  key: 'expiry',
+                  label: '到期',
+                  children: formatExpiry(result.expiresAt) ?? '—（无时长）',
                 },
                 { key: 'cardNo', label: '卡号', children: formatCardNo(result.card.cardNo) },
                 { key: 'room', label: '房号', children: room.roomNo },

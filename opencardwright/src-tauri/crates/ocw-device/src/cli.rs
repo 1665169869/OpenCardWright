@@ -199,7 +199,10 @@ fn enrich(err: DeviceError, stderr: &str) -> DeviceError {    let tail: String =
 /// CLI 是 .NET Framework 程序，写管道时用的是**控制台代码页**（中文 Windows 上是 GBK 936），
 /// 不是 UTF-8。如果直接 `read_to_string`，遇到中文会整体失败并返回空串 ——
 /// 现场表现就是"设备没有任何输出"。所以先试 UTF-8，失败再按 GBK 解。
-fn decode(bytes: &[u8]) -> String {
+///
+/// `pub` 供集成测试复用：对着真实 `PMSLockCard.exe` 的输出做端到端验证时，
+/// 必须用同一套解码逻辑，不能在测试里各自 `from_utf8_lossy`（GBK 中文会变 U+FFFD）。
+pub fn decode(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
         Err(_) => encoding_rs::GBK.decode(bytes).0.into_owned(),

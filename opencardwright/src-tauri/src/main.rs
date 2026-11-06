@@ -114,6 +114,8 @@ fn main() {
             commands::checkout_room,
             commands::checkout_card,
             commands::force_checkout_card,
+            commands::room_move_preview,
+            commands::room_move_out,
             commands::get_checkout_status,
             commands::set_checkout_status,
             commands::log_frontend,

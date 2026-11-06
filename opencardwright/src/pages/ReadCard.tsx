@@ -3,6 +3,7 @@ import { Alert, Button, Card, Space, Typography } from 'antd'
 import {
   api,
   describeError,
+  formatExpiry,
   formatTime,
   type CardReadDto,
   type RecordLookup,
@@ -52,7 +53,10 @@ export default function ReadCard() {
 
       {data ? (
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-          <CardSnapshotView card={data.card} />
+          <CardSnapshotView
+            card={data.card}
+            expiresAt={data.lookup.status === 'found' ? data.lookup.latest.expiresAt : null}
+          />
           <RecordBanner lookup={data.lookup} />
         </Space>
       ) : null}
@@ -72,6 +76,9 @@ function RecordBanner({ lookup }: { lookup: RecordLookup }) {
             <>
               <Space size="large" wrap>
                 <span>发放时间：{formatTime(lookup.latest.createdAt)}</span>
+                {formatExpiry(lookup.latest.expiresAt) ? (
+                  <span>{formatExpiry(lookup.latest.expiresAt)}</span>
+                ) : null}
                 <span>房号：{lookup.latest.roomNo ?? '—'}</span>
                 <span>卡型：{lookup.latest.kind}</span>
                 <span>结果：{lookup.latest.result}</span>

@@ -9,6 +9,7 @@ import {
   LogoutOutlined,
   PlusOutlined,
   ScanOutlined,
+  SwapOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
@@ -32,8 +33,13 @@ import {
 import {
   api,
   describeError,
+  formatCardNo,
+  formatExpiry,
   formatTime,
+  type CardReadDto,
+  type GuestInput,
   type Room,
+  type RoomMovePreview,
   type RoomStatus,
   type RoomType,
 } from '../api'
@@ -41,6 +47,7 @@ import { roomNoIssue } from '../utils/validate'
 import { statusIcon } from '../components/StatusIcon'
 import IssueForm from '../components/IssueForm'
 import { CheckoutCardModal } from '../components/CheckoutCardModal'
+import { CardSnapshotView } from '../components/CardSnapshotView'
 
 const { Text, Title } = Typography
 
@@ -113,7 +120,34 @@ export default function RoomManager({
   const [installOpen, setInstallOpen] = useState(false)
   // 发卡只从右键菜单进入，抽屉里不再放发卡表单
   const [issueRoom, setIssueRoom] = useState<Room | null>(null)
-  const [issueMode, setIssueMode] = useState<'new' | 'renew'>('new')
+  const [issueMode, setIssueMode] = useState<'new' | 'renew' | 'move'>('new')
+  /**
+   * 换房：源房 → 目标房。
+   *
+   * 流程刻意拆成两步：先看源房能带走什么（几张有效卡 / 客人是谁 / 到期时间），
+   * 选好目标房再执行"退旧房"，随后直接打开目标房的发卡表单（旧卡的房间序号是写死的，
+   * 不重新写卡客人进不了新房）。`moveFrom` 非空 = 换房弹窗打开。
+   */
+  const [moveFrom, setMoveFrom] = useState<Room | null>(null)
+  const [moveTo, setMoveTo] = useState<string | null>(null)
+  const [movePreview, setMovePreview] = useState<RoomMovePreview | null>(null)
+  const [moveBusy, setMoveBusy] = useState(false)
+  const [moveLoading, setMoveLoading] = useState(false)
+  const [moveError, setMoveError] = useState<string | null>(null)
+  /**
+   * 换房前必须读卡核对：读到的卡号在源房有效卡里才算"原卡"。
+   * 不是原卡时弹二次确认（可能是别的房间的卡、原厂卡或空白卡）。
+   */
+  const [moveRead, setMoveRead] = useState<CardReadDto | null>(null)
+  const [moveReading, setMoveReading] = useState(false)
+  const [moveReadErr, setMoveReadErr] = useState<string | null>(null)
+  const [moveForceOpen, setMoveForceOpen] = useState(false)
+  const [moveForceConfirmed, setMoveForceConfirmed] = useState(false)
+
+  /** 读到的卡是不是源房当前的有效卡（判据：卡号在源房有效卡集合里）。 */
+  const readCardNo = moveRead?.card.cardNo ?? null
+  const moveCardIsOriginal =
+    readCardNo !== null && (movePreview?.activeCardNos ?? []).includes(readCardNo)
   // 删除房间 = 逻辑删除（active=0）。二次确认用受控 Modal：antd 命令式弹窗在 React 19 下静默失效
   const [deleteTarget, setDeleteTarget] = useState<Room | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
@@ -432,6 +466,120 @@ export default function RoomManager({
     return Math.max(1, Math.ceil(left / 86_400_000) + 1)
   }
 
+  /**
+   * 换房第一步：打开弹窗并查源房能带走什么（只读）。
+   *
+   * 没有有效客卡时也允许打开 —— 弹窗里会说明"该房当前没有有效卡，换房只会做退房登记"，
+   * 免得前台以为按钮坏了。
+   */
+  const openMove = async (room: Room) => {
+    setMoveFrom(room)
+    setMoveTo(null)
+    setMovePreview(null)
+    setMoveError(null)
+    setMoveRead(null)
+    setMoveReadErr(null)
+    setMoveForceConfirmed(false)
+    setMoveForceOpen(false)
+    setMoveLoading(true)
+    try {
+      setMovePreview(await api.roomMovePreview(room.roomNo))
+    } catch (e) {
+      setMoveError(describeError(e))
+    } finally {
+      setMoveLoading(false)
+    }
+  }
+
+  /** 换房前读卡：核对客人手上的卡是不是本房原卡。 */
+  const readMoveCard = async () => {
+    setMoveReading(true)
+    setMoveReadErr(null)
+    setMoveForceConfirmed(false)
+    try {
+      setMoveRead(await api.readCard())
+    } catch (e) {
+      setMoveReadErr(describeError(e))
+      setMoveRead(null)
+    } finally {
+      setMoveReading(false)
+    }
+  }
+
+  /** 换房带入到新房的时长：按剩余有效期向上取整，至少 1。 */
+  const moveIssueDefaults = (): { mode: 'day' | 'hour'; amount: number } => {
+    const latest = movePreview?.latest
+    const mode: 'day' | 'hour' = latest?.kind === '钟点客卡' ? 'hour' : 'day'
+    if (!movePreview?.activeUntil) return { mode, amount: 1 }
+    const leftMs = new Date(movePreview.activeUntil).getTime() - Date.now()
+    const amount =
+      mode === 'hour'
+        ? Math.max(1, Math.ceil(leftMs / 3_600_000))
+        : Math.max(1, Math.ceil(leftMs / 86_400_000))
+    return { mode, amount }
+  }
+
+  /**
+   * 换房第二步：退源房 → 打开目标房发卡表单。
+   *
+   * 不退房直接发新房的话，源房的卡还挂在"有效"里，房态与占用都会乱；
+   * 只退房不写新卡的话，客人进不了新房（卡里的序号是旧房的）。
+   */
+  /** 真正的换房动作：退源房 → 转入目标房发卡表单。 */
+  const doMove = async (from: Room, target: Room) => {
+    setMoveBusy(true)
+    setMoveError(null)
+    try {
+      const res = await api.moveRoomOut(from.roomNo, target.roomNo, readCardNo)
+      setMoveFrom(null)
+      setMoveRead(null)
+      setMoveForceConfirmed(false)
+      setNotice(
+        `${from.roomNo} → ${target.roomNo}：已关闭源房 ${res.cardsClosed} 张有效卡，房态改为退房后房态；` +
+          '旧卡仍能开源房门，请收回。接着为新房写卡。',
+      )
+      await reload()
+      onRoomsChanged?.()
+      // 直接接着写新房卡：客人信息与时长从源房带入
+      setIssueMode('move')
+      setIssueRoom(target)
+    } catch (e) {
+      setMoveError(describeError(e))
+    } finally {
+      setMoveBusy(false)
+    }
+  }
+
+  const confirmMove = () => {
+    if (!moveFrom || !moveTo || !moveRead) return
+    const target = rooms.find((r) => r.roomNo === moveTo)
+    if (!target) return
+    // 不是本房原卡 → 先弹二次确认；确认后由弹窗调用 doMove
+    if (!moveCardIsOriginal && !moveForceConfirmed) {
+      setMoveForceOpen(true)
+      return
+    }
+    void doMove(moveFrom, target)
+  }
+
+  /** 换房带入的客人信息：源房最近一张有效客卡的登记信息（全部为空则不传）。 */
+  const guestFromPreview = (): GuestInput | undefined => {
+    const l = movePreview?.latest
+    if (!l) return undefined
+    const g: GuestInput = {
+      name: l.guestName ?? undefined,
+      gender: l.guestGender ?? undefined,
+      idType: l.guestIdType ?? undefined,
+      idNumber: l.guestIdNumber ?? undefined,
+      nation: l.guestNation ?? undefined,
+      address: l.guestAddress ?? undefined,
+      birthDate: l.guestBirthDate ?? undefined,
+      note: l.guestNote ?? undefined,
+    }
+    const has = Object.values(g).some((v) => (v ?? '').trim() !== '')
+    return has ? g : undefined
+  }
+
   const typeOptions = roomTypes.map((t) => ({ value: t.id, label: t.name }))
 
   /** 房态下拉的选项（带房态自己的图标与颜色），筛选与批量改房态共用 */
@@ -474,6 +622,12 @@ export default function RoomManager({
           ]),
       { key: 'issue', icon: <IdcardOutlined />, label: '发行房间门卡', disabled: !canIssueCard },
       { key: 'renew', icon: <FieldTimeOutlined />, label: '续住写卡', disabled: !canIssueCard },
+      {
+        key: 'move',
+        icon: <SwapOutlined />,
+        label: room.activeCards > 0 ? '换房' : '换房（该房当前无有效卡）',
+        disabled: room.activeCards === 0,
+      },
       { type: 'divider' },
       { key: 'checkoutCard', icon: <LogoutOutlined />, label: '持卡退房' },
       { key: 'checkoutNoCard', icon: <CloseCircleOutlined />, label: '无卡退房' },
@@ -630,6 +784,8 @@ export default function RoomManager({
                         } else if (key === 'renew') {
                           setIssueMode('renew')
                           setIssueRoom(room)
+                        } else if (key === 'move') {
+                          void openMove(room)
                         }
                       },
                     }}
@@ -841,7 +997,9 @@ export default function RoomManager({
         open={issueRoom !== null}
         title={
           issueRoom
-            ? `${issueMode === 'renew' ? '续住写卡' : '发行房间门卡'} · ${issueRoom.roomNo}`
+            ? `${
+                issueMode === 'renew' ? '续住写卡' : issueMode === 'move' ? '换房写卡' : '发行房间门卡'
+              } · ${issueRoom.roomNo}`
             : ''
         }
         footer={null}
@@ -858,8 +1016,17 @@ export default function RoomManager({
               // 发卡会推进卡号水位，顶栏必须跟着刷新，否则"发的卡号"和"显示的水位"对不上
               onRoomsChanged?.()
             }}
-            defaultDays={issueMode === 'renew' ? renewDays(issueRoom) : 1}
+            defaultDays={
+              issueMode === 'renew'
+                ? renewDays(issueRoom)
+                : issueMode === 'move'
+                  ? moveIssueDefaults().amount
+                  : 1
+            }
             renewFrom={issueMode === 'renew' ? issueRoom.activeUntil : null}
+            defaultMode={issueMode === 'move' ? moveIssueDefaults().mode : 'day'}
+            initialGuest={issueMode === 'move' ? guestFromPreview() : undefined}
+            moveNotice={issueMode === 'move'}
           />
         ) : null}
       </Modal>
@@ -979,6 +1146,174 @@ export default function RoomManager({
             ) : null}
           </Space>
         ) : null}
+      </Modal>
+
+      {/* 换房：先看源房能带走什么 → 选目标房 → 退旧房 → 转入目标房发卡表单 */}
+      <Modal
+        open={moveFrom !== null}
+        title={moveFrom ? `换房 · ${moveFrom.roomNo}` : ''}
+        okText="确认换房并写新卡"
+        cancelText="取消"
+        width={560}
+        confirmLoading={moveBusy}
+        okButtonProps={{
+          disabled: !moveTo || moveLoading || moveError !== null || !moveRead || moveReading,
+        }}
+        onOk={() => void confirmMove()}
+        onCancel={() => setMoveFrom(null)}
+        destroyOnHidden
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          {moveError ? <Alert type="error" showIcon message="操作失败" description={moveError} /> : null}
+
+          {moveLoading ? (
+            <Text type="secondary">正在查询源房的有效卡…</Text>
+          ) : (
+            <Card type="inner" size="small" title={`源房 ${movePreview?.roomNo ?? moveFrom?.roomNo ?? ''}`}>
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <Text>
+                  有效客卡：<Text strong>{movePreview?.cards ?? 0} 张</Text>
+                  {movePreview?.activeUntil
+                    ? `　最晚${formatExpiry(movePreview.activeUntil) ?? `有效期至 ${formatTime(movePreview.activeUntil)}`}`
+                    : ''}
+                </Text>
+                {movePreview?.latest ? (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    客人：
+                    {movePreview.latest.guestName ?? '未登记'}
+                    {movePreview.latest.guestGender ? ` · ${movePreview.latest.guestGender}` : ''}
+                    {movePreview.latest.guestIdType ? ` · ${movePreview.latest.guestIdType}` : ''}
+                    {movePreview.latest.guestIdNumber ? ` ${movePreview.latest.guestIdNumber}` : ''}
+                    （卡型 {movePreview.latest.kind}
+                    {movePreview.latest.days > 0 ? ` · ${movePreview.latest.days} 天` : ''}
+                    {movePreview.latest.hours > 0 ? ` · ${movePreview.latest.hours} 小时` : ''}）
+                  </Text>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    没有可带入的客人信息（源房没有有效客卡，换房只会做退房登记）。
+                  </Text>
+                )}
+              </Space>
+            </Card>
+          )}
+
+          {/* 换房前必须读卡核对：读到的卡号必须属于源房当前有效卡 */}
+          <Card type="inner" size="small" title="读卡核对">
+            <Space direction="vertical" size="small" style={{ width: '100%' }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                把客人手上的卡放到读卡器上，先确认它就是这间房当前在用的卡。
+              </Text>
+              <Button icon={<ScanOutlined />} loading={moveReading} onClick={() => void readMoveCard()}>
+                {moveRead ? '重新读卡' : '读卡'}
+              </Button>
+              {moveReadErr ? (
+                <Alert type="error" showIcon message="读卡失败" description={moveReadErr} />
+              ) : null}
+              {moveRead ? <CardSnapshotView card={moveRead.card} /> : null}
+              {moveRead && moveCardIsOriginal ? (
+                <Alert
+                  type="success"
+                  showIcon
+                  message={`核对通过：卡号 ${formatCardNo(readCardNo)} 是 ${moveFrom?.roomNo ?? ''} 房当前有效卡`}
+                />
+              ) : null}
+              {moveRead && !moveCardIsOriginal ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message="这张卡不是该房当前有效卡"
+                  description="可能是别的房间的卡、原厂软件发的卡或空白卡。请先确认客人没拿错卡；拿错卡应先找回原卡，再回来换房。"
+                />
+              ) : null}
+            </Space>
+          </Card>
+
+          <div>
+            <Text type="secondary">换到</Text>
+            <Select
+              style={{ width: '100%', marginTop: 4 }}
+              placeholder="选择目标房间（只列空净房 / 未满房）"
+              value={moveTo ?? undefined}
+              onChange={setMoveTo}
+              showSearch
+              optionFilterProp="label"
+              options={rooms
+                .filter(
+                  (r) =>
+                    r.active &&
+                    r.roomNo !== moveFrom?.roomNo &&
+                    ISSUABLE_STATUS.has(r.status),
+                )
+                .map((r) => ({
+                  value: r.roomNo,
+                  label: `${r.roomNo}（序号 ${r.roomIndex} · ${statusOf(r.status)?.label ?? r.status}）`,
+                }))}
+            />
+          </div>
+
+          <Alert
+            type="warning"
+            showIcon
+            message="确认后会发生什么"
+            description={
+              <ul style={{ margin: '4px 0 0', paddingInlineStart: 20 }}>
+                <li>
+                  把 {moveFrom?.roomNo ?? '源房'} 的全部有效客卡登记退房，房态改为设置里的「退房后房态」
+                </li>
+                <li>接着打开目标房的发卡表单：客人信息与剩余时长已带入，写卡仍需读卡器</li>
+                <li>目标房房态不会自动变，写完卡请按实际改成「未满房 / 已满房」</li>
+                <li>
+                  <Text strong>旧卡仍能打开原房间的门</Text>（卡里的房间序号是写死的），到期前请收回
+                </li>
+                <li>审计日志记一条「换房」，含源房、目标房与关闭张数</li>
+              </ul>
+            }
+          />
+        </Space>
+      </Modal>
+
+      {/* 非本房原卡：换房前的二次确认（受控 Modal，不用命令式确认框） */}
+      <Modal
+        open={moveForceOpen}
+        title="这张卡不是该房的原卡，仍然换房？"
+        okText="仍然换房"
+        cancelText="取消"
+        okButtonProps={{ danger: true }}
+        confirmLoading={moveBusy}
+        onOk={() => {
+          setMoveForceConfirmed(true)
+          setMoveForceOpen(false)
+          if (moveFrom && moveTo) {
+            const target = rooms.find((r) => r.roomNo === moveTo)
+            if (target) void doMove(moveFrom, target)
+          }
+        }}
+        onCancel={() => setMoveForceOpen(false)}
+        destroyOnHidden
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Alert
+            type="warning"
+            showIcon
+            message={`读到的卡号 ${formatCardNo(readCardNo)} 不在 ${moveFrom?.roomNo ?? ''} 房的有效卡里`}
+            description={
+              movePreview?.activeCardNos.length
+                ? `${moveFrom?.roomNo} 房当前有效卡：${movePreview.activeCardNos.map((n) => formatCardNo(n)).join('、')}`
+                : `${moveFrom?.roomNo ?? '该房'} 当前没有有效客卡，读到的任何卡都不可能是原卡。`
+            }
+          />
+          <div>
+            继续将：
+            <ul style={{ margin: '6px 0 0', paddingInlineStart: 20 }}>
+              <li>把 {moveFrom?.roomNo ?? '源房'} 的全部有效客卡登记退房（与该卡本身无关）</li>
+              <li>房态改为设置里的「退房后房态」，审计标注读到的卡号</li>
+              <li>随后打开目标房发卡表单，为客人写一张新房卡</li>
+            </ul>
+          </div>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            请先确认客人是不是拿错了卡（比如拿了旧房卡/别房卡）。拿错卡时应当先找回原卡，否则原房那张卡会一直有效到过期。
+          </Text>
+        </Space>
       </Modal>
 
       {/* 读卡退房 / 持卡退房：先读卡核对，再确认退房（每次打开都重新挂载，不带上次的卡） */}

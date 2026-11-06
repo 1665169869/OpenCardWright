@@ -98,6 +98,8 @@ pub struct IssuedDto {
     pub card: CardSnapshot,
     /// 管理卡（复位/清除/总控/校时）没有房间，所以是可选。
     pub room: Option<Room>,
+    /// 到期时间（UTC ISO8601 估算值）。无时长的卡型（安装/复位/清除）为 None。
+    pub expires_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -428,6 +430,7 @@ pub async fn issue_install_card(
         Ok(IssuedDto {
             card,
             room: Some(room),
+            expires_at: None,
         })
     })
     .await
@@ -645,7 +648,7 @@ pub async fn issue_admin_card(
                 if let Some(no) = &room_no {
                     ocw_store::mark_install_card(&conn, no)?;
                 }
-                ocw_store::record_issuance(
+                let issuance_id = ocw_store::record_issuance(
                     &conn,
                     &ocw_store::NewIssuance {
                         room_no: room_no.as_deref(),
@@ -662,6 +665,8 @@ pub async fn issue_admin_card(
                         duration_ms: Some(duration),
                     },
                 )?;
+                let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
+                    .and_then(|r| r.expires_at);
                 ocw_store::record_audit(
                     &conn,
                     "issue_admin_card",
@@ -670,7 +675,11 @@ pub async fn issue_admin_card(
                     "ok",
                     Some(me.operator_id),
                 )?;
-                Ok(IssuedDto { card, room })
+                Ok(IssuedDto {
+                    card,
+                    room,
+                    expires_at,
+                })
             }
             Err(e) => {
                 // 失败也要留痕：管理卡失败往往是现场事故的第一手线索
@@ -1028,6 +1037,7 @@ pub async fn issue_guest(
                     return Ok(IssuedDto {
                         card: snapshot_from_record(&rec, &room),
                         room: Some(room),
+                        expires_at: rec.expires_at.clone(),
                     });
                 }
             }
@@ -1129,12 +1139,15 @@ pub async fn issue_guest(
                     note: g_note.as_deref(),
                 },
             )?;
-        }
+            let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
+                .and_then(|r| r.expires_at);
 
-        Ok(IssuedDto {
-            card,
-            room: Some(room),
-        })
+            Ok(IssuedDto {
+                card,
+                room: Some(room),
+                expires_at,
+            })
+        }
     })
     .await
 }
@@ -1434,6 +1447,106 @@ pub struct CheckoutResult {
     /// 本次被标记为已退房的卡数
     pub cards_closed: i64,
     pub status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomMovePreview {
+    pub room_no: String,
+    /// 源房当前有效客卡张数（换房就是把它们全部退掉）
+    pub cards: i64,
+    /// 源房最晚到期时间（UTC），无有效卡时为 None
+    pub active_until: Option<String>,
+    /// 源房最近一张有效客卡记录：用来把客人信息、时长带到新房
+    pub latest: Option<ocw_store::IssuanceRecord>,
+    /// 源房当前所有有效客卡的卡号（去重）。换房前要读卡核对"是不是本房原卡"。
+    pub active_card_nos: Vec<u16>,
+}
+
+/// 换房第一步：查源房"能带走什么"，**不改任何数据**。
+///
+/// 前台要先看到「几张有效卡 / 客人是谁 / 几天卡 / 到期时间」再决定换去哪个房间，
+/// 所以把预览与执行拆成两个命令；预览里不写库，用户点取消就是零影响。
+#[tauri::command]
+pub async fn room_move_preview(
+    state: State<'_, AppState>,
+    room_no: String,
+) -> Result<RoomMovePreview, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let room = ocw_store::find_room(&conn, &room_no)?.ok_or_else(|| {
+            CommandError::new(1, format!("房号不存在：{room_no}"), "刷新房间列表后重试")
+        })?;
+        let latest = ocw_store::latest_active_guest_card(&conn, &room_no)?;
+        let active_card_nos = ocw_store::active_guest_card_nos(&conn, &room_no)?;
+        Ok(RoomMovePreview {
+            room_no,
+            cards: room.active_cards,
+            active_until: room.active_until,
+            latest,
+            active_card_nos,
+        })
+    })
+    .await
+}
+
+/// 换房第二步：把源房的全部有效客卡登记退房，并记审计。
+///
+/// 只做业务登记 —— 卡内的房间序号是写死在卡里的，旧卡仍能开**源房**的门，
+/// 直到它自己过期；新房必须重新写一张卡（前端接着打开目标房的发卡表单）。
+///
+/// `card_no` 是换房前读到的卡号，只用于审计留痕（证明当时核对的是哪张卡）；
+/// 不是本房原卡时前端会二次确认，确认后仍带上实际读到的卡号。
+#[tauri::command]
+pub async fn room_move_out(
+    state: State<'_, AppState>,
+    room_no: String,
+    to_room_no: String,
+    card_no: Option<u16>,
+) -> Result<CheckoutResult, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let target = ocw_store::find_room(&conn, &to_room_no)?.ok_or_else(|| {
+            CommandError::new(1, format!("目标房号不存在：{to_room_no}"), "刷新房间列表后重试")
+        })?;
+        if !target.active {
+            return Err(CommandError::new(
+                1,
+                format!("目标房间已删除：{to_room_no}"),
+                "换到其它房间",
+            ));
+        }
+        if target.room_no == room_no {
+            return Err(CommandError::new(1, "不能换到同一间房", "选择另一个房号"));
+        }
+
+        let dirty = ocw_store::checkout_status(&conn)?;
+        let closed = ocw_store::checkout_room(&conn, &room_no, &dirty)? as i64;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "move_room",
+            Some(&room_no),
+            Some(&format!(
+                "to={to_room_no} cardsClosed={closed} readCard={}",
+                match card_no {
+                    Some(n) => format!("0x{n:04X}"),
+                    None => "未读卡".to_string(),
+                }
+            )),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(CheckoutResult {
+            room_no,
+            cards_closed: closed,
+            status: dirty,
+        })
+    })
+    .await
 }
 
 /// 退房：登记退房 + 房态置为空脏房。

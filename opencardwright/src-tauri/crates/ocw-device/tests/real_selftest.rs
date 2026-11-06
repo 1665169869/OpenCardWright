@@ -27,7 +27,10 @@ fn real_selftest_is_all_green_and_parses() {
         .output()
         .expect("应能启动 selftest");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    // PMSLockCard.exe 的输出是控制台代码页（中文 Windows = GBK），必须用与
+    // 生产代码相同的 ocw_device::cli::decode 解码；from_utf8_lossy 会把中文
+    // 变成 U+FFFD，导致解析永远失败。
+    let stdout = ocw_device::cli::decode(&output.stdout);
     let parsed = ocw_device::parse_selftest(&stdout)
         .unwrap_or_else(|e| panic!("无法解析 selftest 输出: {e}\n--- 原文 ---\n{stdout}"));
 

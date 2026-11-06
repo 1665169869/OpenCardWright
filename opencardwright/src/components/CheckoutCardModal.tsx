@@ -5,6 +5,7 @@ import {
   api,
   describeError,
   formatCardNo,
+  formatExpiry,
   formatTime,
   type CardReadDto,
   type Room,
@@ -157,9 +158,11 @@ export function CheckoutCardModal({
   }
 
   const lookup = data?.lookup
+  const recordExpiry = lookup?.status === 'found' ? formatExpiry(lookup.latest.expiresAt) : null
   const recordText =
     lookup?.status === 'found'
-      ? `发卡记录：${lookup.latest.roomNo ?? '—'} · ${lookup.latest.kind} · ${formatTime(lookup.latest.createdAt)}`
+      ? `发卡记录：${lookup.latest.roomNo ?? '—'} · ${lookup.latest.kind} · ${formatTime(lookup.latest.createdAt)}` +
+        (recordExpiry ? ` · ${recordExpiry}` : '')
       : lookup?.status === 'notFound'
         ? '未查到该卡的发卡记录（可能是原厂软件或其它机器发的）'
         : null
@@ -201,7 +204,10 @@ export function CheckoutCardModal({
 
           {card ? (
             <>
-              <CardSnapshotView card={card} />
+              <CardSnapshotView
+                card={card}
+                expiresAt={lookup?.status === 'found' ? lookup.latest.expiresAt : null}
+              />
               {recordText ? (
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   {recordText}
