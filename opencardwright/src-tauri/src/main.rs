@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
+mod backup_job;
 mod commands;
 #[cfg(debug_assertions)]
 mod demo_import;
@@ -67,8 +68,12 @@ fn main() {
                 eprintln!("[ocw] 使用模拟设备（未找到 SDK，或设置了 OCW_SIM）");
             }
 
+            let db = Arc::new(Mutex::new(conn));
+            let db_for_job = db.clone();
+            let db_path_for_job = db_path.clone();
+
             app.manage(AppState {
-                db: Arc::new(Mutex::new(conn)),
+                db: db.clone(),
                 db_path,
                 slot: Arc::new(Mutex::new(DeviceSlot { device, port })),
                 runtime_dir: runtime.dir,
@@ -77,6 +82,9 @@ fn main() {
                 dev: runtime.dev,
                 session: Arc::new(Mutex::new(None)),
             });
+
+            // 自动备份：每 30 秒醒一次读设置，到点就备份（间隔 0 = 关闭）
+            backup_job::spawn(db_for_job, db_path_for_job);
 
             Ok(())
         })
@@ -119,6 +127,9 @@ fn main() {
             commands::backup_database,
             commands::list_backups,
             commands::restore_database,
+            commands::get_backup_settings,
+            commands::set_backup_settings,
+            commands::import_backup_file,
             commands::get_checkout_status,
             commands::set_checkout_status,
             commands::log_frontend,

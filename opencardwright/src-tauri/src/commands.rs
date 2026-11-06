@@ -1568,6 +1568,8 @@ pub struct BackupEntry {
     pub modified_at: Option<String>,
     /// 恢复前自动留的 `.bak`，界面上单独标注、避免误当正式备份
     pub is_safety_copy: bool,
+    /// 自动备份（`auto-` 前缀）：保留份数只对这类生效
+    pub is_auto: bool,
 }
 
 #[derive(Serialize)]
@@ -1581,12 +1583,9 @@ pub struct RestoreResult {
     pub operators: i64,
 }
 
-/// 备份文件放哪：与数据库同级的 `backups\` 目录。
+/// 备份文件放哪：与数据库同级的 `backups\` 目录（实现放在 backup_job，自动备份也用同一处）。
 fn backups_dir(db_path: &Path) -> std::path::PathBuf {
-    db_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("backups")
+    crate::backup_job::backups_dir(db_path)
 }
 
 /// 用 SQLite 自己的 `strftime` 取时间，省掉 chrono 依赖（库用的就是本地时区）。
@@ -1633,6 +1632,11 @@ pub async fn backup_database(
         let target = dir.join(format!("ocw-{}.db", local_stamp(&conn)));
         // 在线备份：WAL 里未 checkpoint 的事务也会一起带走
         let bytes = ocw_store::backup_to(&conn, &target)?;
+        // 手动备份同样推进"上次备份时间"：刚备完不该马上再自动备一次
+        let now: i64 = conn
+            .query_row("SELECT CAST(strftime('%s','now') AS INTEGER)", [], |r| r.get(0))
+            .map_err(|e| CommandError::internal(format!("读取系统时间失败：{e}")))?;
+        let _ = ocw_store::set_setting(&conn, crate::backup_job::SETTING_LAST_AT, &now.to_string());
         let _ = ocw_store::record_audit(
             &conn,
             "backup_database",
@@ -1686,12 +1690,14 @@ pub async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupEntry>
                     continue;
                 }
                 let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let is_auto = name.starts_with("auto-");
                 out.push(BackupEntry {
                     path: path.display().to_string(),
                     name,
                     bytes,
                     modified_at: file_modified(&conn, &path),
                     is_safety_copy: is_safety,
+                    is_auto,
                 });
             }
         }
@@ -2406,6 +2412,206 @@ pub async fn login(
 pub async fn logout(state: State<'_, AppState>) -> Result<AuthStatus, CommandError> {
     state.set_session(None);
     build_auth_status(&state)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupSettingsDto {
+    /// 自动备份间隔（分钟），0 = 关闭
+    pub interval_minutes: i64,
+    /// 自动备份保留份数（只对 auto-*.db 生效）
+    pub keep: i64,
+    /// 上次成功备份的本地时间（手动/自动都算），没有则 None
+    pub last_at: Option<String>,
+    /// 备份目录
+    pub dir: String,
+}
+
+/// 读自动备份设置（管理员）。
+#[tauri::command]
+pub async fn get_backup_settings(
+    state: State<'_, AppState>,
+) -> Result<BackupSettingsDto, CommandError> {
+    require_admin(&state)?;
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let interval = ocw_store::get_setting(&conn, crate::backup_job::SETTING_INTERVAL)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(crate::backup_job::DEFAULT_INTERVAL_MINUTES);
+        let keep = ocw_store::get_setting(&conn, crate::backup_job::SETTING_KEEP)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(crate::backup_job::DEFAULT_KEEP);
+        let last_at = ocw_store::get_setting(&conn, crate::backup_job::SETTING_LAST_AT)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|secs| *secs > 0)
+            .and_then(|secs| {
+                conn.query_row(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch', 'localtime')",
+                    [secs],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            });
+        Ok(BackupSettingsDto {
+            interval_minutes: interval,
+            keep,
+            last_at,
+            dir: backups_dir(&db_path).display().to_string(),
+        })
+    })
+    .await
+}
+
+/// 保存自动备份设置（管理员）。间隔 0 = 关闭；保留份数只影响 `auto-*.db`。
+#[tauri::command]
+pub async fn set_backup_settings(
+    state: State<'_, AppState>,
+    interval_minutes: i64,
+    keep: i64,
+) -> Result<BackupSettingsDto, CommandError> {
+    let me = require_admin(&state)?;
+    if interval_minutes != 0 && !(5..=1440).contains(&interval_minutes) {
+        return Err(CommandError::new(
+            1,
+            "自动备份间隔必须在 5 分钟到 24 小时之间（0 表示关闭）",
+            "默认 60 分钟",
+        ));
+    }
+    if !(1..=500).contains(&keep) {
+        return Err(CommandError::new(1, "保留份数必须在 1–500 之间", "默认 24 份"));
+    }
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    let interval = interval_minutes;
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_setting(
+            &conn,
+            crate::backup_job::SETTING_INTERVAL,
+            &interval.to_string(),
+        )?;
+        ocw_store::set_setting(&conn, crate::backup_job::SETTING_KEEP, &keep.to_string())?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "set_backup_settings",
+            None,
+            Some(&format!("intervalMinutes={interval} keep={keep}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        // 后台线程每 30 秒读一次设置，这里不需要通知
+        let last_at = ocw_store::get_setting(&conn, crate::backup_job::SETTING_LAST_AT)?
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|secs| *secs > 0)
+            .and_then(|secs| {
+                conn.query_row(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', ?1, 'unixepoch', 'localtime')",
+                    [secs],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            });
+        Ok(BackupSettingsDto {
+            interval_minutes: interval,
+            keep,
+            last_at,
+            dir: backups_dir(&db_path).display().to_string(),
+        })
+    })
+    .await
+}
+
+/// 导入外部备份文件（管理员）。
+///
+/// 前端用 `<input type="file">` 读到字节后走这里：本机没有文件选择插件，
+/// 这样既能选任意路径，又不用为一个功能引入 dialog 插件。
+/// 落盘前先看文件头，落盘后再用 `inspect_backup` 确认是**我们自己的库**，
+/// 不合格的文件会立刻删掉，不会留在备份列表里误导人。
+#[tauri::command]
+pub async fn import_backup_file(
+    state: State<'_, AppState>,
+    name: String,
+    bytes: Vec<u8>,
+) -> Result<BackupEntry, CommandError> {
+    const MAX_BYTES: usize = 256 * 1024 * 1024;
+    let me = require_admin(&state)?;
+    if bytes.is_empty() {
+        return Err(CommandError::new(1, "文件是空的", "换一个备份文件"));
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(CommandError::new(
+            1,
+            format!("文件过大（{} MB），上限 256 MB", bytes.len() / 1024 / 1024),
+            "备份文件通常只有几 MB，确认选对了文件",
+        ));
+    }
+    if !bytes.starts_with(b"SQLite format 3\0") {
+        return Err(CommandError::new(
+            1,
+            "这不是 SQLite 数据库文件",
+            "备份文件应是 .db（OpenCardWright 的备份）",
+        ));
+    }
+
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let dir = backups_dir(&db_path);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CommandError::internal(format!("创建备份目录失败：{e}")))?;
+
+        // 文件名只留安全字符，避免路径穿越（"../x.db" 之类）
+        let safe: String = name
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("imported.db")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' })
+            .collect();
+        let stamp = local_stamp(&conn);
+        let file_name = if safe.to_lowercase().ends_with(".db") {
+            format!("imported-{stamp}-{safe}")
+        } else {
+            format!("imported-{stamp}-{safe}.db")
+        };
+        let target = dir.join(&file_name);
+        std::fs::write(&target, &bytes)
+            .map_err(|e| CommandError::internal(format!("写入导入文件失败：{e}")))?;
+
+        // 落盘后立刻验：不是我们的库就删掉，别让它在列表里冒充可用备份
+        if let Err(e) = ocw_store::inspect_backup(&target) {
+            let _ = std::fs::remove_file(&target);
+            return Err(CommandError::new(
+                1,
+                format!("导入失败：{e}"),
+                "请选择 OpenCardWright 生成的 .db 备份",
+            ));
+        }
+
+        let bytes_len = std::fs::metadata(&target)
+            .map_err(|e| CommandError::internal(format!("读取导入文件失败：{e}")))?
+            .len();
+        let _ = ocw_store::record_audit(
+            &conn,
+            "import_backup_file",
+            None,
+            Some(&format!("path={} bytes={bytes_len}", target.display())),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(BackupEntry {
+            path: target.display().to_string(),
+            name: file_name,
+            bytes: bytes_len,
+            modified_at: file_modified(&conn, &target),
+            is_safety_copy: false,
+            is_auto: false,
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

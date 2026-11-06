@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Button,
@@ -21,6 +21,7 @@ import {
   describeError,
   formatTime,
   type BackupEntry,
+  type BackupSettings,
   type Department,
   type OperatorInfo,
   type ReminderSettings,
@@ -1089,21 +1090,34 @@ function WaterPanel({ onChanged }: { onChanged?: () => void }) {
 /**
  * 备份与恢复。
  *
+ * 三件事：手动备份 / 自动备份（可设间隔，默认 1 小时）/ 恢复（含导入外部文件）。
  * 备份走 SQLite 在线备份 API（WAL 里未 checkpoint 的事务也会带走），
  * 恢复的顺序是「只读校验 → 另存当前库 → 覆盖 → 迁移」，任何一步失败都不动现有数据。
- * 恢复会覆盖房间/发卡/账号，所以这里刻意做成：选文件 → 二次确认 → 看结果。
  */
 function BackupPanel({ onChanged }: { onChanged?: () => void }) {
   const [items, setItems] = useState<BackupEntry[]>([])
+  const [cfg, setCfg] = useState<BackupSettings | null>(null)
+  /** 间隔 0 = 关闭；这里存的是"开关 + 分钟数"两个独立状态，避免关掉后丢失填过的值 */
+  const [enabled, setEnabled] = useState(true)
+  const [interval, setIntervalMin] = useState(60)
+  const [keep, setKeep] = useState(24)
+  const [savingCfg, setSavingCfg] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [importing, setImporting] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [target, setTarget] = useState<BackupEntry | null>(null)
   const [restoring, setRestoring] = useState(false)
+  const fileRef = useRef<HTMLInputElement | null>(null)
 
   const load = useCallback(async () => {
     try {
-      setItems(await api.listBackups())
+      const [list, settings] = await Promise.all([api.listBackups(), api.getBackupSettings()])
+      setItems(list)
+      setCfg(settings)
+      setEnabled(settings.intervalMinutes > 0)
+      setIntervalMin(settings.intervalMinutes > 0 ? settings.intervalMinutes : 60)
+      setKeep(settings.keep)
     } catch (e) {
       setErr(describeError(e))
     }
@@ -1125,6 +1139,44 @@ function BackupPanel({ onChanged }: { onChanged?: () => void }) {
       setErr(describeError(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  const saveCfg = async () => {
+    setSavingCfg(true)
+    setErr(null)
+    setMsg(null)
+    try {
+      const next = await api.setBackupSettings(enabled ? interval : 0, keep)
+      setCfg(next)
+      setMsg(
+        next.intervalMinutes > 0
+          ? `自动备份已开启：每 ${next.intervalMinutes} 分钟一次，保留最近 ${next.keep} 份`
+          : '自动备份已关闭（已生成的备份文件保留）',
+      )
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setSavingCfg(false)
+    }
+  }
+
+  /** 导入外部备份：把文件读成字节交后端落盘 + 校验，成功后出现在列表里等用户点「恢复」。 */
+  const onPickFile = async (file: File | null) => {
+    if (!file) return
+    setImporting(true)
+    setErr(null)
+    setMsg(null)
+    try {
+      const buf = new Uint8Array(await file.arrayBuffer())
+      const entry = await api.importBackupFile(file.name, Array.from(buf))
+      setMsg(`已导入 ${entry.name}（${(entry.bytes / 1024).toFixed(1)} KB），确认无误后点该行的「恢复」`)
+      await load()
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setImporting(false)
+      if (fileRef.current) fileRef.current.value = ''
     }
   }
 
@@ -1159,17 +1211,63 @@ function BackupPanel({ onChanged }: { onChanged?: () => void }) {
         type="info"
         showIcon
         message="备份包含房间、房态、发卡记录、账号与设置（不含卡号计数器）"
-        description="备份文件是单个自包含的 .db，可以直接拷到另一台机器；卡号计数器在运行目录的 CardNo.state 里，换机时要另外拷。"
+        description="备份是单个自包含的 .db，可以直接拷到另一台机器；卡号计数器在运行目录的 CardNo.state 里，换机时要另外拷。"
       />
+
+      <Card type="inner" size="small" title="自动备份">
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Space wrap align="center">
+            <Switch
+              checked={enabled}
+              onChange={(v) => setEnabled(v)}
+              checkedChildren="开启"
+              unCheckedChildren="关闭"
+            />
+            <Text>每</Text>
+            <InputNumber
+              min={5}
+              max={1440}
+              value={interval}
+              disabled={!enabled}
+              onChange={(v) => setIntervalMin(Number(v ?? 60))}
+              style={{ width: 90 }}
+            />
+            <Text>分钟备份一次（默认 60）</Text>
+            <Text>保留最近</Text>
+            <InputNumber
+              min={1}
+              max={500}
+              value={keep}
+              onChange={(v) => setKeep(Number(v ?? 24))}
+              style={{ width: 80 }}
+            />
+            <Text>份</Text>
+            <Button type="primary" loading={savingCfg} onClick={() => void saveCfg()}>
+              保存
+            </Button>
+          </Space>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            只清理自动产生的 auto-*.db，手动备份与恢复前的安全副本永远不会被删。
+            上次备份：{cfg?.lastAt ? formatTime(cfg.lastAt) : '还没有'}；目录：{cfg?.dir ?? '—'}
+          </Text>
+        </Space>
+      </Card>
 
       <Space wrap>
         <Button type="primary" loading={busy} onClick={() => void doBackup()}>
           立即备份
         </Button>
+        <Button loading={importing} onClick={() => fileRef.current?.click()}>
+          导入外部备份…
+        </Button>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".db,.bak,application/x-sqlite3,application/octet-stream"
+          style={{ display: 'none' }}
+          onChange={(e) => void onPickFile(e.target.files?.[0] ?? null)}
+        />
         <Button onClick={() => void load()}>刷新列表</Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          默认存到数据库同级的 backups 目录
-        </Text>
       </Space>
 
       {err ? <Alert type="error" showIcon message="操作失败" description={err} /> : null}
@@ -1197,10 +1295,15 @@ function BackupPanel({ onChanged }: { onChanged?: () => void }) {
           },
           {
             title: '类型',
-            dataIndex: 'isSafetyCopy',
             width: 120,
-            render: (v: boolean) =>
-              v ? <Tag color="orange">恢复前副本</Tag> : <Tag color="blue">正式备份</Tag>,
+            render: (_: unknown, row: BackupEntry) =>
+              row.isSafetyCopy ? (
+                <Tag color="orange">恢复前副本</Tag>
+              ) : row.isAuto ? (
+                <Tag>自动</Tag>
+              ) : (
+                <Tag color="blue">手动</Tag>
+              ),
           },
           {
             title: '操作',

@@ -169,6 +169,16 @@ export interface BackupEntry {
   bytes: number
   modifiedAt: string | null
   isSafetyCopy: boolean
+  /** 自动备份（auto- 前缀）：保留份数只对这类生效 */
+  isAuto: boolean
+}
+
+/** 自动备份设置。`intervalMinutes = 0` 表示关闭（默认 60）。 */
+export interface BackupSettings {
+  intervalMinutes: number
+  keep: number
+  lastAt: string | null
+  dir: string
 }
 
 /** 恢复结果：恢复前自动留的副本 + 恢复后库里的数据量。 */
@@ -371,6 +381,13 @@ export const api = {
   listBackups: () => invoke<BackupEntry[]>('list_backups'),
   /** 用备份覆盖当前库（管理员）：先只读校验，再把当前库另存为 .before-restore-*.bak */
   restoreDatabase: (path: string) => invoke<RestoreResult>('restore_database', { path }),
+  /** 自动备份设置（管理员） */
+  getBackupSettings: () => invoke<BackupSettings>('get_backup_settings'),
+  setBackupSettings: (intervalMinutes: number, keep: number) =>
+    invoke<BackupSettings>('set_backup_settings', { intervalMinutes, keep }),
+  /** 导入外部备份文件：前端读字节传过来，后端落盘并校验是不是我们的库 */
+  importBackupFile: (name: string, bytes: number[]) =>
+    invoke<BackupEntry>('import_backup_file', { name, bytes }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
   checkoutCard: (cardNo: number) => invoke<CheckoutCardResult>('checkout_card', { cardNo }),
   /**
