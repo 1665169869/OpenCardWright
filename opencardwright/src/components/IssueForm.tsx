@@ -59,6 +59,8 @@ export default function IssueForm({
   const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
   /** 长有效期卡（>62 天）必须原样输入这个确认词 */
   const [confirmWord, setConfirmWord] = useState('')
+  /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数 */
+  const [checkoutTime, setCheckoutTime] = useState('12:00')
   const needsLongConfirm = mode === 'day' && amount > GUEST_MAX_DAYS
   const longConfirmed = !needsLongConfirm || confirmWord.trim() === LONG_CONFIRM_WORD
 
@@ -79,9 +81,12 @@ export default function IssueForm({
     if (mode === 'hour') return new Date(startAt.getTime() + amount * 3600_000)
     const d = new Date(startAt)
     d.setDate(d.getDate() + amount)
-    d.setHours(12, 0, 0, 0)
+    const [hh, mm] = checkoutTime.split(':').map((v) => Number(v) || 0)
+    d.setHours(hh, mm, 0, 0)
     return d
   })()
+  /** 所选时刻在今天已经过了 —— 只是提示，不改天数 */
+  const checkoutTimePassed = mode === 'day' && checkoutAt.getTime() <= startAt.getTime()
 
   const switchMode = (next: Mode) => {
     setMode(next)
@@ -164,6 +169,21 @@ export default function IssueForm({
           <Text type="secondary">{mode === 'day' ? '天' : '小时'}</Text>
         </Space>
 
+        {mode === 'day' ? (
+          <Space wrap align="center">
+            <Text type="secondary">预计退房时刻</Text>
+            <input
+              type="time"
+              value={checkoutTime}
+              onChange={(e) => setCheckoutTime(e.target.value || '12:00')}
+              style={{ padding: '2px 6px', border: '1px solid #d9d9d9', borderRadius: 6 }}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              只影响这里的估算与记录，写进卡里的仍然是「{amount} 天」
+            </Text>
+          </Space>
+        ) : null}
+
         <Alert
           type="info"
           showIcon
@@ -172,7 +192,11 @@ export default function IssueForm({
               预计退房：<b>{fmt(startAt)}</b> - <b>{fmt(checkoutAt)}</b>
             </span>
           }
-          description="按发卡时间估算（日租默认中午 12:00 退房）；门锁实际从首次刷卡起算，可能比这里晚。"
+          description={
+            checkoutTimePassed
+              ? '所选时刻已过，实际按次日估算。时间只影响记录与到期估算，锁按首次刷卡起算。'
+              : '按发卡时间估算；时间只影响记录与到期估算，锁按首次刷卡起算，可能比这里晚。'
+          }
         />
 
         <Space wrap>
