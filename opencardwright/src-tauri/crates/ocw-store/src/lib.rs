@@ -122,6 +122,109 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- 备份 / 恢复
+
+/// 备份文件的内容摘要。恢复前必须先用它确认「这确实是我们自己的库」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupInfo {
+    /// schema_version 表里的最大版本号（老库可能是 3、5 等）
+    pub schema_version: i64,
+    /// 业务表数量（`room` / `issuance` / `operator` 等都在才算好库）
+    pub tables: i64,
+    pub rooms: i64,
+    pub issuances: i64,
+    pub operators: i64,
+}
+
+/// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
+pub const SCHEMA_VERSION: i64 = 7;
+
+/// 把当前库**在线备份**到指定文件。
+///
+/// 用 SQLite 的在线备份 API（`rusqlite::backup`），不是文件拷贝：
+/// 库是 WAL 模式，直接 `copy` 会漏掉还在 `-wal` 里没 checkpoint 的事务。
+/// 备份文件建成后强制 `journal_mode=DELETE`，保证它是**单个自包含文件**，
+/// 拷到别的机器上能直接用只读连接打开。
+pub fn backup_to(conn: &Connection, path: &Path) -> Result<u64> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+
+    let mut dst = Connection::open(path)?;
+    {
+        let backup = rusqlite::backup::Backup::new(conn, &mut dst)?;
+        backup.run_to_completion(128, Duration::from_millis(5), None)?;
+    }
+    // 备份文件不保留 WAL，避免出现「db + db-wal」两个文件才算完整
+    let _: String = dst.query_row("PRAGMA journal_mode = DELETE", [], |r| r.get(0))?;
+    drop(dst);
+
+    Ok(std::fs::metadata(path)?.len())
+}
+
+/// 只读检查一个备份文件是否可用（不动当前库）。
+pub fn inspect_backup(path: &Path) -> Result<BackupInfo> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+
+    for table in ["room", "issuance", "operator", "schema_version"] {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |r| r.get(0),
+        )?;
+        if n == 0 {
+            return Err(StoreError::Invalid(format!(
+                "不是 OpenCardWright 的备份：缺少 {table} 表"
+            )));
+        }
+    }
+
+    let schema_version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+        [],
+        |r| r.get(0),
+    )?;
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    let count = |table: &str| -> Result<i64> {
+        Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+    };
+
+    Ok(BackupInfo {
+        schema_version,
+        tables,
+        rooms: count("room")?,
+        issuances: count("issuance")?,
+        operators: count("operator")?,
+    })
+}
+
+/// 用备份文件**覆盖**当前库的内容（同一连接，不换文件）。
+///
+/// 调用方必须先 `inspect_backup` 校验、并把当前库另存为 `.bak`——
+/// 这个函数一旦成功，旧数据就没了。恢复后建议再跑一次 [`migrate`]。
+pub fn restore_from(conn: &mut Connection, path: &Path) -> Result<()> {
+    let src = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let backup = rusqlite::backup::Backup::new(&src, conn)?;
+    backup.run_to_completion(128, Duration::from_millis(5), None)?;
+    Ok(())
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
@@ -2128,4 +2231,62 @@ mod tests {
 
         cleanup(conn, path);
     }
+    // ---------------- 备份 / 恢复 ----------------
+
+    /// 备份 → 改库 → 恢复：数据要能完整回来，且备份文件必须自包含（可只读打开）。
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let (mut conn, path) = temp_db();
+        insert_room(&conn, "601", Some(61), None, None, None).unwrap();
+        record_issuance(&conn, &sample_issuance(Some("601"), "日租客卡", 1, 0)).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("ocw-bk-{}", uuid::Uuid::new_v4()));
+        let file = dir.join("ocw-test.db");
+        let bytes = backup_to(&conn, &file).expect("备份应成功");
+        assert!(bytes > 0);
+        assert!(file.is_file());
+        // 备份必须是「单个自包含文件」：不能留下 -wal / -shm 兄弟文件
+        let wal = std::path::PathBuf::from(format!("{}-wal", file.display()));
+        let shm = std::path::PathBuf::from(format!("{}-shm", file.display()));
+        assert!(!wal.exists(), "备份不该带 -wal：{}", wal.display());
+        assert!(!shm.exists(), "备份不该带 -shm：{}", shm.display());
+
+        // 备份文件自包含：只读打开也能读到完整结构
+        let info = inspect_backup(&file).expect("应识别为自己的库");
+        assert_eq!(info.schema_version, SCHEMA_VERSION);
+        assert_eq!(info.rooms, 1);
+        assert_eq!(info.issuances, 1);
+        assert!(info.tables >= 8, "表数量异常：{}", info.tables);
+
+        // 破坏当前库，再恢复
+        conn.execute("DELETE FROM room", []).unwrap();
+        conn.execute("DELETE FROM issuance", []).unwrap();
+        assert!(find_room(&conn, "601").unwrap().is_none());
+
+        restore_from(&mut conn, &file).expect("恢复应成功");
+        migrate(&conn).expect("恢复后迁移应幂等");
+
+        assert_eq!(find_room(&conn, "601").unwrap().map(|r| r.room_index), Some(61));
+        assert_eq!(count_active_cards(&conn, "601").unwrap(), 1, "发卡记录也应回来");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(conn, path);
+    }
+
+    /// 不是本程序的库（缺 room/issuance/schema_version）必须被拒绝，而不是恢复出半截数据。
+    #[test]
+    fn inspect_backup_rejects_foreign_file() {
+        let dir = std::env::temp_dir().join(format!("ocw-bk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("junk.db");
+        let other = Connection::open(&file).unwrap();
+        other.execute_batch("CREATE TABLE foo (x INTEGER);").unwrap();
+        drop(other);
+
+        let err = inspect_backup(&file).expect_err("外部库必须拒绝");
+        assert!(err.to_string().contains("不是 OpenCardWright"), "错误文案要指明原因：{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

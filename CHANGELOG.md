@@ -3,6 +3,27 @@
 本文件记录 OpenCardWright 产品工作区（`opencardwright/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 2026.11.6+0040 — 2026-11-06
+
+### 数据库备份 / 恢复（TD-402）
+
+- 设置 → 新增「**备份**」页签：一键备份、备份列表（大小 / 时间 / 类型）、恢复（二次确认）。
+- 备份用 **SQLite 在线备份 API**，不是文件拷贝：库是 WAL 模式，直接 copy 会漏掉还在 `-wal` 里的事务；
+  备份文件强制 `journal_mode=DELETE`，是**单个自包含 .db**，可拷到另一台机器直接用。
+- 默认落在库同级的 `backups\ocw-YYYYmmdd-HHmmss.db`（本地时间，用 SQLite `strftime` 取，不引 chrono）。
+- 恢复顺序刻意收紧，任何一步失败都不动现有数据：
+  1. **只读校验**备份（必须是含 `room`/`issuance`/`operator`/`schema_version` 的库，否则拒绝）；
+  2. 备份 schema **比本程序新**直接拒绝（本程序支持到 v7）；
+  3. `PRAGMA wal_checkpoint(TRUNCATE)` 让 WAL 落盘；
+  4. 当前库另存为 `opencardwright.db.before-restore-<时间戳>.bak`；
+  5. 覆盖 + 补跑迁移（老库恢复后自动升到 v7）；
+  6. 审计记 `backup_database` / `restore_database`。
+- 新增命令：`backup_database` / `list_backups` / `restore_database`（管理员）；
+  存储层新增 `backup_to` / `inspect_backup` / `restore_from` / `SCHEMA_VERSION`。
+- 测试：备份→改库→恢复往返、外部库被拒（`ocw-store` 34 项）。
+- 已知边界：备份不包含卡号计数器（`CardNo.state` 在运行目录），换机时要单独拷。
+- 版本号 `2026.11.6+0039` → `2026.11.6+0040`。
+
 ## 2026.11.6+0039 — 2026-11-06
 
 ### 换房必须先读卡核对

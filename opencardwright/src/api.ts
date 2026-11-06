@@ -156,6 +156,30 @@ export interface RoomMovePreview {
   activeCardNos: number[]
 }
 
+/** 备份结果：备份文件落在哪、多大。 */
+export interface BackupResult {
+  path: string
+  bytes: number
+}
+
+/** 备份列表项。`isSafetyCopy` = 恢复前自动留的 .bak，不是正式备份。 */
+export interface BackupEntry {
+  path: string
+  name: string
+  bytes: number
+  modifiedAt: string | null
+  isSafetyCopy: boolean
+}
+
+/** 恢复结果：恢复前自动留的副本 + 恢复后库里的数据量。 */
+export interface RestoreResult {
+  before: string
+  schemaVersion: number
+  rooms: number
+  issuances: number
+  operators: number
+}
+
 export interface CheckoutCardResult {
   roomNo: string
   /** 该房剩余有效卡；0 表示已转空脏房 */
@@ -339,6 +363,14 @@ export const api = {
    */
   moveRoomOut: (roomNo: string, toRoomNo: string, cardNo?: number | null) =>
     invoke<CheckoutResult>('room_move_out', { roomNo, toRoomNo, cardNo: cardNo ?? null }),
+
+  /** 立即备份数据库（管理员）；`dir` 留空则写到库同级的 backups\ 目录 */
+  backupDatabase: (dir?: string | null) =>
+    invoke<BackupResult>('backup_database', { dir: dir ?? null }),
+  /** 列出已有备份（管理员） */
+  listBackups: () => invoke<BackupEntry[]>('list_backups'),
+  /** 用备份覆盖当前库（管理员）：先只读校验，再把当前库另存为 .before-restore-*.bak */
+  restoreDatabase: (path: string) => invoke<RestoreResult>('restore_database', { path }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
   checkoutCard: (cardNo: number) => invoke<CheckoutCardResult>('checkout_card', { cardNo }),
   /**

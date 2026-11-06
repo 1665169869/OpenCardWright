@@ -20,6 +20,7 @@ import {
   api,
   describeError,
   formatTime,
+  type BackupEntry,
   type Department,
   type OperatorInfo,
   type ReminderSettings,
@@ -50,6 +51,7 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
           { key: 'roomstatus', label: '房态', children: <RoomStatusPanel onChanged={onChanged} /> },
           { key: 'water', label: '水位', children: <WaterPanel onChanged={onChanged} /> },
+          { key: 'backup', label: '备份', children: <BackupPanel onChanged={onChanged} /> },
         ]}
       />
     </Card>
@@ -1077,6 +1079,163 @@ function WaterPanel({ onChanged }: { onChanged?: () => void }) {
           前提：**每一把门锁**都已经刷过复位卡（复位卡会把该房的"当前有效卡号"归零）。
           没刷就拨低，新发的卡号比锁里记的小，那些锁会直接拒开。
         </p>
+      </Modal>
+    </Space>
+  )
+}
+
+// ---------------------------------------------------------------- 备份 / 恢复
+
+/**
+ * 备份与恢复。
+ *
+ * 备份走 SQLite 在线备份 API（WAL 里未 checkpoint 的事务也会带走），
+ * 恢复的顺序是「只读校验 → 另存当前库 → 覆盖 → 迁移」，任何一步失败都不动现有数据。
+ * 恢复会覆盖房间/发卡/账号，所以这里刻意做成：选文件 → 二次确认 → 看结果。
+ */
+function BackupPanel({ onChanged }: { onChanged?: () => void }) {
+  const [items, setItems] = useState<BackupEntry[]>([])
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  const [target, setTarget] = useState<BackupEntry | null>(null)
+  const [restoring, setRestoring] = useState(false)
+
+  const load = useCallback(async () => {
+    try {
+      setItems(await api.listBackups())
+    } catch (e) {
+      setErr(describeError(e))
+    }
+  }, [])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  const doBackup = async () => {
+    setBusy(true)
+    setErr(null)
+    setMsg(null)
+    try {
+      const r = await api.backupDatabase()
+      setMsg(`已备份到 ${r.path}（${(r.bytes / 1024).toFixed(1)} KB）`)
+      await load()
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const doRestore = async () => {
+    if (!target) return
+    setRestoring(true)
+    setErr(null)
+    setMsg(null)
+    try {
+      const r = await api.restoreDatabase(target.path)
+      const name = target.name
+      setTarget(null)
+      setMsg(
+        `已从 ${name} 恢复：房间 ${r.rooms} · 发卡记录 ${r.issuances} · 账号 ${r.operators}。` +
+          `恢复前的数据另存为 ${r.before}。请退出登录后重新进入，确认数据无误。`,
+      )
+      await load()
+      onChanged?.()
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setRestoring(false)
+    }
+  }
+
+  const bytesText = (n: number) =>
+    n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(2)} MB` : `${(n / 1024).toFixed(1)} KB`
+
+  return (
+    <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Alert
+        type="info"
+        showIcon
+        message="备份包含房间、房态、发卡记录、账号与设置（不含卡号计数器）"
+        description="备份文件是单个自包含的 .db，可以直接拷到另一台机器；卡号计数器在运行目录的 CardNo.state 里，换机时要另外拷。"
+      />
+
+      <Space wrap>
+        <Button type="primary" loading={busy} onClick={() => void doBackup()}>
+          立即备份
+        </Button>
+        <Button onClick={() => void load()}>刷新列表</Button>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          默认存到数据库同级的 backups 目录
+        </Text>
+      </Space>
+
+      {err ? <Alert type="error" showIcon message="操作失败" description={err} /> : null}
+      {msg ? <Alert type="success" showIcon message="完成" description={msg} /> : null}
+
+      <Table<BackupEntry>
+        size="small"
+        rowKey="path"
+        dataSource={items}
+        pagination={{ pageSize: 10, hideOnSinglePage: true }}
+        locale={{ emptyText: '还没有备份。点「立即备份」生成第一份。' }}
+        columns={[
+          { title: '文件', dataIndex: 'name', ellipsis: true },
+          {
+            title: '大小',
+            dataIndex: 'bytes',
+            width: 100,
+            render: (n: number) => bytesText(n),
+          },
+          {
+            title: '时间',
+            dataIndex: 'modifiedAt',
+            width: 170,
+            render: (v: string | null) => (v ? formatTime(v) : '—'),
+          },
+          {
+            title: '类型',
+            dataIndex: 'isSafetyCopy',
+            width: 120,
+            render: (v: boolean) =>
+              v ? <Tag color="orange">恢复前副本</Tag> : <Tag color="blue">正式备份</Tag>,
+          },
+          {
+            title: '操作',
+            width: 90,
+            render: (_: unknown, row: BackupEntry) => (
+              <Button size="small" danger onClick={() => setTarget(row)}>
+                恢复
+              </Button>
+            ),
+          },
+        ]}
+      />
+
+      <Modal
+        open={target !== null}
+        title="确认用这个备份覆盖当前数据？"
+        okText="覆盖并恢复"
+        okButtonProps={{ danger: true }}
+        cancelText="取消"
+        confirmLoading={restoring}
+        onOk={() => void doRestore()}
+        onCancel={() => setTarget(null)}
+        destroyOnHidden
+      >
+        <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+          <Alert
+            type="warning"
+            showIcon
+            message={`将用 ${target?.name ?? ''} 覆盖现在的房间 / 发卡记录 / 账号`}
+            description="恢复期间请不要发卡或刷卡。当前数据会先自动另存为 opencardwright.db.before-restore-*.bak。"
+          />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            备份来自其它机器或更早版本时，恢复后会自动补跑数据库迁移；若备份的 schema 比本程序新，会被直接拒绝。
+          </Text>
+        </Space>
       </Modal>
     </Space>
   )

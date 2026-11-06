@@ -6,7 +6,7 @@ license = "AGPL-3.0-or-later"
 description = "OpenCardWright persistence: SQLite schema and queries"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 uuid = { version = "1", features = ["v4"] }

@@ -1549,6 +1549,246 @@ pub async fn room_move_out(
     .await
 }
 
+// ---------------------------------------------------------------- 备份 / 恢复
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupResult {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupEntry {
+    pub path: String,
+    pub name: String,
+    pub bytes: u64,
+    /// 本地时间 `YYYY-MM-DD HH:mm:ss`，取不到时为 None
+    pub modified_at: Option<String>,
+    /// 恢复前自动留的 `.bak`，界面上单独标注、避免误当正式备份
+    pub is_safety_copy: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreResult {
+    /// 恢复前自动另存的当前库副本
+    pub before: String,
+    pub schema_version: i64,
+    pub rooms: i64,
+    pub issuances: i64,
+    pub operators: i64,
+}
+
+/// 备份文件放哪：与数据库同级的 `backups\` 目录。
+fn backups_dir(db_path: &Path) -> std::path::PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("backups")
+}
+
+/// 用 SQLite 自己的 `strftime` 取时间，省掉 chrono 依赖（库用的就是本地时区）。
+fn local_stamp(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT strftime('%Y%m%d-%H%M%S', 'now', 'localtime')",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn file_modified(conn: &Connection, path: &Path) -> Option<String> {
+    let secs = std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    conn.query_row(
+        "SELECT strftime('%Y-%m-%d %H:%M:%S', ?1, 'unixepoch', 'localtime')",
+        [secs],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// 立即备份数据库（管理员）。默认写到与库同级的 `backups\ocw-时间戳.db`。
+#[tauri::command]
+pub async fn backup_database(
+    state: State<'_, AppState>,
+    dir: Option<String>,
+) -> Result<BackupResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let dir = match dir {
+            Some(d) if !d.trim().is_empty() => std::path::PathBuf::from(d.trim()),
+            _ => backups_dir(&db_path),
+        };
+        let target = dir.join(format!("ocw-{}.db", local_stamp(&conn)));
+        // 在线备份：WAL 里未 checkpoint 的事务也会一起带走
+        let bytes = ocw_store::backup_to(&conn, &target)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "backup_database",
+            None,
+            Some(&format!("path={} bytes={bytes}", target.display())),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(BackupResult {
+            path: target.display().to_string(),
+            bytes,
+        })
+    })
+    .await
+}
+
+/// 列出已有的备份文件（管理员）：`backups\` 目录 + 库同级的安全副本。
+#[tauri::command]
+pub async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupEntry>, CommandError> {
+    require_admin(&state)?;
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let mut out: Vec<BackupEntry> = Vec::new();
+
+        let mut dirs = vec![(backups_dir(&db_path), false)];
+        if let Some(parent) = db_path.parent() {
+            dirs.push((parent.to_path_buf(), true));
+        }
+
+        for (dir, safety_only) in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let is_safety = name.contains(".before-restore-") || name.ends_with(".bak");
+                // 数据库自身目录只列安全副本，别把正在用的 db 当备份
+                if safety_only && !is_safety {
+                    continue;
+                }
+                if !(is_safety || name.starts_with("ocw-")) {
+                    continue;
+                }
+                let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                out.push(BackupEntry {
+                    path: path.display().to_string(),
+                    name,
+                    bytes,
+                    modified_at: file_modified(&conn, &path),
+                    is_safety_copy: is_safety,
+                });
+            }
+        }
+
+        // 新的排前面；同时间按名字倒序，保证稳定
+        out.sort_by(|a, b| {
+            b.modified_at
+                .cmp(&a.modified_at)
+                .then_with(|| b.name.cmp(&a.name))
+        });
+        out.truncate(100);
+        Ok(out)
+    })
+    .await
+}
+
+/// 用备份覆盖当前库（管理员）。
+///
+/// 顺序刻意收紧：**先只读校验备份**（是不是我们的库、版本是否比本程序新）→
+/// 再把当前库另存为 `.before-restore-*.bak` → 最后才覆盖。
+/// 任何一步失败都不会动到正在用的数据。
+#[tauri::command]
+pub async fn restore_database(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<RestoreResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    blocking(move || {
+        let src = std::path::PathBuf::from(path.trim());
+        if !src.is_file() {
+            return Err(CommandError::new(
+                1,
+                format!("备份文件不存在：{}", src.display()),
+                "刷新备份列表后重试",
+            ));
+        }
+
+        // 1) 只读校验：不是我们的库 / 来自更新版本 → 直接拒绝，当前数据不动
+        let info = ocw_store::inspect_backup(&src).map_err(|e| {
+            CommandError::new(1, format!("备份文件不可用：{e}"), "换一个备份文件")
+        })?;
+        if info.schema_version > ocw_store::SCHEMA_VERSION {
+            return Err(CommandError::new(
+                1,
+                format!(
+                    "备份来自更新的版本（schema v{}），本程序只支持到 v{}",
+                    info.schema_version,
+                    ocw_store::SCHEMA_VERSION
+                ),
+                "升级程序后再恢复",
+            ));
+        }
+
+        let mut conn = lock_db(&db)?;
+
+        // 2) 先把 WAL 落盘，再给当前库留一份安全副本
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| CommandError::internal(format!("WAL 落盘失败：{e}")))?;
+        let before = db_path.with_file_name(format!(
+            "opencardwright.db.before-restore-{}.bak",
+            local_stamp(&conn)
+        ));
+        ocw_store::backup_to(&conn, &before)?;
+
+        // 3) 覆盖 + 迁移（备份可能来自老 schema）
+        ocw_store::restore_from(&mut conn, &src)?;
+        ocw_store::migrate(&conn)?;
+
+        let after = ocw_store::inspect_backup(&src)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "restore_database",
+            None,
+            Some(&format!(
+                "from={} before={} rooms={} issuances={}",
+                src.display(),
+                before.display(),
+                after.rooms,
+                after.issuances
+            )),
+            "ok",
+            Some(me.operator_id),
+        );
+
+        Ok(RestoreResult {
+            before: before.display().to_string(),
+            schema_version: after.schema_version,
+            rooms: after.rooms,
+            issuances: after.issuances,
+            operators: after.operators,
+        })
+    })
+    .await
+}
+
 /// 退房：登记退房 + 房态置为空脏房。
 ///
 /// 只做业务登记；要让门锁里的卡立刻失效，还需用退房钟点卡去刷锁。
