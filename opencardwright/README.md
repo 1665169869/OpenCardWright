@@ -268,6 +268,23 @@ fixtures/               CLI 输出样本（解析器测试用）
     离线构包），卡号、房号序号、原始字节都与真机一致，`CardNo.state` 照常自增；区别只是不真的写卡。
     这个构包器由 `scripts/build-sdk.ps1` 从 `tools/CardBuild.cs` 编译，缺了它会退回固定样本。
 
-## 8. 许可
+## 8. 命令 × 角色对照表
+
+后端 55 条 `#[tauri::command]` 的校验级别。**这张表是可执行的**：`commands.rs` 的
+`auth_matrix_matches_every_command` 会用 `include_str!` 扫源码逐条比对，删掉任何一处
+`require_admin` 都会让测试变红；新增命令必须先登记到测试里的 `MATRIX`。
+
+| 级别 | 数量 | 命令 |
+|---|---|---|
+| 公开（无需登录） | 6 | `app_info` `auth_status` `initialize_admin` `login` `logout` `log_frontend` |
+| 登录即可（前台日常 + 只读） | 18 | `read_card` `list_rooms` `run_selftest` `probe_ports` `card_no_status` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `expiring_cards` |
+| 管理员 | 31 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `set_water_warn_at` `reset_water_mark` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `get_backup_settings` `set_backup_settings` `import_backup_file` |
+
+约定：
+- 错误码 **401 = 未登录**、**403 = 权限不足**，前端按 `code` 区分提示，不要只匹配文案。
+- 只读命令不要锁给管理员 —— 前台查房、读卡、看到期是日常动作。
+- 公开命令只有认证入口与启动信息；新增公开命令要在 PR 里说明理由。
+
+## 9. 许可
 
 AGPL-3.0，见 `LICENSE`。商用部署、定制、实施服务不受限制；分发修改版须同样开源。

@@ -2616,6 +2616,10 @@ pub async fn import_backup_file(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::auth::{Role, Session};
+    use crate::state::{AppState, Device, DeviceSlot};
+    use std::sync::{Arc, Mutex};
     use super::AdminCardRequest;
 
     fn args(req: AdminCardRequest) -> Vec<String> {
@@ -2711,4 +2715,209 @@ mod tests {
         let req: AdminCardRequest = serde_json::from_str(r#"{"kind":"master","days":63}"#).unwrap();
         assert_eq!(args(req), vec!["--type", "master", "--days", "63"]);
     }
+    // ---------------- 角色鉴权：命令 × 角色矩阵 ----------------
+
+    /// 命令应具备的校验级别。
+    #[derive(PartialEq, Eq, Debug, Clone, Copy)]
+    enum Level {
+        Admin,
+        Login,
+        Public,
+    }
+
+    /// 全量对照表。**新增命令必须在这里登记**，否则矩阵测试会报「未登记」。
+    /// 三档数量：31 / 18 / 6（改动数量时同步改 `auth_matrix_counts`）。
+    const MATRIX: &[(&str, Level)] = &[
+        // 公开（启动即调用 / 认证入口）
+        ("app_info", Level::Public),
+        ("auth_status", Level::Public),
+        ("initialize_admin", Level::Public),
+        ("login", Level::Public),
+        ("logout", Level::Public),
+        ("log_frontend", Level::Public),
+        // 登录即可（前台日常操作 + 只读查询）
+        ("read_card", Level::Login),
+        ("list_rooms", Level::Login),
+        ("run_selftest", Level::Login),
+        ("probe_ports", Level::Login),
+        ("card_no_status", Level::Login),
+        ("issue_guest", Level::Login),
+        ("list_room_types", Level::Login),
+        ("list_room_statuses", Level::Login),
+        ("set_room_status", Level::Login),
+        ("room_move_preview", Level::Login),
+        ("room_move_out", Level::Login),
+        ("checkout_room", Level::Login),
+        ("checkout_card", Level::Login),
+        ("force_checkout_card", Level::Login),
+        ("get_checkout_status", Level::Login),
+        ("change_own_password", Level::Login),
+        ("get_reminder_settings", Level::Login),
+        ("expiring_cards", Level::Login),
+        // 管理员
+        ("set_port", Level::Admin),
+        ("create_room", Level::Admin),
+        ("delete_room", Level::Admin),
+        ("rename_room", Level::Admin),
+        ("issue_install_card", Level::Admin),
+        ("issue_admin_card", Level::Admin),
+        ("set_water_warn_at", Level::Admin),
+        ("reset_water_mark", Level::Admin),
+        ("list_departments", Level::Admin),
+        ("create_department", Level::Admin),
+        ("rename_department", Level::Admin),
+        ("set_department_active", Level::Admin),
+        ("create_room_type", Level::Admin),
+        ("rename_room_type", Level::Admin),
+        ("delete_room_type", Level::Admin),
+        ("set_room_type", Level::Admin),
+        ("set_room_max_cards", Level::Admin),
+        ("update_room_status_style", Level::Admin),
+        ("backup_database", Level::Admin),
+        ("list_backups", Level::Admin),
+        ("restore_database", Level::Admin),
+        ("set_room_type_color", Level::Admin),
+        ("set_checkout_status", Level::Admin),
+        ("list_operators", Level::Admin),
+        ("create_operator", Level::Admin),
+        ("reset_operator_password", Level::Admin),
+        ("set_operator_active", Level::Admin),
+        ("set_reminder_settings", Level::Admin),
+        ("get_backup_settings", Level::Admin),
+        ("set_backup_settings", Level::Admin),
+        ("import_backup_file", Level::Admin),
+    ];
+
+    /// 从源码里按 `#[tauri::command]` 切出每个命令的函数名与函数体（到顶格 `}` 为止）。
+    fn command_bodies() -> Vec<(String, String)> {
+        let src = include_str!("commands.rs");
+        let head = &src[..src.find("#[cfg(test)]").expect("找不到测试模块")];
+        let mut out = Vec::new();
+        for chunk in head.split("#[tauri::command]").skip(1) {
+            let Some(fn_at) = chunk.find("fn ") else {
+                continue;
+            };
+            let after = &chunk[fn_at + 3..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            // 函数体到下一个顶格 "}"（命令都是顶层函数，内部闭包都带缩进）
+            let body = match chunk.find("\n}\n") {
+                Some(end) => &chunk[..end],
+                None => chunk,
+            };
+            out.push((name, body.to_string()));
+        }
+        out
+    }
+
+    /// 矩阵必须覆盖全部命令，且每个命令的校验级别与代码一致。
+    ///
+    /// 这条测试的价值在于「删掉某个 require_admin 会立刻变红」——
+    /// 比人工逐条 review 可靠，也让新加的命令无处可逃。
+    #[test]
+    fn auth_matrix_matches_every_command() {
+        let bodies = command_bodies();
+        assert!(!bodies.is_empty(), "没切出任何命令，正则/切片逻辑坏了");
+
+        let mut problems = Vec::new();
+        for (name, body) in &bodies {
+            let expected = MATRIX.iter().find(|(n, _)| n == name).map(|(_, l)| *l);
+            let has_admin = body.contains("require_admin");
+            let has_login = body.contains("require_login");
+            match expected {
+                None => problems.push(format!("{name}: 未在 MATRIX 登记")),
+                Some(Level::Admin) => {
+                    if !has_admin {
+                        problems.push(format!("{name}: 应 require_admin，实际没有"));
+                    }
+                }
+                Some(Level::Login) => {
+                    if !has_login && !has_admin {
+                        problems.push(format!("{name}: 应 require_login/require_admin，实际没有"));
+                    }
+                }
+                Some(Level::Public) => {
+                    if has_admin || has_login {
+                        problems.push(format!("{name}: 标为公开却有校验（表需要更新）"));
+                    }
+                }
+            }
+        }
+        // 反向：表里登记了但源码里没有（改了名字没改表）
+        for (name, _) in MATRIX {
+            if !bodies.iter().any(|(n, _)| n == name) {
+                problems.push(format!("{name}: 表里有、源码里找不到"));
+            }
+        }
+        assert!(problems.is_empty(), "鉴权矩阵不一致：\n{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn auth_matrix_counts() {
+        let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
+        let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
+        let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
+        assert_eq!((admin, login, public), (31, 18, 6));
+        assert_eq!(command_bodies().len(), 55, "命令数量变了，矩阵要同步");
+    }
+
+    fn test_state(role: Option<Role>) -> AppState {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ocw-auth-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("t.db");
+        let conn = ocw_store::open(&db_path).unwrap();
+        AppState {
+            db: Arc::new(Mutex::new(conn)),
+            db_path,
+            slot: Arc::new(Mutex::new(DeviceSlot {
+                device: Device::Sim(ocw_device::SimDevice::default()),
+                port: 0,
+            })),
+            runtime_dir: dir,
+            driver_sha256: None,
+            sdk_source: None,
+            dev: true,
+            session: Arc::new(Mutex::new(role.map(|role| Session {
+                operator_id: 1,
+                login: "tester".into(),
+                display_name: "测试".into(),
+                role,
+                department_name: None,
+            }))),
+        }
+    }
+
+    #[test]
+    fn frontdesk_is_rejected_by_admin_guard_with_403() {
+        let st = test_state(Some(Role::Frontdesk));
+        let err = require_admin(&st).expect_err("前台不该通过管理员校验");
+        assert_eq!(err.code, 403);
+        assert!(err.message.contains("没有管理员权限"));
+    }
+
+    #[test]
+    fn anonymous_gets_401_from_both_guards() {
+        let st = test_state(None);
+        assert_eq!(require_login(&st).unwrap_err().code, 401);
+        assert_eq!(require_admin(&st).unwrap_err().code, 401);
+    }
+
+    #[test]
+    fn frontdesk_passes_login_guard() {
+        let st = test_state(Some(Role::Frontdesk));
+        let s = require_login(&st).expect("前台应能通过登录校验");
+        assert_eq!(s.role, Role::Frontdesk);
+        // 管理员命令仍然拒绝
+        assert_eq!(require_admin(&st).unwrap_err().code, 403);
+    }
+
 }
