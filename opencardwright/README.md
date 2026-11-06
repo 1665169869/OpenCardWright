@@ -28,7 +28,7 @@
 npm run build:sdk     # 编译 sdk/ → resources/sdk，跑 27 条黄金向量
 npx tsc --noEmit      # 前端类型检查
 npx vite build        # 前端产物
-- `cargo test --workspace` — **38 项全绿**（解析器 19、真实 selftest 集成 1、存储 9、命令层 9）
+- `cargo test --workspace` — **85 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 2、存储 32、命令层 23）
 ```
 
 功能规划、验收标准、风险登记见 `../plan/开源门锁发卡软件-建设方案-v0.2.md`；

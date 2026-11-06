@@ -15,6 +15,7 @@
 - `room_move_out` 增加 `cardNo` 参数（只用于审计留痕）：审计详情记 `readCard=0xXXXX`，未读卡记 `readCard=未读卡`。
 - `RoomMovePreview` 增加 `activeCardNos`；存储层新增 `active_guest_card_nos`（口径与有效卡计数一致，
   过期卡与管理卡不参与），测试覆盖。
+- 修复：`real_selftest` GBK 红测试（TD-502）——`ocw-device::cli::decode` 提为 `pub`，集成测试改用它解码。
 - 版本号 `2026.11.6+0038` → `2026.11.6+0039`。
 
 ## 2026.11.6+0038 — 2026-11-06

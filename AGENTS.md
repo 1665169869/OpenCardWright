@@ -21,6 +21,8 @@
 | `sdk/PMSLockSDK.cs` | 类库：`CardBuilder`（纯函数）、`LockCardReader`（P/Invoke）、配置/状态 | 见第 4 节约定 |
 | `sdk/PMSLockCard.cs` | CLI，含 `selftest` 的 27 条黄金样本 | 加样本只追加 |
 | `sdk/PMSLockSDK.Com.cs` | COM 可见封装（`PmsLockSdk.Reader`） | 改 ProgId/GUID 会破坏调用方 |
+| `sdk/demo/` | COM/VBScript 与 C# 调用示例（`Demo.cs`、`ComTest.vbs`），自含一份 SDK dll 副本 | 改接口时同步示例 |
+| `sdk/tools/RawRead.exe` | 原始读卡小工具（联机排障用） | 慎改 |
 | `sdk/IOServer/LC2000/*.dll` | 原厂读卡器驱动（x86，随包分发） | **不要动**，见第 3 节哈希 |
 | `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、16 位卡号计数器 | 状态文件是现场数据 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
