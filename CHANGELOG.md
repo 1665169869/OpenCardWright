@@ -3,6 +3,23 @@
 本文件记录 OpenCardWright 产品工作区（`opencardwright/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 2026.11.6+0045 — 2026-11-06
+
+### 模拟构包按卡型区分 + 修「安装卡白吃卡号」（TD-101）
+
+- `tools/CardBuild.cs` 新增 `--type`（guest-day / guest-hour / install / master / reset / clear /
+  checkout / timesync / raw）与 `--hour/--minute/--p1/--p2`；不带 `--type` 时保持老语义（客卡）。
+- **修 bug**：以前无条件 `CardNoStore.Next()`，安装卡也消耗卡号。实际 `BuildInstall` 不收卡号
+  （真机也不吃），现在只有含卡号的卡型才推进计数器，安装卡/raw 卡输出 `"cardNo":null`。
+- `SimDevice::issue_admin(args, room_index)`：把 CLI 参数原样转发给构包器，只把
+  `--room <房号>` 换成 `--index <序号>`；卡型中文名与 `parse.rs` 对齐（退房卡是「退房钟点设置卡」）。
+- `Device::issue(args, room_index)`：模拟分支先走构包器；**没有 `OCWCardBuild.exe` 时**，
+  安装卡/客卡退回固定样本，其它管理卡直接报错而不是静默回放客卡。
+- 新增 3 条测试：六类管理卡字节两两不同、安装卡不推进计数器（字节相同）、关键字节对齐已知向量
+  （总控页1 `5BECF0FF`、1095 天 `E3`、复位 `5BEC0A00`、清除 `5BEC9BE5`、安装页2 `46F20001`、校时 10:48 `5BEC392C`）。
+- 门禁：`npm run build:sdk` 27/27；`cargo test --workspace` **100 项全绿**。
+- 版本号 `2026.11.6+0044` → `2026.11.6+0045`。
+
 ## 2026.11.6+0044 — 2026-11-06
 
 ### 右键「预定房间」（TD-201）

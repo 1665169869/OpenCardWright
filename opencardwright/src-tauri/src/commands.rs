@@ -403,7 +403,10 @@ pub async fn issue_install_card(
         }
 
         // 设备调用期间不持有数据库锁
-        let card = device.issue(&["--type", "install", "--room", room_no.as_str()])?;
+        let card = device.issue(
+            &["--type", "install", "--room", room_no.as_str()],
+            Some(room.room_index),
+        )?;
 
         {
             let conn = lock_db(&db)?;
@@ -639,7 +642,7 @@ pub async fn issue_admin_card(
         };
 
         let started = Instant::now();
-        let issued = device.issue(&refs);
+        let issued = device.issue(&refs, room.as_ref().map(|r| r.room_index));
         let duration = started.elapsed().as_millis() as i64;
 
         match issued {
@@ -1102,7 +1105,7 @@ pub async fn issue_guest(
             if use_days { 0 } else { amount },
         ) {
             Some(res) => res?,
-            None => device.issue(&args)?,
+            None => device.issue(&args, Some(room.room_index))?,
         };
 
         // 5) 落库（含客人身份信息；身份信息只存库，不写卡）

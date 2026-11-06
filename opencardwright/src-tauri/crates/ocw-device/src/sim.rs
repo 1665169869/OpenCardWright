@@ -107,6 +107,94 @@ impl SimDevice {
         Some(parse::parse_card(&json, 0))
     }
 
+    /// 模拟发**管理卡**（总控 / 复位 / 清除 / 安装 / 退房钟点 / 校时 / raw）。
+    ///
+    /// 参数原样转发给 `OCWCardBuild.exe`，只做两件事：把 `--room <房号>` 换成
+    /// `--index <序号>`（构包器按序号算页1 第三/四字节），以及把输出翻译成统一的
+    /// 卡快照 JSON。返回 `None` 表示没有构包器，调用方决定回退还是报错。
+    pub fn issue_admin(
+        &self,
+        args: &[&str],
+        room_index: Option<u8>,
+    ) -> Option<Result<CardSnapshot, DeviceError>> {
+        let dir = self.runtime.as_ref()?;
+        let exe = dir.join("OCWCardBuild.exe");
+        if !exe.is_file() {
+            return None;
+        }
+
+        let state = dir.join("CardNo.state");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("--state")
+            .arg(&state)
+            .arg("--start")
+            .arg(format!("{:04X}", self.start));
+
+        let mut kind_type = String::new();
+        let mut days: u16 = 0;
+        let mut hours: u16 = 0;
+        let mut i = 0;
+        while i < args.len() {
+            let a = args[i];
+            // 构包器不认识房号（卡内只有序号），跳过它的值
+            if a == "--room" {
+                i += 2;
+                continue;
+            }
+            if a == "--type" && i + 1 < args.len() {
+                kind_type = args[i + 1].to_string();
+            } else if a == "--days" && i + 1 < args.len() {
+                days = args[i + 1].parse().unwrap_or(0);
+            } else if a == "--hours" && i + 1 < args.len() {
+                hours = args[i + 1].parse().unwrap_or(0);
+            }
+            cmd.arg(a);
+            i += 1;
+        }
+        if let Some(idx) = room_index {
+            cmd.arg("--index").arg(idx.to_string());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+
+        let out = cmd.output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.contains("\"ok\":true") {
+            let msg = json_field(&text, "msg").unwrap_or_else(|| text.to_string());
+            return Some(Err(DeviceError::Protocol(format!(
+                "模拟构包失败：{msg}"
+            ))));
+        }
+
+        let raw = match json_field(&text, "raw") {
+            Some(v) => v,
+            None => return Some(Err(DeviceError::Protocol("构包器输出缺少 raw".into()))),
+        };
+        // 安装卡 / raw 卡不含卡号：构包器给的是 null，解析器能接受
+        let card_no = json_field(&text, "cardNo").unwrap_or_else(|| "null".into());
+
+        // 卡型中文名要和 parse.rs 认的名字一致（退房是「退房钟点设置卡」全称）
+        let kind = match kind_type.as_str() {
+            "master" => "总控卡",
+            "reset" => "复位卡",
+            "clear" => "清除卡",
+            "install" => "安装卡",
+            "checkout" => "退房钟点设置卡",
+            "timesync" => "校时卡",
+            "raw" => "自定义卡",
+            _ => "管理卡",
+        };
+        let idx = room_index.map(|v| v as i32).unwrap_or(-1);
+        let json = format!(
+            r#"{{"ok":true,"card":{{"kind":"{kind}","room":null,"roomIndex":{idx},"days":{days},"hours":{hours},"cardNo":{card_no},"raw":"{raw}"}}}}"#
+        );
+        Some(parse::parse_card(&json, 0))
+    }
+
     pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
         parse::parse_selftest(SELFTEST_OK)
     }

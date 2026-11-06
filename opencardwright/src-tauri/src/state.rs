@@ -44,16 +44,29 @@ impl Device {
         }
     }
 
-    pub fn issue(&self, args: &[&str]) -> Result<CardSnapshot, DeviceError> {
+    /// 写一张卡。`room_index` 只有模拟构包器用得上（卡里存的是序号不是房号）。
+    pub fn issue(&self, args: &[&str], room_index: Option<u8>) -> Result<CardSnapshot, DeviceError> {
         match self {
             Self::Cli(d) => d.issue(args),
-            Self::Sim(_) => {
-                let sample = if args.contains(&"install") {
-                    ocw_device::sim::INSTALL_JSON
-                } else {
-                    ocw_device::sim::GUEST_DAY_JSON
-                };
-                parse::parse_card(sample, 0)
+            Self::Sim(d) => {
+                // 有构包器就按卡型真实构包（字节与真机一致），没有才回退
+                if let Some(res) = d.issue_admin(args, room_index) {
+                    return res;
+                }
+                let kind = args
+                    .iter()
+                    .position(|a| *a == "--type")
+                    .and_then(|i| args.get(i + 1))
+                    .copied();
+                match kind {
+                    // 安装卡与客卡有固定样本可回放
+                    Some("install") => parse::parse_card(ocw_device::sim::INSTALL_JSON, 0),
+                    // 其它管理卡没有样本：宁可报错，也不要静默回放客卡让人以为发对了
+                    Some(other) => Err(DeviceError::Protocol(format!(
+                        "模拟设备缺少 OCWCardBuild.exe，无法构 {other} 卡（先跑 npm run build:sdk）"
+                    ))),
+                    None => parse::parse_card(ocw_device::sim::GUEST_DAY_JSON, 0),
+                }
             }
         }
     }
