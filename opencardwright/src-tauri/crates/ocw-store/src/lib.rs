@@ -1548,6 +1548,253 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+
+// ---------------------------------------------------------------- 发卡记录 / 操作审计
+
+/// 发卡记录筛选条件。全部可选，`page` 从 1 开始。
+#[derive(Debug, Clone, Default)]
+pub struct IssuanceFilter {
+    pub room_no: Option<String>,
+    pub card_no: Option<u16>,
+    pub kind: Option<String>,
+    /// ISO8601 UTC 下界（含）
+    pub from: Option<String>,
+    /// ISO8601 UTC 上界（不含）
+    pub to: Option<String>,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+/// 列表用的发卡记录行（比 [`IssuanceRecord`] 宽，且**不复用**它 —— 那条被读卡/换房链路共用，
+/// 加列会牵动一大片）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuanceRow {
+    pub id: i64,
+    pub created_at: String,
+    pub room_no: Option<String>,
+    pub kind: String,
+    pub days: i64,
+    pub hours: i64,
+    pub card_no: Option<u16>,
+    pub guest_name: Option<String>,
+    pub guest_id_type: Option<String>,
+    pub guest_id_number: Option<String>,
+    pub operator_name: Option<String>,
+    pub result: String,
+    pub expires_at: Option<String>,
+    pub checked_out_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub raw_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    pub id: i64,
+    pub at: String,
+    pub action: String,
+    pub target: Option<String>,
+    /// `audit_log.detail_json` 里实际存的是自由文本，字段名叫 detail 才不误导
+    pub detail: Option<String>,
+    pub result: String,
+    pub operator_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page<T> {
+    pub rows: Vec<T>,
+    pub total: i64,
+}
+
+const MAX_PAGE_SIZE: i64 = 200;
+
+fn limit_offset(page: i64, page_size: i64) -> (i64, i64) {
+    // 0 / 负数按默认 50 处理（别把"没传"变成"只取 1 条"）
+    let size = if page_size <= 0 {
+        50
+    } else {
+        page_size.min(MAX_PAGE_SIZE)
+    };
+    let page = page.max(1);
+    (size, (page - 1) * size)
+}
+
+/// 发卡记录列表：房号前缀 / 卡号 / 卡型 / 时间范围 + 分页，按时间倒序。
+pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<IssuanceRow>> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = String::from(" WHERE 1 = 1");
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(room) = f.room_no.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND room_no LIKE ? || '%'");
+        vals.push(Value::Text(room.to_string()));
+    }
+    if let Some(card) = f.card_no {
+        where_sql.push_str(" AND card_no = ?");
+        vals.push(Value::Integer(card as i64));
+    }
+    if let Some(kind) = f.kind.as_ref().filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND kind = ?");
+        vals.push(Value::Text(kind.to_string()));
+    }
+    if let Some(from) = f.from.as_ref().filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND created_at >= ?");
+        vals.push(Value::Text(from.to_string()));
+    }
+    if let Some(to) = f.to.as_ref().filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND created_at < ?");
+        vals.push(Value::Text(to.to_string()));
+    }
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM issuance{where_sql}"),
+        rusqlite::params_from_iter(vals.iter()),
+        |r| r.get(0),
+    )?;
+
+    let (size, offset) = limit_offset(f.page, f.page_size);
+    let sql = format!(
+        "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
+                i.guest_name, i.guest_id_type, i.guest_id_number, o.display_name,
+                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
+           FROM issuance i
+           LEFT JOIN operator o ON o.id = i.operator_id
+           {where_sql}
+          ORDER BY i.created_at DESC, i.id DESC
+          LIMIT ? OFFSET ?"
+    );
+    let mut all = vals;
+    all.push(Value::Integer(size));
+    all.push(Value::Integer(offset));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(all.iter()), |r| {
+        Ok(IssuanceRow {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            room_no: r.get(2)?,
+            kind: r.get(3)?,
+            days: r.get(4)?,
+            hours: r.get(5)?,
+            card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
+            guest_name: r.get(7)?,
+            guest_id_type: r.get(8)?,
+            guest_id_number: r.get(9)?,
+            operator_name: r.get(10)?,
+            result: r.get(11)?,
+            expires_at: r.get(12)?,
+            checked_out_at: r.get(13)?,
+            duration_ms: r.get(14)?,
+            raw_hex: r.get(15)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(Page { rows: out, total })
+}
+
+/// 操作审计列表：动作前缀 / 时间范围 + 分页。
+pub fn list_audits(
+    conn: &Connection,
+    action: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+    page: i64,
+    page_size: i64,
+) -> Result<Page<AuditRow>> {
+    use rusqlite::types::Value;
+    let mut where_sql = String::from(" WHERE 1 = 1");
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(a) = action.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND a.action LIKE ? || '%'");
+        vals.push(Value::Text(a.to_string()));
+    }
+    if let Some(f) = from.filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND a.at >= ?");
+        vals.push(Value::Text(f.to_string()));
+    }
+    if let Some(t) = to.filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND a.at < ?");
+        vals.push(Value::Text(t.to_string()));
+    }
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM audit_log a{where_sql}"),
+        rusqlite::params_from_iter(vals.iter()),
+        |r| r.get(0),
+    )?;
+
+    let (size, offset) = limit_offset(page, page_size);
+    let sql = format!(
+        "SELECT a.id, a.at, a.action, a.target, a.detail_json, a.result, o.display_name
+           FROM audit_log a LEFT JOIN operator o ON o.id = a.operator_id
+           {where_sql}
+          ORDER BY a.at DESC, a.id DESC
+          LIMIT ? OFFSET ?"
+    );
+    let mut all = vals;
+    all.push(Value::Integer(size));
+    all.push(Value::Integer(offset));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(all.iter()), |r| {
+        Ok(AuditRow {
+            id: r.get(0)?,
+            at: r.get(1)?,
+            action: r.get(2)?,
+            target: r.get(3)?,
+            detail: r.get(4)?,
+            result: r.get(5)?,
+            operator_name: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(Page { rows: out, total })
+}
+
+/// 同一张卡号的全部写入记录（按时间正序）——用来解释"这张卡被改写过几次"。
+pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<IssuanceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
+                i.guest_name, i.guest_id_type, i.guest_id_number, o.display_name,
+                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
+           FROM issuance i LEFT JOIN operator o ON o.id = i.operator_id
+          WHERE i.card_no = ?1
+          ORDER BY i.created_at ASC, i.id ASC
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![card_no as i64, limit.clamp(1, 500)], |r| {
+        Ok(IssuanceRow {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            room_no: r.get(2)?,
+            kind: r.get(3)?,
+            days: r.get(4)?,
+            hours: r.get(5)?,
+            card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
+            guest_name: r.get(7)?,
+            guest_id_type: r.get(8)?,
+            guest_id_number: r.get(9)?,
+            operator_name: r.get(10)?,
+            result: r.get(11)?,
+            expires_at: r.get(12)?,
+            checked_out_at: r.get(13)?,
+            duration_ms: r.get(14)?,
+            raw_hex: r.get(15)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2321,6 +2568,63 @@ mod tests {
 
         deactivate_room(&conn, "702").unwrap();
         delete_room_type(&conn, t.id).expect("房间已删，房型应可删");
+        cleanup(conn, path);
+    }
+
+    /// 记录页的筛选与分页：条数要与直查一致，超上限的 page_size 要被夹住。
+    #[test]
+    fn list_issuances_filters_and_paginates() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "801", Some(80), None, None, None).unwrap();
+        insert_room(&conn, "802", Some(81), None, None, None).unwrap();
+        for i in 0..5 {
+            let room = if i % 2 == 0 { Some("801") } else { Some("802") };
+            record_issuance(&conn, &sample_issuance(room, "日租客卡", 1, 0)).unwrap();
+        }
+
+        let all = list_issuances(&conn, &IssuanceFilter::default()).unwrap();
+        assert_eq!(all.total, 5);
+        assert_eq!(all.rows.len(), 5);
+
+        let only = list_issuances(
+            &conn,
+            &IssuanceFilter {
+                room_no: Some("801".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(only.total, 3, "801 房应有 3 条");
+
+        let paged = list_issuances(
+            &conn,
+            &IssuanceFilter {
+                page: 2,
+                page_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(paged.total, 5);
+        assert_eq!(paged.rows.len(), 2);
+
+        cleanup(conn, path);
+    }
+
+    /// 审计列表能查到刚写的动作，且带操作员显示名。
+    #[test]
+    fn list_audits_finds_recent_action() {
+        let (conn, path) = temp_db();
+        let op = insert_operator(&conn, "u1", "值班", "frontdesk", "hash", None).unwrap();
+        record_audit(&conn, "checkout_room", Some("801"), Some("cardsClosed=1"), "ok", Some(op.id))
+            .unwrap();
+
+        let page = list_audits(&conn, Some("checkout"), None, None, 1, 20).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].action, "checkout_room");
+        assert_eq!(page.rows[0].detail.as_deref(), Some("cardsClosed=1"));
+        assert_eq!(page.rows[0].operator_name.as_deref(), Some("值班"));
+
         cleanup(conn, path);
     }
 

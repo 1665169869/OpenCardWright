@@ -16,6 +16,7 @@ import {
   IdcardOutlined,
   LogoutOutlined,
   ScanOutlined,
+  HistoryOutlined,
   SettingOutlined,
 } from '@ant-design/icons'
 import {
@@ -32,6 +33,7 @@ import {
 } from './api'
 import AuthGate from './pages/AuthGate'
 import ReadCard from './pages/ReadCard'
+import Logs from './pages/Logs'
 import RoomManager from './pages/RoomManager'
 import AdminCards from './pages/AdminCards'
 import Settings from './pages/Settings'
@@ -210,6 +212,7 @@ export default function App() {
       ),
     },
     { key: 'read', icon: <ScanOutlined />, label: '读卡', children: <ReadCard /> },
+    { key: 'logs', icon: <HistoryOutlined />, label: '记录', children: <Logs canAdmin={admin} /> },
   ]
 
   if (admin) {

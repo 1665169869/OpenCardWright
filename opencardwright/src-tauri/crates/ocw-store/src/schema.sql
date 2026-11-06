@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS issuance (
 
 CREATE INDEX IF NOT EXISTS idx_issuance_card_no ON issuance (card_no);
 CREATE INDEX IF NOT EXISTS idx_issuance_created ON issuance (created_at DESC);
+-- 记录页的筛选常用列（v7 内追加即可：迁移每次启动都会执行本文件，索引对读方透明）
+CREATE INDEX IF NOT EXISTS idx_issuance_room ON issuance (room_no);
+CREATE INDEX IF NOT EXISTS idx_issuance_kind ON issuance (kind);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +69,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_log (at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log (action);
 
 CREATE TABLE IF NOT EXISTS device (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -2706,6 +2706,215 @@ pub async fn export_diagnostics(
     .await
 }
 
+// ---------------------------------------------------------------- 发卡记录 / 操作审计
+
+type IssuancePage = ocw_store::Page<ocw_store::IssuanceRow>;
+type AuditPage = ocw_store::Page<ocw_store::AuditRow>;
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn list_issuances(
+    state: State<'_, AppState>,
+    room_no: Option<String>,
+    card_no: Option<u16>,
+    kind: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<IssuancePage, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let filter = ocw_store::IssuanceFilter {
+            room_no,
+            card_no,
+            kind,
+            from,
+            to,
+            page: page.unwrap_or(1),
+            page_size: page_size.unwrap_or(50),
+        };
+        Ok(ocw_store::list_issuances(&conn, &filter)?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_audits(
+    state: State<'_, AppState>,
+    action: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<AuditPage, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::list_audits(
+            &conn,
+            action.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+            page.unwrap_or(1),
+            page_size.unwrap_or(50),
+        )?)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn card_history(
+    state: State<'_, AppState>,
+    card_no: u16,
+) -> Result<Vec<ocw_store::IssuanceRow>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::card_history(&conn, card_no, 200)?)
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CsvResult {
+    pub path: String,
+    pub rows: i64,
+    pub bytes: u64,
+}
+
+/// CSV 单元格转义：含逗号/引号/换行就加引号并把内部引号翻倍；
+/// 以 `= + - @` 开头的前置单引号，避免 Excel 把内容当公式执行。
+fn csv_cell(value: &str) -> String {
+    let needs_prefix = value.starts_with(['=', '+', '-', '@']);
+    let escaped = value.replace('"', "\"\"");
+    let cell = if escaped.contains([',', '"', '\n', '\r']) {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    };
+    if needs_prefix {
+        format!("'{cell}")
+    } else {
+        cell
+    }
+}
+
+/// 导出 CSV 文本（纯函数，便于单测）：UTF-8 BOM + CRLF，Excel 双击不乱码。
+pub fn issuances_to_csv(rows: &[ocw_store::IssuanceRow]) -> String {
+    let mut out = String::from("\u{feff}");
+    out.push_str("记录ID,发卡时间,房号,卡型,天数,小时,卡号,客人,证件类型,证件号码,操作员,结果,到期时间,退房时间,耗时ms,原始数据\r\n");
+    for r in rows {
+        let cells = [
+            r.id.to_string(),
+            r.created_at.clone(),
+            r.room_no.clone().unwrap_or_default(),
+            r.kind.clone(),
+            r.days.to_string(),
+            r.hours.to_string(),
+            r.card_no.map(|n| format!("0x{n:04X}")).unwrap_or_default(),
+            r.guest_name.clone().unwrap_or_default(),
+            r.guest_id_type.clone().unwrap_or_default(),
+            r.guest_id_number.clone().unwrap_or_default(),
+            r.operator_name.clone().unwrap_or_default(),
+            r.result.clone(),
+            r.expires_at.clone().unwrap_or_default(),
+            r.checked_out_at.clone().unwrap_or_default(),
+            r.duration_ms.map(|v| v.to_string()).unwrap_or_default(),
+            r.raw_hex.clone().unwrap_or_default(),
+        ];
+        let line: Vec<String> = cells.iter().map(|c| csv_cell(c)).collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// 导出目录：桌面 → OneDrive 桌面 → 下载 → 数据目录 exports（取第一个存在的）。
+fn export_dir() -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if !home.is_empty() {
+        let desktop = std::path::PathBuf::from(&home).join("Desktop");
+        if desktop.is_dir() {
+            return desktop;
+        }
+        if let Ok(one) = std::env::var("OneDrive") {
+            let d = std::path::PathBuf::from(one).join("Desktop");
+            if d.is_dir() {
+                return d;
+            }
+        }
+        let downloads = std::path::PathBuf::from(&home).join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+    }
+    crate::provision::data_root().join("exports")
+}
+
+/// 导出当前筛选结果为 CSV（管理员）。上限 5 万行：超了让用户缩范围，不静默截断。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn export_issuances_csv(
+    state: State<'_, AppState>,
+    room_no: Option<String>,
+    card_no: Option<u16>,
+    kind: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<CsvResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let filter = ocw_store::IssuanceFilter {
+            room_no,
+            card_no,
+            kind,
+            from,
+            to,
+            page: 1,
+            page_size: 50_000,
+        };
+        let page = ocw_store::list_issuances(&conn, &filter)?;
+        if page.rows.len() >= 50_000 {
+            return Err(CommandError::new(
+                1,
+                "结果超过 5 万行，请缩小日期范围再导出",
+                "按月份分批导出",
+            ));
+        }
+        let csv = issuances_to_csv(&page.rows);
+        let dir = export_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CommandError::internal(format!("创建导出目录失败：{e}")))?;
+        let name = format!("发卡记录-{}.csv", local_stamp(&conn));
+        let path = dir.join(name);
+        std::fs::write(&path, csv.as_bytes())
+            .map_err(|e| CommandError::internal(format!("写 CSV 失败：{e}")))?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = ocw_store::record_audit(
+            &conn,
+            "export_issuances_csv",
+            None,
+            Some(&format!("rows={} path={}", page.rows.len(), path.display())),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(CsvResult {
+            path: path.display().to_string(),
+            rows: page.rows.len() as i64,
+            bytes,
+        })
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2846,6 +3055,9 @@ mod tests {
         ("change_own_password", Level::Login),
         ("get_reminder_settings", Level::Login),
         ("expiring_cards", Level::Login),
+        ("list_issuances", Level::Login),
+        ("list_audits", Level::Login),
+        ("card_history", Level::Login),
         // 管理员
         ("set_port", Level::Admin),
         ("create_room", Level::Admin),
@@ -2878,6 +3090,8 @@ mod tests {
         ("get_backup_settings", Level::Admin),
         ("set_backup_settings", Level::Admin),
         ("import_backup_file", Level::Admin),
+        ("export_diagnostics", Level::Admin),
+        ("export_issuances_csv", Level::Admin),
     ];
 
     /// 从源码里按 `#[tauri::command]` 切出每个命令的函数名与函数体（到顶格 `}` 为止）。
@@ -2954,8 +3168,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (31, 18, 6));
-        assert_eq!(command_bodies().len(), 55, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (33, 21, 6));
+        assert_eq!(command_bodies().len(), 60, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {
@@ -3010,6 +3224,36 @@ mod tests {
         assert_eq!(s.role, Role::Frontdesk);
         // 管理员命令仍然拒绝
         assert_eq!(require_admin(&st).unwrap_err().code, 403);
+    }
+
+    /// CSV：BOM 开头、CRLF 换行、逗号/引号转义、公式注入防护。
+    #[test]
+    fn csv_escapes_and_has_bom() {
+        let row = ocw_store::IssuanceRow {
+            id: 7,
+            created_at: "2026-11-06T03:00:00Z".into(),
+            room_no: Some("220".into()),
+            kind: "日租客卡".into(),
+            days: 1,
+            hours: 0,
+            card_no: Some(0x2404),
+            guest_name: Some("张三,李四".into()),
+            guest_id_type: Some("身份证".into()),
+            guest_id_number: Some("=1+1".into()),
+            operator_name: Some("值班\"甲".into()),
+            result: "ok".into(),
+            expires_at: None,
+            checked_out_at: None,
+            duration_ms: Some(120),
+            raw_hex: Some("5BECF100810424AB".into()),
+        };
+        let csv = issuances_to_csv(&[row]);
+        assert!(csv.starts_with('\u{feff}'), "必须以 BOM 开头");
+        assert!(csv.contains("\r\n"), "必须用 CRLF");
+        assert!(csv.contains("\"张三,李四\""), "逗号字段要加引号");
+        assert!(csv.contains("'=1+1"), "公式注入要前置单引号");
+        assert!(csv.contains("\"值班\"\"甲\""), "内部引号要翻倍");
+        assert!(csv.contains("0x2404"));
     }
 
 }

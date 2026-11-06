@@ -156,6 +156,59 @@ export interface RoomMovePreview {
   activeCardNos: number[]
 }
 
+/** 发卡记录行（记录页用，比读卡用的 IssuanceRecord 宽）。 */
+export interface IssuanceRow {
+  id: number
+  createdAt: string
+  roomNo: string | null
+  kind: string
+  days: number
+  hours: number
+  cardNo: number | null
+  guestName: string | null
+  guestIdType: string | null
+  guestIdNumber: string | null
+  operatorName: string | null
+  result: string
+  expiresAt: string | null
+  checkedOutAt: string | null
+  durationMs: number | null
+  rawHex: string | null
+}
+
+/** 操作审计行；`detail` 是后端拼的文本（列名叫 detail_json 但实际不是 JSON）。 */
+export interface AuditRow {
+  id: number
+  at: string
+  action: string
+  target: string | null
+  detail: string | null
+  result: string
+  operatorName: string | null
+}
+
+export interface Page<T> {
+  rows: T[]
+  total: number
+}
+
+export interface CsvResult {
+  path: string
+  rows: number
+  bytes: number
+}
+
+/** 记录页的筛选参数（时间为 ISO UTC 字符串） */
+export interface LogFilter {
+  roomNo?: string | null
+  cardNo?: number | null
+  kind?: string | null
+  from?: string | null
+  to?: string | null
+  page?: number
+  pageSize?: number
+}
+
 /** 备份结果：备份文件落在哪、多大。 */
 export interface BackupResult {
   path: string
@@ -390,6 +443,38 @@ export const api = {
   exportDiagnostics: () => invoke<DiagnosticsResult>('export_diagnostics'),
   /** 用备份覆盖当前库（管理员）：先只读校验，再把当前库另存为 .before-restore-*.bak */
   restoreDatabase: (path: string) => invoke<RestoreResult>('restore_database', { path }),
+  /** 发卡记录（登录即可，前台也要查） */
+  listIssuances: (f: LogFilter) =>
+    invoke<Page<IssuanceRow>>('list_issuances', {
+      roomNo: f.roomNo ?? null,
+      cardNo: f.cardNo ?? null,
+      kind: f.kind ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+      page: f.page ?? 1,
+      pageSize: f.pageSize ?? 50,
+    }),
+  /** 操作审计（登录即可） */
+  listAudits: (f: { action?: string | null; from?: string | null; to?: string | null; page?: number; pageSize?: number }) =>
+    invoke<Page<AuditRow>>('list_audits', {
+      action: f.action ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+      page: f.page ?? 1,
+      pageSize: f.pageSize ?? 50,
+    }),
+  /** 同一卡号的全部写入记录 */
+  cardHistory: (cardNo: number) => invoke<IssuanceRow[]>('card_history', { cardNo }),
+  /** 导出当前筛选为 CSV（管理员）：后端落盘并返回路径 */
+  exportIssuancesCsv: (f: LogFilter) =>
+    invoke<CsvResult>('export_issuances_csv', {
+      roomNo: f.roomNo ?? null,
+      cardNo: f.cardNo ?? null,
+      kind: f.kind ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+    }),
+
   /** 自动备份设置（管理员） */
   getBackupSettings: () => invoke<BackupSettings>('get_backup_settings'),
   setBackupSettings: (intervalMinutes: number, keep: number) =>
