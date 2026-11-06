@@ -203,11 +203,13 @@ export default function AdminCards({
                 value={roomNo}
                 onChange={setRoomNo}
                 optionFilterProp="label"
-                options={rooms.map((r) => ({
-                  value: r.roomNo,
-                  label: `${r.roomNo}（序号 ${r.roomIndex}）`,
-                  disabled: !r.active,
-                }))}
+                // 已逻辑删除的房间不再作为新发卡入口（历史卡仍可在房间页退）
+                options={rooms
+                  .filter((r) => r.active)
+                  .map((r) => ({
+                    value: r.roomNo,
+                    label: `${r.roomNo}（序号 ${r.roomIndex}）`,
+                  }))}
               />
             </Space>
           ) : null}

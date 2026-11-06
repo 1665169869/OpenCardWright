@@ -231,15 +231,20 @@ pub async fn list_rooms(state: State<'_, AppState>) -> Result<Vec<Room>, Command
         Ok(ocw_store::list_rooms(&conn)?)
     })
     .await
-}/// 新增房间。序号不传则自动分配 0–255 中最小的空闲值。
+}
+
+/// 新增房间。序号不传则自动分配 0–255 中最小的空闲值。
+///
+/// 如果传的序号属于一条**已逻辑删除**的房间，会复用那条记录（只改房名）并返回
+/// `revivedFrom`，因为序号已随门锁绑定、不能真正插一行新记录。
 #[tauri::command]
 pub async fn create_room(
     state: State<'_, AppState>,
     room_no: String,
     room_index: Option<u8>,
     room_type_id: Option<i64>,
-) -> Result<Room, CommandError> {
-    require_admin(&state)?;
+) -> Result<ocw_store::RoomUpsert, CommandError> {
+    let me = require_admin(&state)?;
     let room_no = require_room_no(&room_no)?;
     let db = state.db.clone();
     blocking(move || {
@@ -255,14 +260,107 @@ pub async fn create_room(
                 return Err(CommandError::new(1, "房型不存在", "刷新房型列表后重选"));
             }
         }
-        Ok(ocw_store::insert_room(
+        let upsert = ocw_store::insert_room_reporting(
             &conn,
             &room_no,
             room_index,
             None,
             None,
             room_type_id,
-        )?)
+        )?;
+        // 复用老记录这种"看不见的写操作"更需要留痕
+        let _ = ocw_store::record_audit(
+            &conn,
+            "create_room",
+            Some(&room_no),
+            Some(&format!(
+                "roomIndex={},revivedFrom={}",
+                upsert.room.room_index,
+                upsert.revived_from.as_deref().unwrap_or("-")
+            )),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(upsert)
+    })
+    .await
+}
+
+/// 删除房间 = 逻辑删除：只置 `active = 0`，序号不释放、历史发卡记录保留。
+///
+/// 场上还有有效卡时拒绝，理由和改房号一样：卡是按房号对账的，
+/// 房间一旦从房间图消失，这些卡就没有地方退了。
+#[tauri::command]
+pub async fn delete_room(state: State<'_, AppState>, room_no: String) -> Result<(), CommandError> {
+    let me = require_admin(&state)?;
+    let room_no = require_room_no(&room_no)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let room = ocw_store::find_room(&conn, &room_no)?.ok_or_else(|| {
+            CommandError::new(1, format!("房号不存在：{room_no}"), "刷新房间列表后重试")
+        })?;
+        if !room.active {
+            return Err(CommandError::new(1, format!("{room_no} 房已经删除了"), "刷新房间列表"));
+        }
+        let cards = ocw_store::count_active_cards(&conn, &room_no)?;
+        if cards > 0 {
+            return Err(CommandError::new(
+                2,
+                format!("{room_no} 房还有 {cards} 张有效卡，不能删除"),
+                "请先退房（读卡退房 / 无卡退房）再删除",
+            ));
+        }
+        ocw_store::deactivate_room(&conn, &room_no)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "delete_room",
+            Some(&room_no),
+            Some(&format!("roomIndex={}", room.room_index)),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// 改房号（房间显示名称），序号保持不变。
+#[tauri::command]
+pub async fn rename_room(
+    state: State<'_, AppState>,
+    room_no: String,
+    new_room_no: String,
+) -> Result<ocw_store::Room, CommandError> {
+    let me = require_admin(&state)?;
+    let old_no = require_room_no(&room_no)?;
+    let new_no = require_room_no(&new_room_no)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        if ocw_store::find_room(&conn, &old_no)?.is_none() {
+            return Err(CommandError::new(1, format!("房号不存在：{old_no}"), "刷新房间列表后重试"));
+        }
+        // 退房/发卡都按房号关联，场上还有卡时改名会让这些卡对不上账
+        let cards = ocw_store::count_active_cards(&conn, &old_no)?;
+        if cards > 0 {
+            return Err(CommandError::new(
+                2,
+                format!("{old_no} 房还有 {cards} 张有效卡，不能改房号"),
+                "请先退房（读卡退房 / 无卡退房）再改",
+            ));
+        }
+        ocw_store::rename_room(&conn, &old_no, &new_no)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "rename_room",
+            Some(&old_no),
+            Some(&format!("to={new_no}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        ocw_store::find_room(&conn, &new_no)?
+            .ok_or_else(|| CommandError::new(1, "改名后读不回该房间", "刷新房间列表"))
     })
     .await
 }
@@ -521,9 +619,18 @@ pub async fn issue_admin_card(
 
         let room = if let Some(no) = &room_no {
             let conn = lock_db(&db)?;
-            Some(ocw_store::find_room(&conn, no)?.ok_or_else(|| {
+            let room = ocw_store::find_room(&conn, no)?.ok_or_else(|| {
                 CommandError::new(1, format!("房号不存在：{no}"), "请先在房间管理里新增该房号")
-            })?)
+            })?;
+            // 已逻辑删除的房间不能再做安装卡（与 issue_install_card 的护栏一致）
+            if !room.active {
+                return Err(CommandError::new(
+                    1,
+                    format!("房间已删除：{no}"),
+                    "先新增该序号的房间再制作安装卡",
+                ));
+            }
+            Some(room)
         } else {
             None
         };
@@ -1396,6 +1503,48 @@ pub async fn checkout_card(
             Some(me.operator_id),
         );
         Ok(CheckoutCardResult { room_no, remaining })
+    })
+    .await
+}
+
+/// 强制退房：卡不是本系统发的（本地没有发卡记录），按卡号找不到房间，
+/// 只能按前端从卡片数据里读出的房号，**直接写入退房数据**。
+///
+/// 语义等同该房间的「无卡退房」：关闭该房全部有效卡 + 房态置为退房默认态，
+/// 并在审计里记下是强制退房、来自哪个卡号。调用方必须先让用户二次确认。
+#[tauri::command]
+pub async fn force_checkout_card(
+    state: State<'_, AppState>,
+    room_no: String,
+    card_no: u16,
+) -> Result<CheckoutResult, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let room_no = room_no.trim().to_string();
+        if room_no.is_empty() {
+            return Err(CommandError::new(
+                1,
+                "没有确定要退的房间".to_string(),
+                "这张卡的数据里没有房号，本机也没有对应序号的房间；请改用右键菜单的「无卡退房」",
+            ));
+        }
+        let conn = lock_db(&db)?;
+        let dirty = ocw_store::checkout_status(&conn)?;
+        let closed = ocw_store::checkout_room(&conn, &room_no, &dirty)? as i64;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "force_checkout_card",
+            Some(&room_no),
+            Some(&format!("cardNo={card_no} cardsClosed={closed} foreignCard=true")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(CheckoutResult {
+            room_no,
+            cards_closed: closed,
+            status: dirty,
+        })
     })
     .await
 }

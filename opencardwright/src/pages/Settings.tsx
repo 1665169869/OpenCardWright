@@ -28,6 +28,7 @@ import {
 } from '../api'
 import { tryPreview } from '../utils/sound'
 import PasswordRules from '../components/PasswordRules'
+import DevicePanel from './DevicePanel'
 import { confirmIssue, passwordIssues } from '../utils/password'
 import { loginIssue, textIssue } from '../utils/validate'
 import { ICON_CHOICES, statusIcon } from '../components/StatusIcon'
@@ -41,11 +42,13 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
     <Card title="设置">
       <Tabs
         items={[
+          // 设备曾是顶级页签，现在收进设置里做第一个二级页签
+          { key: 'device', label: '设备', children: <DevicePanel onChanged={onChanged} /> },
           { key: 'reminder', label: '到期提醒', children: <ReminderPanel onChanged={onChanged} /> },
           { key: 'departments', label: '部门', children: <DepartmentPanel onChanged={onChanged} /> },
           { key: 'operators', label: '用户', children: <OperatorPanel onChanged={onChanged} /> },
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
-          { key: 'roomstatus', label: '房态', children: <RoomStatusPanel /> },
+          { key: 'roomstatus', label: '房态', children: <RoomStatusPanel onChanged={onChanged} /> },
           { key: 'water', label: '水位', children: <WaterPanel onChanged={onChanged} /> },
         ]}
       />
@@ -627,6 +630,7 @@ function RoomTypePanel({ onChanged }: { onChanged?: () => void }) {
       await api.deleteRoomType(t.id)
       setMsg(`已删除房型 ${t.name}`)
       await reload()
+      onChanged?.()
     } catch (e) {
       setErr(describeError(e))
     }
@@ -754,7 +758,7 @@ function RoomTypePanel({ onChanged }: { onChanged?: () => void }) {
  * key 是固定用途（空净/空脏/预定/未满/已满/维修/其他），只允许改图标与颜色；
  * 房间格子、房态筛选、退房流程都按这里的配置渲染。
  */
-function RoomStatusPanel() {
+function RoomStatusPanel({ onChanged }: { onChanged?: () => void }) {
   const [list, setList] = useState<RoomStatus[]>([])
   const [draft, setDraft] = useState<Record<string, { icon: string; color: string }>>({})
   const [checkoutStatus, setCheckoutStatus] = useState<string>('vacant_dirty')
@@ -784,6 +788,7 @@ function RoomStatusPanel() {
       setCheckoutStatus(key)
       const label = list.find((s) => s.key === key)?.label ?? key
       setMsg(`退房后房态已设为「${label}」`)
+      onChanged?.()
     } catch (e) {
       setErr(describeError(e))
     }
@@ -801,6 +806,7 @@ function RoomStatusPanel() {
       await api.updateRoomStatusStyle(s.key, d.icon, d.color)
       setMsg(`${s.label} 的图标/颜色已保存`)
       await reload()
+      onChanged?.()
     } catch (e) {
       setErr(describeError(e))
     }
@@ -817,7 +823,15 @@ function RoomStatusPanel() {
           style={{ width: 160 }}
           value={checkoutStatus}
           onChange={(v) => void saveCheckoutStatus(v)}
-          options={list.map((s) => ({ value: s.key, label: s.label }))}
+          options={list.map((s) => ({
+            value: s.key,
+            label: (
+              <Space size={6}>
+                <span style={{ color: s.color }}>{statusIcon(s.icon)}</span>
+                <span>{s.label}</span>
+              </Space>
+            ),
+          }))}
         />
         <Text type="secondary" style={{ fontSize: 12 }}>
           读卡退房 / 持卡退房 / 无卡退房完成后，房间自动转成这个房态

@@ -53,6 +53,17 @@ pub struct Room {
     pub active_until: Option<String>,
 }
 
+/// 新增房间的结果。
+///
+/// `revived_from` 非空表示这次没有插新行，而是把一条已逻辑删除的房间记录
+/// 改名后重新启用（序号复用），值是那条记录的旧房号。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomUpsert {
+    pub room: Room,
+    pub revived_from: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssuanceRecord {
@@ -505,6 +516,22 @@ pub fn insert_room(
     floor: Option<i64>,
     room_type_id: Option<i64>,
 ) -> Result<Room> {
+    Ok(insert_room_reporting(conn, room_no, room_index, building, floor, room_type_id)?.room)
+}
+
+/// 新增房间，并告诉调用方这次是不是"复活"了一条已删除的记录。
+///
+/// 序号一旦被门锁绑定就永不复用，所以删房只置 `active = 0`。将来要用这个序号，
+/// 不能插新行（会撞 `room_index` UNIQUE），只能把那行改名 + 重新启用。
+/// 自动分配（`room_index` 为 None）只看真正空闲的序号，不会顺手复活已删房。
+pub fn insert_room_reporting(
+    conn: &Connection,
+    room_no: &str,
+    room_index: Option<u8>,
+    building: Option<&str>,
+    floor: Option<i64>,
+    room_type_id: Option<i64>,
+) -> Result<RoomUpsert> {
     let room_no = room_no.trim();
     if room_no.is_empty() {
         return Err(StoreError::Invalid("房号不能为空".into()));
@@ -514,6 +541,35 @@ pub fn insert_room(
         None => next_free_room_index(conn)?
             .ok_or_else(|| StoreError::Invalid("房间序号已用尽（0–255），无法再新增房间".into()))?,
     };
+
+    // 序号已被占用：还在用的直接拒绝，已逻辑删除的就复用这一行
+    if let Some(existing) = find_room_by_index(conn, index)? {
+        if existing.active {
+            return Err(StoreError::Invalid(format!(
+                "序号 {index} 已被 {} 房占用",
+                existing.room_no
+            )));
+        }
+        // 新房号不能撞别的房间（撞到自己这行不算）
+        if existing.room_no != room_no && find_room(conn, room_no)?.is_some() {
+            return Err(StoreError::Invalid(format!("房号已存在：{room_no}")));
+        }
+        // 这一行代表"一间新房间"：房态回空净房、发卡上限回不限、
+        // 安装卡记录清空（那张卡是给旧房号做的，对新房号没有意义）
+        conn.execute(
+            "UPDATE room SET room_no = ?2, active = 1, status = 'vacant_clean', \
+                    install_card_at = NULL, max_cards = NULL, \
+                    building = ?3, floor = ?4, room_type_id = ?5 \
+             WHERE room_index = ?1",
+            params![index as i64, room_no, building, floor, room_type_id],
+        )?;
+        let room = find_room(conn, room_no)?
+            .ok_or_else(|| StoreError::Invalid("复用房间后读不回该房间".into()))?;
+        return Ok(RoomUpsert {
+            room,
+            revived_from: Some(existing.room_no),
+        });
+    }
 
     conn.execute(
         "INSERT INTO room (room_no, room_index, building, floor, room_type_id)
@@ -527,7 +583,12 @@ pub fn insert_room(
         other => StoreError::Sqlite(other),
     })?;
 
-    find_room(conn, room_no)?.ok_or_else(|| StoreError::Invalid("插入后读不回该房间".into()))
+    let room = find_room(conn, room_no)?
+        .ok_or_else(|| StoreError::Invalid("插入后读不回该房间".into()))?;
+    Ok(RoomUpsert {
+        room,
+        revived_from: None,
+    })
 }
 
 /// 记录"已为该房间制作安装卡"的时间。
@@ -535,6 +596,36 @@ pub fn mark_install_card(conn: &Connection, room_no: &str) -> Result<()> {
     let n = conn.execute(
         "UPDATE room SET install_card_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE room_no = ?1",
         params![room_no],
+    )?;
+    if n == 0 {
+        return Err(StoreError::Invalid(format!("房号不存在：{room_no}")));
+    }
+    Ok(())
+}
+
+/// 改房号（房间显示名称）。序号不变 —— 序号才是门锁里的身份。
+///
+/// 房号是主键，新名称必须没被占用；发卡/退房链路都按房号关联，
+/// 所以调用方需要自己保证该房没有在场的有效卡（见 `count_active_cards`）。
+pub fn rename_room(conn: &Connection, room_no: &str, new_room_no: &str) -> Result<()> {
+    let new_no = new_room_no.trim();
+    if new_no.is_empty() {
+        return Err(StoreError::Invalid("房号不能为空".into()));
+    }
+    if new_no == room_no {
+        return Ok(());
+    }
+    let taken: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM room WHERE room_no = ?1",
+        params![new_no],
+        |r| r.get(0),
+    )?;
+    if taken > 0 {
+        return Err(StoreError::Invalid(format!("房号已存在：{new_no}")));
+    }
+    let n = conn.execute(
+        "UPDATE room SET room_no = ?2 WHERE room_no = ?1",
+        params![room_no, new_no],
     )?;
     if n == 0 {
         return Err(StoreError::Invalid(format!("房号不存在：{room_no}")));
@@ -1011,14 +1102,49 @@ pub fn update_room_type_color(conn: &Connection, id: i64, color: Option<&str>) -
     Ok(())
 }
 
+/// 新建房型自动配的标签颜色。
+///
+/// 取 antd 色板里白字对比度够用的中深色，避免新建房型一律灰色。
+const ROOM_TYPE_PALETTE: &[&str] = &[
+    "#1677ff", "#13c2c2", "#52c41a", "#722ed1", "#eb2f96", "#fa8c16", "#2f54eb", "#f5222d",
+    "#08979c", "#d4380d", "#531dab", "#237804", "#ad6800", "#c41d7f",
+];
+
+/// 0..bound 的随机下标。借 uuid v4 的随机字节，不为这点需求单独引 rand 依赖。
+fn random_index(bound: usize) -> usize {
+    (uuid::Uuid::new_v4().into_bytes()[0] as usize) % bound
+}
+
+/// 挑一个还没被其它房型占用的颜色；调色板用尽了就允许重复。
+fn pick_room_type_color(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT color FROM room_type WHERE color IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut used: Vec<String> = Vec::new();
+    for c in rows {
+        used.push(c?.to_ascii_lowercase());
+    }
+    let free: Vec<&str> = ROOM_TYPE_PALETTE
+        .iter()
+        .copied()
+        .filter(|c| !used.iter().any(|u| u == c))
+        .collect();
+    let pool: &[&str] = if free.is_empty() {
+        ROOM_TYPE_PALETTE
+    } else {
+        &free
+    };
+    Ok(pool[random_index(pool.len())].to_string())
+}
+
 pub fn insert_room_type(conn: &Connection, name: &str, sort_order: i64) -> Result<RoomType> {
     let name = name.trim();
     if name.is_empty() {
         return Err(StoreError::Invalid("房型名称不能为空".into()));
     }
+    let color = pick_room_type_color(conn)?;
     conn.execute(
-        "INSERT INTO room_type (name, sort_order) VALUES (?1, ?2)",
-        params![name, sort_order],
+        "INSERT INTO room_type (name, sort_order, color) VALUES (?1, ?2, ?3)",
+        params![name, sort_order, color],
     )
     .map_err(|e| match e {
         rusqlite::Error::SqliteFailure(_, Some(ref m)) if m.contains("UNIQUE") => {
@@ -1283,6 +1409,65 @@ mod tests {
     }
 
     #[test]
+    fn deactivated_room_can_be_revived() {
+        let (conn, path) = temp_db();
+        let first = insert_room(&conn, "201", None, None, None, None).unwrap();
+        assert_eq!(first.room_index, 0);
+        set_room_status(&conn, "201", "vacant_dirty").unwrap();
+        set_room_max_cards(&conn, "201", Some(2)).unwrap();
+        mark_install_card(&conn, "201").unwrap();
+        deactivate_room(&conn, "201").unwrap();
+
+        // 手动填已删房的序号 = 复用那条记录，只改房名
+        let upsert = insert_room_reporting(&conn, "260", Some(0), None, None, None).unwrap();
+        assert_eq!(upsert.revived_from.as_deref(), Some("201"));
+        assert_eq!(upsert.room.room_no, "260");
+        assert_eq!(upsert.room.room_index, 0);
+        assert!(upsert.room.active);
+        // 复用的行代表"一间新房间"：房态回空净房、上限回不限、安装卡记录清空
+        assert_eq!(upsert.room.status, "vacant_clean");
+        assert_eq!(upsert.room.max_cards, None);
+        assert_eq!(upsert.room.install_card_at, None);
+        // 旧房号已经不存在，全表仍只有一行
+        assert!(find_room(&conn, "201").unwrap().is_none());
+        assert_eq!(list_rooms(&conn).unwrap().len(), 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn auto_index_skips_deactivated_room() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "201", None, None, None, None).unwrap();
+        deactivate_room(&conn, "201").unwrap();
+        // 自动分配不复活已删房，只会拿真正空闲的序号
+        let upsert = insert_room_reporting(&conn, "202", None, None, None, None).unwrap();
+        assert_eq!(upsert.revived_from, None);
+        assert_eq!(upsert.room.room_index, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn live_room_index_is_rejected() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "201", Some(3), None, None, None).unwrap();
+        let err = insert_room_reporting(&conn, "202", Some(3), None, None, None).unwrap_err();
+        assert!(format!("{err}").contains("已被 201 房占用"), "实际：{err}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn revive_with_taken_room_no_is_rejected() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "201", None, None, None, None).unwrap(); // 序号 0
+        deactivate_room(&conn, "201").unwrap();
+        insert_room(&conn, "202", None, None, None, None).unwrap(); // 序号 1，在用
+        // 序号 0 已删，但房号 202 被别的房间占着 → 不能复用成 202
+        let err = insert_room_reporting(&conn, "202", Some(0), None, None, None).unwrap_err();
+        assert!(format!("{err}").contains("房号已存在"), "实际：{err}");
+        cleanup(conn, path);
+    }
+
+    #[test]
     fn issuance_lookup_by_card_no() {
         let (conn, path) = temp_db();
         let id = record_issuance(
@@ -1491,6 +1676,24 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// 改房号：序号不变，重名必须拒绝。
+    #[test]
+    fn rename_room_keeps_index_and_rejects_duplicate() {
+        let (conn, path) = temp_db();
+        let a = insert_room(&conn, "220", None, None, None, None).unwrap();
+        insert_room(&conn, "221", None, None, None, None).unwrap();
+
+        rename_room(&conn, "220", "230").unwrap();
+        let renamed = find_room(&conn, "230").unwrap().expect("改名后应能按新房号查到");
+        assert_eq!(renamed.room_index, a.room_index, "序号不应变化");
+        assert!(find_room(&conn, "220").unwrap().is_none());
+
+        assert!(rename_room(&conn, "230", "221").is_err(), "重名应被拒绝");
+        assert!(rename_room(&conn, "999", "231").is_err(), "不存在的房号应报错");
+
+        cleanup(conn, path);
+    }
+
     #[test]
     fn room_type_assign_and_delete_guard() {
         let (conn, path) = temp_db();
@@ -1506,6 +1709,21 @@ mod tests {
         set_room_type(&conn, "220", None).unwrap();
         delete_room_type(&conn, t.id).expect("解绑后应可删除");
 
+        cleanup(conn, path);
+    }
+
+    /// 新房型必须自带颜色，且不要和已有房型撞成同一个（调色板够用时）。
+    #[test]
+    fn new_room_type_gets_unused_palette_color() {
+        let (conn, path) = temp_db();
+        let mut colors = Vec::new();
+        for name in ["大床房", "标间", "亲子房", "套房", "特价房"] {
+            let t = insert_room_type(&conn, name, 0).unwrap();
+            let c = t.color.expect("新房型应有颜色");
+            assert!(ROOM_TYPE_PALETTE.contains(&c.as_str()), "颜色应取自调色板：{c}");
+            assert!(!colors.contains(&c), "调色板够用时不应撞色：{c}");
+            colors.push(c);
+        }
         cleanup(conn, path);
     }
 

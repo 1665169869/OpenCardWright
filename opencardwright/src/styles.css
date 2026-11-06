@@ -24,3 +24,12 @@ body {
   margin: 0 auto;
   width: 100%;
 }
+
+/* 房型筛选的 Tabs 只当筛选用（不承载面板内容），把空的内容区收掉 */
+.ocw-type-tabs .ant-tabs-content-holder {
+  display: none;
+}
+
+.ocw-type-tabs .ant-tabs-nav {
+  margin-bottom: 8px;
+}

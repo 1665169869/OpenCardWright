@@ -113,6 +113,17 @@ export interface Room {
   activeUntil: string | null
 }
 
+/**
+ * 新增房间的结果。
+ *
+ * `revivedFrom` 非空表示这次没有新建行，而是把一条已逻辑删除的房间记录
+ * 改名后重新启用（序号复用），值是那条记录的旧房号。
+ */
+export interface RoomUpsert {
+  room: Room
+  revivedFrom: string | null
+}
+
 /** 房态定义（颜色/图标可自定义）。 */
 export interface RoomStatus {
   key: string
@@ -281,7 +292,12 @@ export const api = {
   readCard: () => invoke<CardReadDto>('read_card'),
   listRooms: () => invoke<Room[]>('list_rooms'),
   createRoom: (roomNo: string, roomIndex?: number, roomTypeId?: number) =>
-    invoke<Room>('create_room', { roomNo, roomIndex: roomIndex ?? null, roomTypeId: roomTypeId ?? null }),
+    invoke<RoomUpsert>('create_room', { roomNo, roomIndex: roomIndex ?? null, roomTypeId: roomTypeId ?? null }),
+  /** 改房号（显示名称），序号不变；房号不能与其它房间重复 */
+  renameRoom: (roomNo: string, newRoomNo: string) =>
+    invoke<Room>('rename_room', { roomNo, newRoomNo }),
+  /** 逻辑删除房间：只置 active=0，序号不释放，历史发卡记录保留 */
+  deleteRoom: (roomNo: string) => invoke<void>('delete_room', { roomNo }),
   setRoomType: (roomNo: string, roomTypeId: number | null) =>
     invoke<void>('set_room_type', { roomNo, roomTypeId }),
   /** 房间参数：最多同时有效的客卡数（null = 不限） */
@@ -296,6 +312,12 @@ export const api = {
   checkoutRoom: (roomNo: string) => invoke<CheckoutResult>('checkout_room', { roomNo }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
   checkoutCard: (cardNo: number) => invoke<CheckoutCardResult>('checkout_card', { cardNo }),
+  /**
+   * 强制退房：卡不是本系统发的，本地没有发卡记录，按前端从卡片里读出的房号
+   * 直接写入退房数据（关闭该房全部有效卡 + 改房态）。调用前必须让用户二次确认。
+   */
+  forceCheckoutCard: (roomNo: string, cardNo: number) =>
+    invoke<CheckoutResult>('force_checkout_card', { roomNo, cardNo }),
   /** 退房后要转成的房态 key（设置项） */
   getCheckoutStatus: () => invoke<string>('get_checkout_status'),
   setCheckoutStatus: (status: string) => invoke<void>('set_checkout_status', { status }),

@@ -1,5 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Alert, App as AntdApp, Button, Layout, Space, Spin, Tabs, Tag, Typography } from 'antd'
+import {
+  Alert,
+  App as AntdApp,
+  Button,
+  Layout,
+  Space,
+  Spin,
+  Tabs,
+  Tag,
+  Typography,
+  type TabsProps,
+} from 'antd'
+import {
+  HomeOutlined,
+  IdcardOutlined,
+  LogoutOutlined,
+  ScanOutlined,
+  SettingOutlined,
+} from '@ant-design/icons'
 import {
   api,
   describeError,
@@ -16,7 +34,6 @@ import AuthGate from './pages/AuthGate'
 import ReadCard from './pages/ReadCard'
 import RoomManager from './pages/RoomManager'
 import AdminCards from './pages/AdminCards'
-import DevicePanel from './pages/DevicePanel'
 import Settings from './pages/Settings'
 import ExpiryBell from './components/ExpiryBell'
 import { playAlert, unlockSound } from './utils/sound'
@@ -36,6 +53,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   // 房间列表的版本号：房间页一变就 +1，让发卡页/管理卡页重新拉列表
   const [roomsVersion, setRoomsVersion] = useState(0)
+  // 设置页的版本号：房型/房态的颜色图标改完就 +1，房间页据此重新拉数据（不用手动刷新）
+  const [settingsVersion, setSettingsVersion] = useState(0)
 
   // 到期提醒
   const [reminder, setReminder] = useState<ReminderSettings | null>(null)
@@ -174,21 +193,30 @@ export default function App() {
 
   const admin = isAdmin(auth)
 
-  const tabs = [
+  // 一级导航。图标沿用项目里的 antd 线性 Outlined 风格（与右键菜单、房态图标一致）。
+  const tabs: NonNullable<TabsProps['items']> = [
     // 房间放最前面：前台最常用的是"选房间 → 发卡/退房"，
     // 读卡更多是偶尔核对一张卡时才用。
     {
       key: 'rooms',
+      icon: <HomeOutlined />,
       label: '房间',
-      children: <RoomManager onRoomsChanged={onRoomsChanged} canAdmin={admin} />,
+      children: (
+        <RoomManager
+          onRoomsChanged={onRoomsChanged}
+          canAdmin={admin}
+          settingsVersion={settingsVersion}
+        />
+      ),
     },
-    { key: 'read', label: '读卡', children: <ReadCard /> },
+    { key: 'read', icon: <ScanOutlined />, label: '读卡', children: <ReadCard /> },
   ]
 
   if (admin) {
     tabs.push(
       {
         key: 'admin',
+        icon: <IdcardOutlined />,
         label: '管理卡',
         children: (
           <AdminCards
@@ -200,9 +228,9 @@ export default function App() {
           />
         ),
       },
-      { key: 'device', label: '设备', children: <DevicePanel onChanged={refreshInfo} /> },
       {
         key: 'settings',
+        icon: <SettingOutlined />,
         label: '设置',
         children: (
           <Settings
@@ -210,6 +238,8 @@ export default function App() {
               refreshInfo()
               // 水位警戒线、退房后房态这些设置改完，顶部的状态条要跟着变
               refreshStatus()
+              // 房型标签颜色、房态图标颜色改完，房间页要立刻重画，不能等手动刷新
+              setSettingsVersion((v) => v + 1)
               api
                 .getReminderSettings()
                 .then(setReminder)
@@ -266,8 +296,8 @@ export default function App() {
           <Tag color={admin ? 'blue' : 'default'}>
             {auth.displayName || auth.login} · {admin ? '管理员' : '前台'}
           </Tag>
-          <Button size="small" onClick={logout}>
-            退出
+          <Button size="small" icon={<LogoutOutlined />} onClick={logout}>
+            退出登录
           </Button>
         </Space>
       </Header>
