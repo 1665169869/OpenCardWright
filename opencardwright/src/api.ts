@@ -290,6 +290,8 @@ export interface ReminderSettings {
   enabled: boolean
   minutes: number
   sound: boolean
+  /** 语音播报（系统 TTS，音色随系统） */
+  voice: boolean
 }
 
 /** 即将到期 / 刚过期的客卡。 */
@@ -529,8 +531,14 @@ export const api = {
     invoke<void>('change_own_password', { oldPassword, newPassword }),
 
   getReminderSettings: () => invoke<ReminderSettings>('get_reminder_settings'),
-  setReminderSettings: (enabled: boolean, minutes: number, sound: boolean) =>
-    invoke<ReminderSettings>('set_reminder_settings', { enabled, minutes, sound }),
+  setReminderSettings: (enabled: boolean, minutes: number, sound: boolean, voice?: boolean) =>
+    invoke<ReminderSettings>('set_reminder_settings', {
+      enabled,
+      minutes,
+      sound,
+      // 不传 = null，后端按"保持库里现值"处理
+      voice: voice ?? null,
+    }),
   expiringCards: (withinMinutes: number) =>
     invoke<ExpiringCard[]>('expiring_cards', { withinMinutes }),
   issueInstallCard: (roomNo: string) => invoke<IssuedCard>('issue_install_card', { roomNo }),

@@ -80,7 +80,7 @@ function ReminderPanel({ onChanged }: { onChanged?: () => void }) {
     setErr(null)
     setMsg(null)
     try {
-      setS(await api.setReminderSettings(s.enabled, s.minutes, s.sound))
+      setS(await api.setReminderSettings(s.enabled, s.minutes, s.sound, s.voice))
       setMsg('已保存，下一条到期提醒会按新设置触发')
       // 必须通知 App 重新拉设置：轮询用的 minutes 在 App 里，不刷新就还是旧值
       onChanged?.()
@@ -113,6 +113,10 @@ function ReminderPanel({ onChanged }: { onChanged?: () => void }) {
         <Space>
           <Switch checked={s.sound} onChange={(v) => setS({ ...s, sound: v })} />
           <Text>提示声</Text>
+        </Space>
+        <Space>
+          <Switch checked={s.voice} onChange={(v) => setS({ ...s, voice: v })} />
+          <Text>语音播报（音色随系统，无中文语音时自动退回提示声）</Text>
         </Space>
       </Space>
 

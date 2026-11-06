@@ -56,6 +56,33 @@ export function playAlert(): void {
 }
 
 /** 仅供设置页「试听」用：强制尝试并返回是否可能发声。 */
+/**
+ * 用系统 TTS 播报一句话，返回**是否真的入队**。
+ *
+ * 依赖 WebView2 的 `speechSynthesis` 与系统中文语音包 —— 音色随系统，不承诺"温柔女声"。
+ * 没有 zh 音色、合成失败、API 不存在都返回 false，由调用方决定回退提示音。
+ */
+export function speak(text: string): boolean {
+  try {
+    const synth = window.speechSynthesis
+    if (!synth || typeof SpeechSynthesisUtterance === 'undefined') return false
+    const voices = synth.getVoices()
+    const zh = voices.find((v) => v.lang && v.lang.toLowerCase().startsWith('zh'))
+    // 没有任何中文音色时中文会被念成字母，不如退回提示音
+    if (voices.length > 0 && !zh) return false
+    const utter = new SpeechSynthesisUtterance(text)
+    if (zh) utter.voice = zh
+    utter.lang = zh?.lang ?? 'zh-CN'
+    utter.rate = 0.9
+    utter.pitch = 1
+    synth.cancel()
+    synth.speak(utter)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function tryPreview(): boolean {
   unlockSound()
   playAlert()

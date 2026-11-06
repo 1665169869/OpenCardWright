@@ -38,7 +38,8 @@ import RoomManager from './pages/RoomManager'
 import AdminCards from './pages/AdminCards'
 import Settings from './pages/Settings'
 import ExpiryBell from './components/ExpiryBell'
-import { playAlert, unlockSound } from './utils/sound'
+import { playAlert, speak, unlockSound } from './utils/sound'
+import { expirySpeech } from './utils/reminder'
 
 const { Header, Content } = Layout
 const { Title, Text } = Typography
@@ -137,7 +138,10 @@ export default function App() {
             duration: 20,
             placement: 'topRight',
           })
-          if (reminder.sound) playAlert()
+          // 语音优先；语音不可用（无中文音色/合成失败）才回退提示音，避免同时响两遍
+          let spoke = false
+          if (reminder.voice) spoke = speak(expirySpeech(c, Date.now()))
+          if (!spoke && reminder.sound) playAlert()
         }
       } catch {
         // 轮询失败静默，下一轮再试；不要用弹窗骚扰前台
@@ -165,6 +169,9 @@ export default function App() {
       setAuth(next)
       setInfo(null)
       setStatus(null)
+      // 换账号后同一张卡要能再播一次，否则"上一个前台看过就不再提醒"
+      alerted.current.clear()
+      setReminders([])
     } catch (e) {
       setError(describeError(e))
     }

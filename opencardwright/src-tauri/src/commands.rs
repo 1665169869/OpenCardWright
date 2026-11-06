@@ -2202,6 +2202,8 @@ pub struct ReminderSettings {
     /// 提前多少分钟开始提醒
     pub minutes: i64,
     pub sound: bool,
+    /// 语音播报（系统 TTS）。旧调用方不传时保持库里现值，不重置。
+    pub voice: bool,
 }
 
 #[tauri::command]
@@ -2222,10 +2224,14 @@ pub async fn get_reminder_settings(
         let sound = ocw_store::get_setting(&conn, "reminderSound")?
             .map(|v| v != "0")
             .unwrap_or(true);
+        let voice = ocw_store::get_setting(&conn, "reminderVoice")?
+            .map(|v| v != "0")
+            .unwrap_or(true);
         Ok(ReminderSettings {
             enabled,
             minutes,
             sound,
+            voice,
         })
     })
     .await
@@ -2237,6 +2243,8 @@ pub async fn set_reminder_settings(
     enabled: bool,
     minutes: i64,
     sound: bool,
+    // 语音开关：None = 保持库里现值（旧前端三个参数调用时不会把用户关掉的语音又打开）
+    voice: Option<bool>,
 ) -> Result<ReminderSettings, CommandError> {
     let me = require_admin(&state)?;
     if !(1..=1440).contains(&minutes) {
@@ -2248,11 +2256,20 @@ pub async fn set_reminder_settings(
         ocw_store::set_setting(&conn, "reminderEnabled", if enabled { "1" } else { "0" })?;
         ocw_store::set_setting(&conn, "reminderMinutes", &minutes.to_string())?;
         ocw_store::set_setting(&conn, "reminderSound", if sound { "1" } else { "0" })?;
+        let voice = match voice {
+            Some(v) => v,
+            None => ocw_store::get_setting(&conn, "reminderVoice")?
+                .map(|v| v != "0")
+                .unwrap_or(true),
+        };
+        ocw_store::set_setting(&conn, "reminderVoice", if voice { "1" } else { "0" })?;
         let _ = ocw_store::record_audit(
             &conn,
             "set_reminder_settings",
             None,
-            Some(&format!("enabled={enabled} minutes={minutes} sound={sound}")),
+            Some(&format!(
+                "enabled={enabled} minutes={minutes} sound={sound} voice={voice}"
+            )),
             "ok",
             Some(me.operator_id),
         );
@@ -2260,6 +2277,7 @@ pub async fn set_reminder_settings(
             enabled,
             minutes,
             sound,
+            voice,
         })
     })
     .await
