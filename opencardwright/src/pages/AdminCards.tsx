@@ -20,6 +20,7 @@ import {
   formatCardNo,
   formatExpiry,
   hourOptions,
+  LONG_CONFIRM_WORD,
   MASTER_MAX_DAYS,
   MASTER_MAX_HOURS,
   type AdminCardRequest,
@@ -112,6 +113,12 @@ export default function AdminCards({
   // 待确认的请求。用受控 Modal 而不是 Modal.confirm：
   // antd v5 的命令式弹窗在 React 19 下会静默失效（ReactDOM.render 已被移除）。
   const [pending, setPending] = useState<AdminCardRequest | null>(null)
+  /** 长有效期总控卡（>63 天）的确认词 */
+  const [confirmWord, setConfirmWord] = useState('')
+
+  const masterDays = kind === 'master' && !useHours ? amount : 0
+  const needsLongConfirm = masterDays > MASTER_MAX_DAYS
+  const longConfirmed = !needsLongConfirm || confirmWord.trim() === LONG_CONFIRM_WORD
 
   const submit = () => {
     const request = buildRequest()
@@ -128,7 +135,7 @@ export default function AdminCards({
     setLoading(true)
     setError(null)
     try {
-      setResult(await api.issueAdminCard(pending, true))
+      setResult(await api.issueAdminCard(pending, true, needsLongConfirm ? confirmWord.trim() : null))
       onChanged?.()
     } catch (e) {
       setError(describeError(e))
@@ -293,11 +300,34 @@ export default function AdminCards({
         okText="确认发卡"
         cancelText="取消"
         confirmLoading={loading}
-        okButtonProps={{ danger: kind === 'reset' || kind === 'clear' || kind === 'raw' }}
+        okButtonProps={{
+          danger: kind === 'reset' || kind === 'clear' || kind === 'raw',
+          disabled: !longConfirmed,
+        }}
         onOk={confirmIssue}
         onCancel={() => setPending(null)}
       >
         <p style={{ color: '#cf1322' }}>{WARNING[kind]}</p>
+        {needsLongConfirm ? (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={`${masterDays} 天总控卡会把全店水位顶到 ${Math.ceil(masterDays / 365)} 年后`}
+            description={
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <span>之后发的正常卡会被锁当成旧卡拒开，只能给全部门锁刷复位卡恢复。</span>
+                <Input
+                  placeholder={`原样输入「${LONG_CONFIRM_WORD}」`}
+                  value={confirmWord}
+                  onChange={(e) => setConfirmWord(e.target.value)}
+                  status={longConfirmed ? undefined : 'error'}
+                  style={{ maxWidth: 240 }}
+                />
+              </Space>
+            }
+          />
+        ) : null}
         <p>确认后，本次操作会写入审计日志。</p>
       </Modal>
     </Card>

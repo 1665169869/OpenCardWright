@@ -445,6 +445,8 @@ export const api = {
     duration: { days: number } | { hours: number },
     idempotencyKey: string,
     guest?: GuestInput,
+    /** 长有效期卡（>62 天）的确认词，必须原样等于「顶高水位」 */
+    confirmLong?: string | null,
   ) =>
     invoke<IssuedCard>('issue_guest', {
       roomNo,
@@ -452,9 +454,14 @@ export const api = {
       hours: 'hours' in duration ? duration.hours : null,
       idempotencyKey,
       guest: guest ?? null,
+      confirmLong: confirmLong ?? null,
     }),
-  issueAdminCard: (request: AdminCardRequest, confirm: boolean) =>
-    invoke<IssuedCard>('issue_admin_card', { request, confirm }),
+  issueAdminCard: (request: AdminCardRequest, confirm: boolean, confirmLong?: string | null) =>
+    invoke<IssuedCard>('issue_admin_card', {
+      request,
+      confirm,
+      confirmLong: confirmLong ?? null,
+    }),
   cardNoStatus: () => invoke<CardNoStatus>('card_no_status'),
   setWaterWarnAt: (hex: string) => invoke<CardNoStatus>('set_water_warn_at', { hex }),
   resetWaterMark: (startAt: string) => invoke<CardNoStatus>('reset_water_mark', { startAt }),
@@ -469,6 +476,9 @@ export const api = {
 //   简单段 0x80|天数 —— 客卡 1–62、总控 1–63
 //   小时段 0x40|小时 —— 客卡 1–62、总控 1–63
 //   超过简单段只能走固定档位（月码 0xC0|月数）
+
+/** 长有效期卡（天数进入月码段）发卡前必须原样输入的确认词，与后端 rules.rs 保持一致 */
+export const LONG_CONFIRM_WORD = '顶高水位'
 
 export const GUEST_MAX_DAYS = 62
 export const MASTER_MAX_DAYS = 63

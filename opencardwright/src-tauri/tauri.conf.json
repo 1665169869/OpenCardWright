@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "OpenCardWright",
-  "version": "2026.11.6+0045",
+  "version": "2026.11.6+0046",
   "identifier": "io.opencardwright.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

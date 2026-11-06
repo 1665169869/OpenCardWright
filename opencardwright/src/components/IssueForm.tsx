@@ -10,6 +10,7 @@ import {
   GENDERS,
   hourOptions,
   GUEST_MAX_DAYS,
+  LONG_CONFIRM_WORD,
   GUEST_MAX_HOURS,
   ID_TYPES,
   type GuestInput,
@@ -56,6 +57,10 @@ export default function IssueForm({
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<IssuedCard | null>(null)
   const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
+  /** 长有效期卡（>62 天）必须原样输入这个确认词 */
+  const [confirmWord, setConfirmWord] = useState('')
+  const needsLongConfirm = mode === 'day' && amount > GUEST_MAX_DAYS
+  const longConfirmed = !needsLongConfirm || confirmWord.trim() === LONG_CONFIRM_WORD
 
   const setGuestField = (key: keyof GuestInput, value: string) => {
     setGuest((prev) => ({ ...prev, [key]: value }))
@@ -94,6 +99,7 @@ export default function IssueForm({
         duration,
         crypto.randomUUID(),
         guestHasInput ? guest : undefined,
+        needsLongConfirm ? confirmWord.trim() : null,
       )
       setResult(issued)
       setGuest({})
@@ -111,7 +117,12 @@ export default function IssueForm({
       size="small"
       title="发客卡"
       extra={
-        <Button type="primary" loading={loading} onClick={issue} disabled={!room.active}>
+        <Button
+          type="primary"
+          loading={loading}
+          onClick={issue}
+          disabled={!room.active || !longConfirmed}
+        >
           发卡
         </Button>
       }
@@ -234,12 +245,25 @@ export default function IssueForm({
           />
         ) : null}
 
-        {mode === 'day' && amount >= 360 ? (
+        {needsLongConfirm ? (
           <Alert
             type="error"
             showIcon
-            message="长有效期卡会顶高该房间的水位"
-            description="这张卡刷一次门后，该房间此前的客卡会全部失效，只能用复位卡恢复。"
+            message={`${amount} 天是长有效期卡：刷一次门会把该房间水位顶到 ${Math.ceil(amount / 365)} 年后`}
+            description={
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <Text>
+                  之后给这个房间发的新卡号比它小，门锁会当成旧卡拒开；只能给全部门锁各刷一次复位卡才恢复。
+                </Text>
+                <Input
+                  placeholder={`原样输入「${LONG_CONFIRM_WORD}」才能发卡`}
+                  value={confirmWord}
+                  onChange={(e) => setConfirmWord(e.target.value)}
+                  status={longConfirmed ? undefined : 'error'}
+                  style={{ maxWidth: 260 }}
+                />
+              </Space>
+            }
           />
         ) : null}
 

@@ -596,8 +596,14 @@ pub async fn issue_admin_card(
     state: State<'_, AppState>,
     request: AdminCardRequest,
     confirm: bool,
+    // 总控卡长有效期（>63 天）的确认词
+    confirm_long: Option<String>,
 ) -> Result<IssuedDto, CommandError> {
     let me = require_admin(&state)?;
+    if let AdminCardRequest::Master { days: Some(d), hours: None } = &request {
+        rules::check_long_confirm(CardTier::Master, *d, confirm_long.as_deref())
+            .map_err(|m| CommandError::new(1, m, "总控卡长有效期要先确认水位后果"))?;
+    }
     if !confirm {
         return Err(CommandError::new(
             1,
@@ -987,6 +993,8 @@ pub async fn issue_guest(
     hours: Option<u16>,
     idempotency_key: String,
     guest: Option<GuestInput>,
+    // 长有效期卡（>62 天）的确认词，必须原样等于「顶高水位」；普通档位可不传
+    confirm_long: Option<String>,
 ) -> Result<IssuedDto, CommandError> {
     let me = require_login(&state)?;
     let (use_days, amount) = match (days, hours) {
@@ -994,6 +1002,8 @@ pub async fn issue_guest(
             rules::validate_days(CardTier::Guest, d).map_err(|m| {
                 CommandError::new(1, m, "客卡超过 62 天的有效期请从固定档位（90/120/…）选择")
             })?;
+            rules::check_long_confirm(CardTier::Guest, d, confirm_long.as_deref())
+                .map_err(|m| CommandError::new(1, m, "长有效期卡要先确认水位后果"))?;
             (true, d)
         }
         (None, Some(h)) => {
