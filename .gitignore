@@ -35,5 +35,6 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# 本地 agent 记忆
+# 本地 agent 记忆与计划（含本机绝对路径，不入库）
 .ai-memory/
+.workbuddy/

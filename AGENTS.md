@@ -1,7 +1,8 @@
 # AGENTS.md
 
 本仓库是「智能门锁管理软件（LOCK_V8 / V8.9）」TEMIC 卡的**逆向成果 + 独立发卡 SDK**，
-不是常规应用工程：没有解决方案文件、没有包管理、没有单元测试框架、没有版本库。
+不是常规应用工程：没有解决方案文件、没有包管理、sdk/ 侧也没有单元测试框架
+（回归靠 `PMSLockCard.exe selftest`）。仓库已纳入 git，见第 8 节。
 （产品工作区 `opencardwright/` 例外：它是独立的 Tauri + Rust 工程，有自己的构建链，见第 9 节。）
 
 改动前先读 `docs/`，那里是唯一权威来源；代码是文档的实现。
@@ -23,6 +24,7 @@
 | `sdk/IOServer/LC2000/*.dll` | 原厂读卡器驱动（x86，随包分发） | **不要动**，见第 3 节哈希 |
 | `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、16 位卡号计数器 | 状态文件是现场数据 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
+| `opencardwright/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链 | 见第 9 节 |
 
 `sdk/` 会被**整目录拷到现场 32 位 Windows** 直接运行，所以不要在 `sdk/` 里塞构建中间物或文档。
 
@@ -133,7 +135,9 @@ PMSLockCard.exe selftest
   "没跑过命令"当成验证通过。
 - 驱动版本敏感：结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
-- 无版本库：改动前自己备份，尤其 `sdk/CardNo.state` 与已编译的二进制。
+- 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
+  常规改动直接提交即可；但 `sdk/CardNo.state` 是现场计数器，提交前确认值未被误改。
+  注意 `opencardwright/src-tauri/resources/sdk/` 是构建产物，不入库。
 
 ---
 
@@ -152,3 +156,57 @@ PMSLockCard.exe selftest
 | 编译环境坑 | 仓库路径含中文时 MSVC 会报 `D8050`：设 `CARGO_TARGET_DIR` 到 ASCII 路径 + `DEBUG=false`。详见 `opencardwright/README.md` §4 |
 
 新产品自己的约定（技术栈、目录、阶段）以 `opencardwright/README.md` 为准，不要套用本文件的 csc 构建命令。
+
+产品工作区常用命令（在 `opencardwright/` 内）：
+
+```powershell
+npm install
+npm run build:sdk      # 编译 ../sdk → resources/sdk，跑 27 条黄金向量门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
+npm run tauri dev      # 前端热更新；改 Rust 会自动重编译+重启
+npx tsc --noEmit       # 前端类型检查
+npm run setup:nsis     # 打包前预置 NSIS 工具链（本机联网下载会超时）
+npm run tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出的是 dev 壳）
+```
+
+测试在 `src-tauri/` 内跑，几种粒度都常用：
+
+```powershell
+$env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 仓库路径含中文必须设，否则 MSVC 报 D8050
+cargo test --workspace                                   # 全部（前端 0 项，Rust 40+ 项）
+cargo test -p ocw-store                                  # 只跑存储层
+cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件
+cargo test -p ocw-store insert_room                      # 按用例名子串单跑
+```
+
+> 已知红灯：`ocw-device` 的 `real_selftest_is_all_green_and_parses` 用 `String::from_utf8_lossy`
+> 读 `PMSLockCard.exe` 的 **GBK** 输出，中文变 U+FFFD 导致断言失败（设备输出本身是 27/27 全过）。
+> 修法是把 `cli::decode` 提成 `pub` 给集成测试用。
+
+无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`。模拟设备会调用 `OCWCardBuild.exe`
+离线构包并推进 `CardNo.state`，卡号/字节与真机一致，只是不真写卡（缺构包器时退回固定样本）。
+
+**运行时数据不在仓库里**：`%PROGRAMDATA%\OpenCardWright\opencardwright.db`（SQLite）+
+`runtime\`（构建期从 `src-tauri/resources/sdk` 拷入）。debug 构建在空库时会自动导入
+`data/NacreHis.json` 的 `Kf_fh`，建 30 个房间 + 房型 + 房态；发布版不含这段。
+查数据直接读那个 db，不要指望仓库内有 `*.db`。
+
+### 房间与卡片的业务铁律（改房间/发卡相关代码前必读）
+
+| 规则 | 原因 |
+|---|---|
+| 房间序号绑上锁后**永不复用** | 序号写进卡内页1，锁按「房间 × 卡型」记高水位；换号即旧卡失效 |
+| 删房是**逻辑删除**（`room.active=0`） | 历史发卡记录要留档，序号仍占位，`list_rooms` 返回全量 |
+| 新增房间用到已删序号 = **复活那条记录改房名**，不插新行 | 否则撞 `room_index UNIQUE`；同时重置房态/发卡上限/安装卡记录 |
+| 有有效卡时**不许改名、不许删房** | 发卡、退房、改上限全按 `room_no` 对账，改名会让在场卡对不上号 |
+| 「有效卡」口径 | `result='ok' AND card_no IS NOT NULL AND expires_at IS NOT NULL AND checked_out_at IS NULL AND expires_at > now` |
+| 发卡 / 续住写卡只在**空净房 / 未满房**可点 | 房态是人工维护的业务字段，只做前端拦截，后端不硬拦（旧流程允许先发卡再改房态） |
+
+### 前端两个反复踩的坑
+
+- **HMR 会保留组件 state**，弹窗/抽屉里上次的表单数据会残留。修法是给组件加一个自增计数
+  当 `key` 强制重挂载（`RoomManager` 的 `checkoutSession` 就是为此）。
+- `npm install` 会重写 `package-lock.json` 的 `libc` 元数据，产生无意义 diff；误改就
+  `git checkout -- opencardwright/package-lock.json` 还原，别把它带进提交。
+
+产品侧高频踩坑（详见 `opencardwright/README.md` §7）：设备 CLI 输出是 GBK，必须经
+`ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。
