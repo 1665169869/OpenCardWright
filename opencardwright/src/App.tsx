@@ -4,6 +4,7 @@ import {
   App as AntdApp,
   Button,
   Layout,
+  Modal,
   Space,
   Spin,
   Tabs,
@@ -41,6 +42,7 @@ import Settings from './pages/Settings'
 import ExpiryBell from './components/ExpiryBell'
 import { playAlert, speak, unlockSound } from './utils/sound'
 import { expirySpeech } from './utils/reminder'
+import { listen } from '@tauri-apps/api/event'
 
 const { Header, Content } = Layout
 const { Title, Text } = Typography
@@ -66,6 +68,8 @@ export default function App() {
   const alerted = useRef<Set<number>>(new Set())
   /** 首启向导：登录后查一次，只在空库且没做过时弹 */
   const [needWizard, setNeedWizard] = useState(false)
+  /** 关窗确认框（TD-109）：Rust 拦截 CloseRequested 后发 close-confirm，这里弹框让用户选 */
+  const [closeAsk, setCloseAsk] = useState(false)
 
   // 第一次点击任何地方就解锁音频（浏览器自动播放策略）
   useEffect(() => {
@@ -127,6 +131,20 @@ export default function App() {
       .getReminderSettings()
       .then(setReminder)
       .catch(() => setReminder(null))
+  }, [loggedIn])
+
+  // 关窗确认（TD-109）：Rust 拦截 CloseRequested 后发 close-confirm，弹框让用户选
+  // 「缩小到托盘（默认）/ 退出程序 / 取消」。取消 = 继续使用，什么都不动。
+  useEffect(() => {
+    if (!loggedIn) return
+    let alive = true
+    const un = listen('close-confirm', () => {
+      if (alive) setCloseAsk(true)
+    })
+    return () => {
+      alive = false
+      void un.then((f) => f())
+    }
   }, [loggedIn])
 
   // 到期提醒轮询：只有开提醒才跑，避免无谓的数据库查询
@@ -282,6 +300,10 @@ export default function App() {
         style={{
           background: '#fff',
           borderBottom: '1px solid #f0f0f0',
+          // 顶栏固定：内容滚动时水位 / 到期提醒 / 角色始终可见（TD-108）
+          position: 'sticky',
+          top: 0,
+          zIndex: 10,
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
@@ -372,6 +394,40 @@ export default function App() {
 
         <Tabs defaultActiveKey="rooms" items={tabs} />
         <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
+
+        {/* 关窗确认（TD-109）：默认「缩小到托盘」，后台继续跑到期提醒与自动备份 */}
+        <Modal
+          open={closeAsk}
+          title="关闭 OpenCardWright？"
+          // antd 默认 top=100px 在高窗口下偏上；centered 垂直居中
+          centered
+          footer={null}
+          closable
+          maskClosable={false}
+          onCancel={() => setCloseAsk(false)}
+        >
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Text type="secondary">
+              缩小到系统托盘后程序继续运行（到期提醒、自动备份不受影响），
+              点托盘图标可恢复窗口；托盘菜单里也能真正退出。
+            </Text>
+            <Space wrap>
+              <Button
+                type="primary"
+                onClick={() => {
+                  setCloseAsk(false)
+                  void api.hideToTray()
+                }}
+              >
+                缩小到托盘（推荐）
+              </Button>
+              <Button danger onClick={() => void api.quitApp()}>
+                退出程序
+              </Button>
+              <Button onClick={() => setCloseAsk(false)}>取消</Button>
+            </Space>
+          </Space>
+        </Modal>
       </Content>
     </Layout>
   )

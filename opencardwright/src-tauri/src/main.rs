@@ -28,8 +28,11 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // 第二个实例只把已有窗口叫到前台：串口是独占资源，不能有两个发卡进程
+            // 第二个实例只把已有窗口叫到前台：串口是独占资源，不能有两个发卡进程。
+            // 窗口可能被缩小到托盘（hide），所以要先 show 再 unminimize/focus。
             if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
                 let _ = window.set_focus();
             }
         }))
@@ -110,6 +113,64 @@ fn main() {
             // 自动备份：每 30 秒醒一次读设置，到点就备份（间隔 0 = 关闭）
             backup_job::spawn(db_for_job, db_path_for_job);
 
+            // 关窗拦截（TD-109）：点 X / Alt+F4 不直接退，先问「缩小到托盘还是退出」，
+            // 由前端弹确认框（默认缩小）；选择缩小走 hide_to_tray，退出走 quit_app。
+            if let Some(win) = app.get_webview_window("main") {
+                let w = win.clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        use tauri::Emitter;
+                        let _ = w.emit("close-confirm", ());
+                    }
+                });
+            }
+
+            // 系统托盘：缩小到托盘后靠它恢复 / 退出（TD-109）
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+                let quit = MenuItem::with_id(app, "quit", "退出程序", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show, &quit])?;
+                let mut builder = TrayIconBuilder::with_id("main-tray")
+                    .tooltip("OpenCardWright · 门锁发卡台")
+                    .menu(&tray_menu)
+                    // 左键走 on_tray_icon_event（单击恢复窗口），菜单由右键弹出
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    builder = builder.icon(icon.clone());
+                }
+                builder.build(app)?;
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -143,6 +204,10 @@ fn main() {
             commands::list_room_statuses,
             commands::update_room_status_style,
             commands::set_room_status,
+            commands::list_reservations,
+            commands::create_reservation,
+            commands::update_reservation,
+            commands::cancel_reservation,
             commands::checkout_room,
             commands::checkout_card,
             commands::force_checkout_card,
@@ -173,6 +238,8 @@ fn main() {
             commands::get_reminder_settings,
             commands::set_reminder_settings,
             commands::expiring_cards,
+            commands::hide_to_tray,
+            commands::quit_app,
             commands::run_selftest,
             commands::probe_ports,
             commands::set_port,

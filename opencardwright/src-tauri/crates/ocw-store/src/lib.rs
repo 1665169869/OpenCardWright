@@ -119,6 +119,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v5(conn)?;
     apply_v6(conn)?;
     apply_v7(conn)?;
+    apply_v8(conn)?;
     Ok(())
 }
 
@@ -138,7 +139,7 @@ pub struct BackupInfo {
 }
 
 /// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// 把当前库**在线备份**到指定文件。
 ///
@@ -370,6 +371,15 @@ fn apply_v7(conn: &Connection) -> Result<()> {
         [],
     )?;
     conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (7)", [])?;
+    Ok(())
+}
+
+/// v7 → v8：预定日期区间。
+///
+/// 表本身在 schema.sql 里用 `CREATE TABLE IF NOT EXISTS` 建（每次 migrate 都会执行），
+/// 这里只登记版本号；不涉及旧列改写，升级无损。
+fn apply_v8(conn: &Connection) -> Result<()> {
+    conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (8)", [])?;
     Ok(())
 }
 
@@ -672,8 +682,316 @@ pub fn checkout_room(conn: &Connection, room_no: &str, dirty_status: &str) -> Re
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![room_no],
     )?;
+    // 刚过期但还没标记的客卡也要一并关闭：expiring_cards 的提醒窗口是 [-10 分钟, +N 分钟]，
+    // 不关掉它们，无卡退房后铃铛还会挂到自然出窗。
+    conn.execute(
+        "UPDATE issuance
+            SET checked_out_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE room_no = ?1
+            AND result = 'ok'
+            AND checked_out_at IS NULL
+            AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
+            AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        params![room_no],
+    )?;
     set_room_status(conn, room_no, dirty_status)?;
     Ok(n)
+}
+
+/// 预定记录。日期是本地业务日期（`YYYY-MM-DD`），退房日不含。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reservation {
+    pub id: i64,
+    pub room_no: String,
+    pub check_in: String,
+    pub check_out: String,
+    pub guest_name: Option<String>,
+    pub note: Option<String>,
+    pub status: String,
+    pub operator_name: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub cancelled_at: Option<String>,
+}
+
+/// 新建 / 改期预定的入参。`check_out` 是退房日（不含）。
+#[derive(Debug, Clone)]
+pub struct ReservationInput {
+    pub room_no: String,
+    pub check_in: String,
+    pub check_out: String,
+    pub guest_name: Option<String>,
+    pub note: Option<String>,
+}
+
+fn row_to_reservation(r: &Row<'_>) -> rusqlite::Result<Reservation> {
+    Ok(Reservation {
+        id: r.get(0)?,
+        room_no: r.get(1)?,
+        check_in: r.get(2)?,
+        check_out: r.get(3)?,
+        guest_name: r.get(4)?,
+        note: r.get(5)?,
+        status: r.get(6)?,
+        operator_name: r.get(7)?,
+        created_at: r.get(8)?,
+        updated_at: r.get(9)?,
+        cancelled_at: r.get(10)?,
+    })
+}
+
+const RESERVATION_SELECT: &str = "SELECT r.id, r.room_no, r.check_in, r.check_out, r.guest_name, \
+                                         r.note, r.status, o.display_name, r.created_at, r.updated_at, \
+                                         r.cancelled_at \
+                                    FROM reservation r LEFT JOIN operator o ON o.id = r.operator_id";
+
+fn is_valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    if !b
+        .iter()
+        .enumerate()
+        .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let year: i32 = s[0..4].parse().unwrap_or(0);
+    let month: u32 = s[5..7].parse().unwrap_or(0);
+    let day: u32 = s[8..10].parse().unwrap_or(0);
+    if !(1970..=2200).contains(&year) || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    (1..=max_day).contains(&day)
+}
+
+fn today_local(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row("SELECT date('now','localtime')", [], |r| r.get(0))?)
+}
+
+fn reservation_covers_today(conn: &Connection, check_in: &str, check_out: &str) -> Result<bool> {
+    let today = today_local(conn)?;
+    Ok(check_in <= today.as_str() && check_out > today.as_str())
+}
+
+/// 校验日期、房号与同房区间重叠。`allow_past_check_in` 用于改期：
+/// 允许把一条已经开始的预定改成今天退房，但创建时不允许入住日早于今天。
+fn validate_reservation(
+    conn: &Connection,
+    input: &ReservationInput,
+    exclude_id: Option<i64>,
+    allow_past_check_in: bool,
+) -> Result<()> {
+    if input.room_no.trim().is_empty() {
+        return Err(StoreError::Invalid("房号不能为空".into()));
+    }
+    let room_exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM room WHERE room_no = ?1 AND active = 1",
+        params![input.room_no],
+        |r| r.get(0),
+    )?;
+    if room_exists == 0 {
+        return Err(StoreError::Invalid(format!("房号不存在或已删除：{}", input.room_no)));
+    }
+    if !is_valid_date(&input.check_in) || !is_valid_date(&input.check_out) {
+        return Err(StoreError::Invalid("日期格式应为 YYYY-MM-DD".into()));
+    }
+    if input.check_out <= input.check_in {
+        return Err(StoreError::Invalid(
+            "退房日期必须晚于入住日期（退房日不含）".into(),
+        ));
+    }
+    let today = today_local(conn)?;
+    if !allow_past_check_in && input.check_in < today {
+        return Err(StoreError::Invalid("入住日期不能早于今天".into()));
+    }
+    if input.check_out <= today {
+        return Err(StoreError::Invalid("退房日期必须晚于今天".into()));
+    }
+
+    let mut sql = String::from(
+        "SELECT COUNT(*) FROM reservation
+          WHERE room_no = ?1 AND status = 'booked'
+            AND check_in < ?2 AND check_out > ?3",
+    );
+    if exclude_id.is_some() {
+        sql.push_str(" AND id != ?4");
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let count: i64 = if let Some(id) = exclude_id {
+        stmt.query_row(
+            params![input.room_no, input.check_out, input.check_in, id],
+            |r| r.get(0),
+        )?
+    } else {
+        stmt.query_row(
+            params![input.room_no, input.check_out, input.check_in],
+            |r| r.get(0),
+        )?
+    };
+    if count > 0 {
+        return Err(StoreError::Invalid("该房间在这个日期区间已有预定".into()));
+    }
+    Ok(())
+}
+
+/// 预定变化后同步「今天」的房态。
+///
+/// * 今天有有效预定且房间是空净 / 空脏 → 标成预定房；
+/// * 原本覆盖今天、现在不再覆盖，且没有别的预定 → 只有当前是预定房才回退空净。
+///
+/// 在住/维修/已满不强行改，避免把在住房变成预定房。**到期不自动改房态**
+/// （用户明确要求），这里只在创建/改期/取消这些主动操作后执行。
+fn sync_room_status_for_reservation(
+    conn: &Connection,
+    room_no: &str,
+    was_covering_today: bool,
+) -> Result<()> {
+    let today = today_local(conn)?;
+    let covering: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reservation
+          WHERE room_no = ?1 AND status = 'booked'
+            AND check_in <= ?2 AND check_out > ?2",
+        params![room_no, today],
+        |r| r.get(0),
+    )?;
+    let Some(room) = find_room(conn, room_no)? else {
+        return Ok(());
+    };
+    if covering > 0 {
+        if matches!(room.status.as_str(), "vacant_clean" | "vacant_dirty") {
+            set_room_status(conn, room_no, "reserved")?;
+        }
+    } else if was_covering_today && room.status == "reserved" {
+        set_room_status(conn, room_no, "vacant_clean")?;
+    }
+    Ok(())
+}
+
+pub fn find_reservation(conn: &Connection, id: i64) -> Result<Option<Reservation>> {
+    let sql = format!("{RESERVATION_SELECT} WHERE r.id = ?1");
+    Ok(conn
+        .query_row(&sql, params![id], row_to_reservation)
+        .optional()?)
+}
+
+/// 查询与 `[from, to)` 相交的有效预定；日期都是 `YYYY-MM-DD`。
+pub fn list_reservations(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    room_no: Option<&str>,
+) -> Result<Vec<Reservation>> {
+    if !is_valid_date(from) || !is_valid_date(to) || to <= from {
+        return Err(StoreError::Invalid("查询日期区间不合法".into()));
+    }
+    let mut sql = format!(
+        "{RESERVATION_SELECT} WHERE r.status = 'booked' AND r.check_in < ?1 AND r.check_out > ?2"
+    );
+    if room_no.is_some() {
+        sql.push_str(" AND r.room_no = ?3");
+    }
+    sql.push_str(" ORDER BY r.check_in, r.room_no, r.id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = if let Some(room) = room_no {
+        stmt.query_map(params![to, from, room], row_to_reservation)?
+    } else {
+        stmt.query_map(params![to, from], row_to_reservation)?
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn create_reservation(
+    conn: &Connection,
+    input: &ReservationInput,
+    operator_id: Option<i64>,
+) -> Result<Reservation> {
+    validate_reservation(conn, input, None, false)?;
+    conn.execute(
+        "INSERT INTO reservation (room_no, check_in, check_out, guest_name, note, operator_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            input.room_no.as_str(),
+            input.check_in.as_str(),
+            input.check_out.as_str(),
+            input.guest_name.as_deref(),
+            input.note.as_deref(),
+            operator_id
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    sync_room_status_for_reservation(conn, &input.room_no, false)?;
+    find_reservation(conn, id)?
+        .ok_or_else(|| StoreError::Invalid("预定写入后读不到".into()))
+}
+
+pub fn update_reservation(
+    conn: &Connection,
+    id: i64,
+    input: &ReservationInput,
+) -> Result<Reservation> {
+    let old = find_reservation(conn, id)?
+        .ok_or_else(|| StoreError::Invalid("预定不存在".into()))?;
+    if old.status != "booked" {
+        return Err(StoreError::Invalid("已取消的预定不能改期".into()));
+    }
+    validate_reservation(conn, input, Some(id), true)?;
+    let old_covers_today = reservation_covers_today(conn, &old.check_in, &old.check_out)?;
+    conn.execute(
+        "UPDATE reservation
+            SET room_no = ?2, check_in = ?3, check_out = ?4, guest_name = ?5, note = ?6,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE id = ?1",
+        params![
+            id,
+            input.room_no.as_str(),
+            input.check_in.as_str(),
+            input.check_out.as_str(),
+            input.guest_name.as_deref(),
+            input.note.as_deref()
+        ],
+    )?;
+    sync_room_status_for_reservation(conn, &old.room_no, old_covers_today)?;
+    if old.room_no != input.room_no {
+        sync_room_status_for_reservation(conn, &input.room_no, false)?;
+    }
+    find_reservation(conn, id)?
+        .ok_or_else(|| StoreError::Invalid("预定更新后读不到".into()))
+}
+
+pub fn cancel_reservation(conn: &Connection, id: i64) -> Result<Reservation> {
+    let old = find_reservation(conn, id)?
+        .ok_or_else(|| StoreError::Invalid("预定不存在".into()))?;
+    if old.status != "booked" {
+        return Ok(old);
+    }
+    let was_covering_today = reservation_covers_today(conn, &old.check_in, &old.check_out)?;
+    conn.execute(
+        "UPDATE reservation
+            SET status = 'cancelled',
+                cancelled_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE id = ?1",
+        params![id],
+    )?;
+    sync_room_status_for_reservation(conn, &old.room_no, was_covering_today)?;
+    find_reservation(conn, id)?
+        .ok_or_else(|| StoreError::Invalid("预定取消后读不到".into()))
 }
 
 /// 0..=255 中未使用的最小序号。用尽返回 None。
@@ -1011,7 +1329,10 @@ pub struct ExpiringCard {
 /// 即将到期 / 刚过期的客卡。
 ///
 /// * 每个 `(房间, 卡型)` 只取最新一条 —— 同房重发不会重复提醒；
-/// * 时间窗 `[now - 1 天, now + within_minutes]`：既提醒即将到期，也把刚过期没来得及提醒的补回来；
+/// * 时间窗 `[now - 10 分钟, now + within_minutes]`：既提醒即将到期，也给
+///   「过期瞬间没赶上轮询」留 10 分钟补提醒。**过期 10 分钟后必须出窗** ——
+///   自然过期的卡没人退房（checked_out_at 为 NULL），窗口放到 1 天会让
+///   「房间已经没有有效卡了」的铃铛多挂 24 小时（TD-111）；
 /// * 用 ISO UTC 字符串比较，字典序即时间序。
 pub fn expiring_cards(conn: &Connection, within_minutes: i64) -> Result<Vec<ExpiringCard>> {
     let within = within_minutes.clamp(0, 24 * 60);
@@ -1029,7 +1350,8 @@ pub fn expiring_cards(conn: &Connection, within_minutes: i64) -> Result<Vec<Expi
            FROM issuance i
            LEFT JOIN room r ON r.room_no = i.room_no
           WHERE i.id IN (SELECT id FROM latest)
-            AND i.expires_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day')
+            AND i.checked_out_at IS NULL
+            AND i.expires_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')
             AND i.expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+' || ?1 || ' minutes')
           ORDER BY i.expires_at",
     )?;
@@ -1563,6 +1885,9 @@ pub struct IssuanceFilter {
     pub to: Option<String>,
     pub page: i64,
     pub page_size: i64,
+    /// 入住记录视图（TD-118）：只看填了身份信息的发卡 —— guest_name 非空且非空白，
+    /// 「未输入身份信息不记录入住信息」在查询层落实。
+    pub guest_only: bool,
 }
 
 /// 列表用的发卡记录行（比 [`IssuanceRecord`] 宽，且**不复用**它 —— 那条被读卡/换房链路共用，
@@ -1646,6 +1971,10 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
     if let Some(to) = f.to.as_ref().filter(|s| !s.is_empty()) {
         where_sql.push_str(" AND created_at < ?");
         vals.push(Value::Text(to.to_string()));
+    }
+    // 入住记录视图（TD-118）：未输入身份信息（NULL / 空白）的发卡不进入入住记录
+    if f.guest_only {
+        where_sql.push_str(" AND guest_name IS NOT NULL AND TRIM(guest_name) != ''");
     }
 
     let total: i64 = conn.query_row(
@@ -2235,8 +2564,9 @@ mod tests {
             .unwrap();
         };
 
-        insert("-2 days", "301", "日租客卡", 10); // 太旧，出窗
-        insert("-30 minutes", "302", "日租客卡", 11); // 刚过期，要提醒
+        insert("-2 days", "301", "日租客卡", 10); // 过期超宽限，出窗
+        insert("-30 minutes", "307", "日租客卡", 17); // 过期超 10 分钟宽限：TD-111 回归，不出窗
+        insert("-5 minutes", "302", "日租客卡", 11); // 刚过期（宽限内），要提醒
         insert("+30 minutes", "303", "日租客卡", 12); // 即将到期，要提醒
         insert("+2 hours", "304", "日租客卡", 13); // 还早，出窗
 
@@ -2247,6 +2577,7 @@ mod tests {
         let list = expiring_cards(&conn, 60).unwrap();
         let rooms: Vec<&str> = list.iter().filter_map(|c| c.room_no.as_deref()).collect();
         assert!(!rooms.contains(&"301"));
+        assert!(!rooms.contains(&"307"), "过期超 10 分钟宽限不得再提醒（TD-111）");
         assert!(!rooms.contains(&"304"));
         assert!(rooms.contains(&"302"));
         assert!(rooms.contains(&"303"));
@@ -2254,6 +2585,116 @@ mod tests {
         assert_eq!(list.last().unwrap().room_no.as_deref(), Some("303"), "按到期时间升序");
 
         cleanup(conn, path);
+    }
+
+    #[test]
+    fn expiring_cards_excludes_checked_out() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "306", None, None, None, None).unwrap();
+        conn.execute(
+            "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
+             VALUES (?1, '306', '日租客卡', 1, 0, 16, 'ok',
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+30 minutes'))",
+            params![uuid::Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(expiring_cards(&conn, 60).unwrap().len(), 1, "退房前应提醒");
+        checkout_room(&conn, "306", "vacant_dirty").unwrap();
+        assert!(
+            expiring_cards(&conn, 60).unwrap().is_empty(),
+            "已退房的卡不应再出现在到期提醒里"
+        );
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn reservation_overlap_room_status_and_cancel() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "801", None, None, None, None).unwrap();
+        let day = |offset: &str| -> String {
+            conn.query_row(
+                "SELECT date('now','localtime', ?1)",
+                params![offset],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let today = day("+0 day");
+        let tomorrow = day("+1 day");
+        let day_after = day("+2 days");
+        let make = |check_in: &str, check_out: &str| ReservationInput {
+            room_no: "801".into(),
+            check_in: check_in.into(),
+            check_out: check_out.into(),
+            guest_name: Some("张三".into()),
+            note: None,
+        };
+
+        let a = create_reservation(&conn, &make(&today, &tomorrow), None).unwrap();
+        assert_eq!(
+            find_room(&conn, "801").unwrap().unwrap().status,
+            "reserved",
+            "覆盖今天的预定应把空房标成预定房"
+        );
+        assert!(
+            create_reservation(&conn, &make(&today, &day_after), None).is_err(),
+            "同房重叠日期必须拒绝"
+        );
+        assert!(
+            create_reservation(&conn, &make(&day("-1 day"), &tomorrow), None).is_err(),
+            "入住日不能早于今天"
+        );
+
+        let b = create_reservation(&conn, &make(&tomorrow, &day_after), None).unwrap();
+        assert_eq!(b.check_in, tomorrow, "紧邻的下一段不算重叠");
+
+        // 取消 A：今天已无有效预定，房态从 reserved 回退
+        let cancelled = cancel_reservation(&conn, a.id).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(
+            find_room(&conn, "801").unwrap().unwrap().status,
+            "vacant_clean"
+        );
+        assert_eq!(
+            cancel_reservation(&conn, a.id).unwrap().status,
+            "cancelled",
+            "重复取消幂等"
+        );
+
+        // 取消的预定不参与重叠：C 可以占用同一段
+        let c = create_reservation(&conn, &make(&today, &tomorrow), None).unwrap();
+        assert_eq!(
+            find_room(&conn, "801").unwrap().unwrap().status,
+            "reserved"
+        );
+
+        // 改期到明天（B 仍占着明天，先取消 B 再改）
+        cancel_reservation(&conn, b.id).unwrap();
+        let moved = update_reservation(&conn, c.id, &make(&tomorrow, &day_after)).unwrap();
+        assert_eq!(moved.check_in, tomorrow);
+        assert_eq!(
+            find_room(&conn, "801").unwrap().unwrap().status,
+            "vacant_clean",
+            "改到未来后今天不再覆盖，房态回退"
+        );
+
+        let list = list_reservations(&conn, &today, &day_after, Some("801")).unwrap();
+        assert_eq!(list.len(), 1, "取消的 A / B 不在列表里，只剩改期后的 C");
+        assert_eq!(list[0].id, c.id);
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn date_validation_rejects_impossible_dates() {
+        assert!(is_valid_date("2026-02-28"));
+        assert!(!is_valid_date("2026-02-29"));
+        assert!(is_valid_date("2028-02-29"));
+        assert!(!is_valid_date("2026-13-01"));
+        assert!(!is_valid_date("2026-00-10"));
+        assert!(!is_valid_date("2026-1-01"));
     }
 
     #[test]
@@ -2431,13 +2872,24 @@ mod tests {
         };
         mk(1, "+1 day");
         mk(2, "+2 hours");
-        mk(3, "-1 hour"); // 已过期，不该被算作"退房关闭"
+        mk(3, "-1 hour"); // 已过期：不计入 closed，但退房时要一并标记，避免到期提醒残留
 
         assert_eq!(count_active_cards(&conn, "220").unwrap(), 2);
         assert_eq!(find_room(&conn, "220").unwrap().unwrap().status, "vacant_clean");
 
         let closed = checkout_room(&conn, "220", "vacant_dirty").unwrap();
-        assert_eq!(closed, 2, "只关闭仍有效的卡");
+        assert_eq!(closed, 2, "closed 只数仍有效的卡");
+        let expired_checked_out: Option<String> = conn
+            .query_row(
+                "SELECT checked_out_at FROM issuance WHERE room_no = '220' AND card_no = 3",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            expired_checked_out.is_some(),
+            "已过期客卡也要标记退房，避免到期提醒残留"
+        );
         assert_eq!(count_active_cards(&conn, "220").unwrap(), 0);
         assert_eq!(
             find_room(&conn, "220").unwrap().unwrap().status,
@@ -2568,6 +3020,40 @@ mod tests {
 
         deactivate_room(&conn, "702").unwrap();
         delete_room_type(&conn, t.id).expect("房间已删，房型应可删");
+        cleanup(conn, path);
+    }
+
+    /// 入住记录视图（TD-118）：只有填了身份信息（guest_name 非空且非空白）的发卡才出现。
+    #[test]
+    fn guest_only_excludes_blank_names() {
+        let (conn, path) = temp_db();
+        let insert = |name: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at, guest_name)
+                 VALUES (?1, '803', '日租客卡', 1, 0, 1, 'ok',
+                         strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 day'), ?2)",
+                params![uuid::Uuid::new_v4().to_string(), name],
+            )
+            .unwrap();
+        };
+        insert(Some("张三"));
+        insert(None);
+        insert(Some("   ")); // 空白姓名也不算入住信息
+
+        let all = list_issuances(&conn, &IssuanceFilter::default()).unwrap();
+        assert_eq!(all.total, 3, "不过滤时三条都在");
+
+        let guests = list_issuances(
+            &conn,
+            &IssuanceFilter {
+                guest_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(guests.total, 1, "未输入身份信息的两条不进入入住记录");
+        assert_eq!(guests.rows[0].guest_name.as_deref(), Some("张三"));
+
         cleanup(conn, path);
     }
 

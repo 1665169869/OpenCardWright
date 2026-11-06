@@ -1,9 +1,10 @@
 # AGENTS.md
 
 本仓库是「智能门锁管理软件（LOCK_V8 / V8.9）」TEMIC 卡的**逆向成果 + 独立发卡 SDK**，
-不是常规应用工程：没有解决方案文件、没有包管理、sdk/ 侧也没有单元测试框架
-（回归靠 `PMSLockCard.exe selftest`）。仓库已纳入 git，见第 8 节。
-（产品工作区 `opencardwright/` 例外：它是独立的 Tauri + Rust 工程，有自己的构建链，见第 9 节。）
+并在其上开发开源发卡台 **OpenCardWright**。`sdk/` 侧不是常规应用工程：没有解决方案文件、
+没有包管理，也没有单元测试框架（回归靠 `PMSLockCard.exe selftest`）；产品侧
+`opencardwright/` 是独立的 Tauri + Rust + React 工程，有自己的构建链（见第 9 节）。
+仓库已纳入 git，见第 8 节。
 
 改动前先读 `docs/`，那里是唯一权威来源；代码是文档的实现。
 
@@ -27,6 +28,8 @@
 | `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、16 位卡号计数器 | 状态文件是现场数据 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
 | `opencardwright/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链 | 见第 9 节 |
+| `opencardwright/docs/使用手册.md`、`CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
+| `opencardwright/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder` / `CardNoStore`） | 随 SDK 接口同步 |
 | `plan/` | 建设方案（v0.1 作废留档、v0.2 已批准）与 `待办清单.md` | 方案改结论要留痕；待办清单每轮更新，见第 10 节 |
 
 `sdk/` 会被**整目录拷到现场 32 位 Windows** 直接运行，所以不要在 `sdk/` 里塞构建中间物或文档。
@@ -51,6 +54,8 @@ csc /target:library /platform:x86 /out:PMSLockSDK.Com.dll /r:PMSLockSDK.dll PMSL
 - COM 注册（管理员，32 位）：`regasm.exe PMSLockSDK.Com.dll /tlb /codebase`。
 - 源码含中文注释与中文输出：若编译后乱码，加 `/codepage:65001`，**不要**转成 GBK 保存。
 - 交付物是 `.dll/.exe`，仓库里已提交编译结果；改源码后要同步重建，否则现场跑的是旧二进制。
+- **产品侧不要手工执行上面的 csc**：统一走 `opencardwright/scripts/build-sdk.ps1`
+  （额外编 `OCWCardBuild.exe`、跑 27 条自检门禁、不复制 `CardNo.state`）。
 
 ## 3. 验证（不需要读卡器）
 
@@ -129,14 +134,18 @@ PMSLockCard.exe selftest
 
 **仍存在的不一致（无害）**：
 
+- `opencardwright/README.md` §1 的 M3/M4/M5 状态表是历史快照，部分 ⬜ 实际已完成；
+  判断“还差什么”只看 `plan/待办清单.md`，不要据此开工。
 - `RoomIndex.ini` 有两份（`data/` 与 `sdk/`）；运行时读 `sdk/` 侧（`LockCard.ini` 用相对路径），
   增删房间要两份同步。
 
 ## 8. 环境注记
 
-- 本会话 `pwsh` 启动失败（`exit code 3221225794` = `0xC0000142` DLL 初始化失败），
-  全程只能用 `read` / `glob` / `grep` 读仓库。若你遇到同样现象，先确认能否编译，不要把
-  "没跑过命令"当成验证通过。
+- 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用，`npm run build:sdk`
+  实测 27/27 通过。若某会话 `pwsh` 启动失败（`0xC0000142` DLL 初始化失败），先确认能否编译，
+  不要把“没跑过命令”当成验证通过。
+- `cargo` 可能不在 bash 的 PATH：本机在 `~/.cargo/bin/cargo.exe`。跑 Rust 测试前先设
+  `CARGO_TARGET_DIR='C:\ocw-target'`（仓库路径含中文，见第 9 节），否则 MSVC 可能报 `D8050`。
 - 驱动版本敏感：结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
 - 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
@@ -153,7 +162,7 @@ PMSLockCard.exe selftest
 | 关系 | 说明 |
 |---|---|
 | `sdk/` 的定位 | 产品的**设备实现与参考实现**。产品在构建期用 `csc` 从 `sdk/*.cs` 现编，产物打进 `src-tauri/resources/sdk/` |
-| 能否修改 `sdk/` | **不能**（沿用第 0 节约束）。需要改设备行为时，改的是产品的适配层，不是 SDK |
+| 能否修改 `sdk/` | **不能**（沿用第 1、4、6 节约束）。需要改设备行为时，改的是产品的适配层，不是 SDK |
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
 | 回归口径 | `sdk` 自带的 27 条黄金向量；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
 | 构建命令 | 在 `opencardwright/` 内：`pwsh -File scripts/build-sdk.ps1` → `npm run build:sdk`；随后 `npm run tauri build` |
@@ -161,13 +170,27 @@ PMSLockCard.exe selftest
 
 新产品自己的约定（技术栈、目录、阶段）以 `opencardwright/README.md` 为准，不要套用本文件的 csc 构建命令。
 
+### 产品侧模块（改代码先定位）
+
+| 位置（相对 `opencardwright/`） | 职责 |
+|---|---|
+| `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/` |
+| `src-tauri/src/commands.rs` | 全部 `#[tauri::command]`：发卡 / 退房 / 房间 / 管理卡 / 备份 / 诊断 / 登录，以及命令 × 角色矩阵 |
+| `src-tauri/src/rules.rs` | 时长边界（客卡 62 / 总控 63）、长有效期档位与确认词；**与 `src/api.ts` 的档位表必须同步** |
+| `src-tauri/src/auth.rs` | 会话、角色（admin / frontdesk）、Argon2 口令 |
+| `src-tauri/crates/ocw-store/` | SQLite schema 与查询（rusqlite bundled）；`issuance` 只追加，序号唯一 |
+| `src-tauri/crates/ocw-device/` | 启动 `PMSLockCard.exe` 子进程、GBK 解码、解析、模拟设备 |
+| `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 运行目录 + 首启卡号、自动备份、文件日志、诊断包 |
+
 产品工作区常用命令（在 `opencardwright/` 内）：
 
 ```powershell
 npm install
 npm run build:sdk      # 编译 ../sdk → resources/sdk，跑 27 条黄金向量门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
-npm run tauri dev      # 前端热更新；改 Rust 会自动重编译+重启
-npx tsc --noEmit       # 前端类型检查
+npm run dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
+npm run tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
+npm run build          # build:sdk + tsc --noEmit + vite build
+npx tsc --noEmit       # 只做前端类型检查
 npm run setup:nsis     # 打包前预置 NSIS 工具链（本机联网下载会超时）
 npm run tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出的是 dev 壳）
 ```
@@ -176,15 +199,15 @@ npm run tauri build    # 出 NSIS 安装包；不要用 cargo build --release（
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 仓库路径含中文必须设，否则 MSVC 报 D8050
-cargo test --workspace                                   # 全部（前端 0 项，Rust 40+ 项）
-cargo test -p ocw-store                                  # 只跑存储层
-cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件
+cargo test --workspace                                   # 全部；2026-11-06 实测 118 项全绿
+cargo test -p ocw-store                                  # 只跑存储层（41）
+cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件（5）
 cargo test -p ocw-store insert_room                      # 按用例名子串单跑
 ```
 
-> 已知红灯：`ocw-device` 的 `real_selftest_is_all_green_and_parses` 用 `String::from_utf8_lossy`
-> 读 `PMSLockCard.exe` 的 **GBK** 输出，中文变 U+FFFD 导致断言失败（设备输出本身是 27/27 全过）。
-> 修法是把 `cli::decode` 提成 `pub` 给集成测试用。
+> 2026-11-06 起 `real_selftest_is_all_green_and_parses` 已改用 `ocw_device::cli::decode`，
+> GBK 红灯已修复；`cargo test --workspace` 实测 118 项全绿
+> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 41 + 命令层 44）。
 
 无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`。模拟设备会调用 `OCWCardBuild.exe`
 离线构包并推进 `CardNo.state`，卡号/字节与真机一致，只是不真写卡（缺构包器时退回固定样本）。
@@ -203,7 +226,7 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 | 新增房间用到已删序号 = **复活那条记录改房名**，不插新行 | 否则撞 `room_index UNIQUE`；同时重置房态/发卡上限/安装卡记录 |
 | 有有效卡时**不许改名、不许删房** | 发卡、退房、改上限全按 `room_no` 对账，改名会让在场卡对不上号 |
 | 「有效卡」口径 | `result='ok' AND card_no IS NOT NULL AND expires_at IS NOT NULL AND checked_out_at IS NULL AND expires_at > now` |
-| 发卡 / 续住写卡只在**空净房 / 未满房**可点 | 房态是人工维护的业务字段，只做前端拦截，后端不硬拦（旧流程允许先发卡再改房态） |
+| 发卡 / 续住写卡可在**空净房 / 未满房 / 预定房**点（预定房发卡时自动预填预定姓名） | 房态是人工维护的业务字段，只做前端拦截，后端不硬拦（旧流程允许先发卡再改房态） |
 
 ### 前端两个反复踩的坑
 
@@ -214,6 +237,10 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 
 产品侧高频踩坑（详见 `opencardwright/README.md` §7）：设备 CLI 输出是 GBK，必须经
 `ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。
+
+- 新增/改名 Tauri 命令必须同步 `opencardwright/README.md` §8 的「命令 × 角色」表；
+  `commands.rs` 的 `auth_matrix_matches_every_command` 会机械校验，漏登记即红。
+- 时长边界改一处不算完：`src-tauri/src/rules.rs` 与 `src/api.ts` 的档位表必须同步。
 
 计划与未完成项的登记规则见第 10 节。
 

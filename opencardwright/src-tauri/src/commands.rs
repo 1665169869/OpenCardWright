@@ -1155,6 +1155,18 @@ pub async fn issue_guest(
             let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
                 .and_then(|r| r.expires_at);
 
+            // 6) 发卡成功后同步房态（TD-115）：空净房 / 预定房 → 未满房；
+            //    设了上限且有效卡已到顶 → 已满房。维修 / 其他 / 已满 不动。
+            //    只在成功分支执行 —— 写卡失败保持原房态。
+            if matches!(room.status.as_str(), "vacant_clean" | "reserved") {
+                let active_after = ocw_store::count_active_cards(&conn, &room_no)?;
+                let new_status = match room.max_cards {
+                    Some(max) if active_after >= max => "occupied_full",
+                    _ => "occupied_partial",
+                };
+                ocw_store::set_room_status(&conn, &room_no, new_status)?;
+            }
+
             Ok(IssuedDto {
                 card,
                 room: Some(room),
@@ -1451,6 +1463,142 @@ pub async fn set_room_status(
         Ok(())
     })
     .await
+}
+
+/// 列出与 `[from, to)` 相交的有效预定（日期均为 `YYYY-MM-DD`）。
+#[tauri::command]
+pub async fn list_reservations(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+    room_no: Option<String>,
+) -> Result<Vec<ocw_store::Reservation>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::list_reservations(
+            &conn,
+            &from,
+            &to,
+            room_no.as_deref(),
+        )?)
+    })
+    .await
+}
+
+/// 新建预定。`check_out` 是退房日（不含）。
+#[tauri::command]
+pub async fn create_reservation(
+    state: State<'_, AppState>,
+    room_no: String,
+    check_in: String,
+    check_out: String,
+    guest_name: Option<String>,
+    note: Option<String>,
+) -> Result<ocw_store::Reservation, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let input = ocw_store::ReservationInput {
+            room_no,
+            check_in,
+            check_out,
+            guest_name,
+            note,
+        };
+        let r = ocw_store::create_reservation(&conn, &input, Some(me.operator_id))?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "create_reservation",
+            Some(&r.room_no),
+            Some(&format!("{}→{}", r.check_in, r.check_out)),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(r)
+    })
+    .await
+}
+
+/// 改期 / 改预定信息。已取消的预定不能改。
+#[tauri::command]
+pub async fn update_reservation(
+    state: State<'_, AppState>,
+    id: i64,
+    room_no: String,
+    check_in: String,
+    check_out: String,
+    guest_name: Option<String>,
+    note: Option<String>,
+) -> Result<ocw_store::Reservation, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let input = ocw_store::ReservationInput {
+            room_no,
+            check_in,
+            check_out,
+            guest_name,
+            note,
+        };
+        let r = ocw_store::update_reservation(&conn, id, &input)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "update_reservation",
+            Some(&r.room_no),
+            Some(&format!("{}→{}", r.check_in, r.check_out)),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(r)
+    })
+    .await
+}
+
+/// 取消预定（保留记录，重复取消幂等）。
+#[tauri::command]
+pub async fn cancel_reservation(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<ocw_store::Reservation, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let r = ocw_store::cancel_reservation(&conn, id)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "cancel_reservation",
+            Some(&r.room_no),
+            Some(&format!("{}→{}", r.check_in, r.check_out)),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(r)
+    })
+    .await
+}
+
+/// 缩小到系统托盘：关窗确认框的「缩小」选项（TD-109）。窗口隐藏，进程继续跑。
+#[tauri::command]
+pub async fn hide_to_tray(
+    state: State<'_, AppState>,
+    window: tauri::Window,
+) -> Result<(), CommandError> {
+    require_login(&state)?;
+    let _ = window.hide();
+    Ok(())
+}
+
+/// 真正退出程序（确认框的「退出」与托盘菜单共用），绕过关窗拦截。
+#[tauri::command]
+pub async fn quit_app(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), CommandError> {
+    require_login(&state)?;
+    app.exit(0);
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2740,6 +2888,8 @@ pub async fn list_issuances(
     to: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
+    // 入住记录视图（TD-118）：true 时只返回填了身份信息的发卡
+    guest_only: Option<bool>,
 ) -> Result<IssuancePage, CommandError> {
     require_login(&state)?;
     let db = state.db.clone();
@@ -2753,6 +2903,7 @@ pub async fn list_issuances(
             to,
             page: page.unwrap_or(1),
             page_size: page_size.unwrap_or(50),
+            guest_only: guest_only.unwrap_or(false),
         };
         Ok(ocw_store::list_issuances(&conn, &filter)?)
     })
@@ -2898,6 +3049,7 @@ pub async fn export_issuances_csv(
             to,
             page: 1,
             page_size: 50_000,
+            guest_only: false,
         };
         let page = ocw_store::list_issuances(&conn, &filter)?;
         if page.rows.len() >= 50_000 {
@@ -3142,7 +3294,7 @@ mod tests {
     }
 
     /// 全量对照表。**新增命令必须在这里登记**，否则矩阵测试会报「未登记」。
-    /// 三档数量：31 / 18 / 6（改动数量时同步改 `auth_matrix_counts`）。
+    /// 三档数量：35 / 28 / 6（改动数量时同步改 `auth_matrix_counts`）。
     const MATRIX: &[(&str, Level)] = &[
         // 公开（启动即调用 / 认证入口）
         ("app_info", Level::Public),
@@ -3174,6 +3326,12 @@ mod tests {
         ("list_audits", Level::Login),
         ("card_history", Level::Login),
         ("get_onboarding_status", Level::Login),
+        ("list_reservations", Level::Login),
+        ("create_reservation", Level::Login),
+        ("update_reservation", Level::Login),
+        ("cancel_reservation", Level::Login),
+        ("hide_to_tray", Level::Login),
+        ("quit_app", Level::Login),
         // 管理员
         ("set_port", Level::Admin),
         ("create_room", Level::Admin),
@@ -3286,8 +3444,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (35, 22, 6));
-        assert_eq!(command_bodies().len(), 63, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (35, 28, 6));
+        assert_eq!(command_bodies().len(), 69, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {

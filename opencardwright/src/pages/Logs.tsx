@@ -38,6 +38,7 @@ export default function Logs({ canAdmin }: { canAdmin: boolean }) {
       <Tabs
         items={[
           { key: 'issuance', label: '发卡记录', children: <IssuanceTab canAdmin={canAdmin} /> },
+          { key: 'checkin', label: '入住记录', children: <CheckinTab /> },
           { key: 'audit', label: '操作审计', children: <AuditTab /> },
         ]}
       />
@@ -71,6 +72,13 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
   const [err, setErr] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
   const [history, setHistory] = useState<Record<number, IssuanceRow[]>>({})
+
+  // 记录页停留时每 60 秒重渲染一次：到期状态按当前时间计算，跨过到期点要自动变色
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((t) => t + 1), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   const filter = {
     roomNo: roomNo.trim() || null,
@@ -263,8 +271,163 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
           {
             title: '状态',
             width: 100,
+            render: (_: unknown, r: IssuanceRow) => {
+              if (r.result !== 'ok') return <Tag color="red">失败</Tag>
+              if (r.checkedOutAt) return <Tag>已退房</Tag>
+              const guest = r.kind === '日租客卡' || r.kind === '钟点客卡'
+              const expires = r.expiresAt ? Date.parse(r.expiresAt) : NaN
+              if (guest && Number.isFinite(expires) && expires <= Date.now()) {
+                return <Tag color="red">已过期</Tag>
+              }
+              return <Tag color="green">有效</Tag>
+            },
+          },
+        ]}
+      />
+    </Space>
+  )
+}
+
+/** 入住记录（TD-118）：发卡记录中**填了身份信息**的发卡视图。
+ *  未输入身份信息的发卡不进入本表 —— guestOnly 由后端查询层过滤（TRIM 非空），
+ *  这里只管展示：谁、哪间房、什么时候发的卡、住到什么时候。 */
+function CheckinTab() {
+  const [rows, setRows] = useState<IssuanceRow[]>([])
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(50)
+  const [roomNo, setRoomNo] = useState('')
+  const [fromDay, setFromDay] = useState<string | null>(null)
+  const [toDay, setToDay] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  // 到期状态按当前时间计算，跨过到期点自动变色（同发卡记录，60 秒重渲染）
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((t) => t + 1), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setErr(null)
+    try {
+      const p = await api.listIssuances({
+        roomNo: roomNo.trim() || null,
+        from: dayToIso(fromDay),
+        to: dayToIso(toDay, true),
+        guestOnly: true,
+        page,
+        pageSize,
+      })
+      setRows(p.rows)
+      setTotal(p.total)
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [roomNo, fromDay, toDay, page, pageSize])
+
+  useEffect(() => {
+    void load()
+  }, [load])
+
+  return (
+    <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space wrap>
+        <Input
+          placeholder="房号（前缀匹配）"
+          value={roomNo}
+          onChange={(e) => {
+            setRoomNo(e.target.value)
+            setPage(1)
+          }}
+          style={{ width: 150 }}
+          allowClear
+        />
+        <DatePicker
+          placeholder="入住起始日"
+          onChange={(_, s) => {
+            setFromDay(typeof s === 'string' && s ? s : null)
+            setPage(1)
+          }}
+        />
+        <DatePicker
+          placeholder="入住截止日"
+          onChange={(_, s) => {
+            setToDay(typeof s === 'string' && s ? s : null)
+            setPage(1)
+          }}
+        />
+        <Button onClick={() => void load()}>查询</Button>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          只显示发卡时填写了身份信息的记录；未填写的不计入入住记录
+        </Text>
+      </Space>
+
+      {err ? <Alert type="error" showIcon message="操作失败" description={err} /> : null}
+
+      <Table<IssuanceRow>
+        size="small"
+        rowKey="id"
+        loading={loading}
+        dataSource={rows}
+        locale={{ emptyText: '这个条件下没有入住记录' }}
+        pagination={{
+          current: page,
+          pageSize,
+          total,
+          showSizeChanger: true,
+          pageSizeOptions: [20, 50, 100, 200],
+          showTotal: (t) => `共 ${t} 条`,
+          onChange: (p, s) => {
+            setPage(p)
+            setPageSize(s)
+          },
+        }}
+        columns={[
+          {
+            title: '入住时间',
+            dataIndex: 'createdAt',
+            width: 170,
+            render: (v: string) => formatTime(v),
+          },
+          { title: '房号', dataIndex: 'roomNo', width: 90, render: (v: string | null) => v ?? '—' },
+          { title: '客人', dataIndex: 'guestName', width: 110, render: (v: string | null) => v ?? '—' },
+          { title: '卡型', dataIndex: 'kind', width: 120 },
+          {
+            title: '时长',
+            width: 100,
             render: (_: unknown, r: IssuanceRow) =>
-              r.checkedOutAt ? <Tag>已退房</Tag> : <Tag color="green">有效</Tag>,
+              r.days > 0 ? `${r.days} 天` : r.hours > 0 ? `${r.hours} 小时` : '—',
+          },
+          {
+            title: '卡号',
+            dataIndex: 'cardNo',
+            width: 100,
+            render: (v: number | null) =>
+              v === null ? '—' : `0x${v.toString(16).toUpperCase().padStart(4, '0')}`,
+          },
+          {
+            title: '到期',
+            dataIndex: 'expiresAt',
+            width: 170,
+            render: (v: string | null) => (v ? formatTime(v) : '—'),
+          },
+          {
+            title: '状态',
+            width: 100,
+            render: (_: unknown, r: IssuanceRow) => {
+              if (r.result !== 'ok') return <Tag color="red">失败</Tag>
+              if (r.checkedOutAt) return <Tag>已退房</Tag>
+              const expires = r.expiresAt ? Date.parse(r.expiresAt) : NaN
+              if (Number.isFinite(expires) && expires <= Date.now()) {
+                return <Tag color="red">已过期</Tag>
+              }
+              return <Tag color="green">有效</Tag>
+            },
           },
         ]}
       />

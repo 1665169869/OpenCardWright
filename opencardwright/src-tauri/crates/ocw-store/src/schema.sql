@@ -124,4 +124,25 @@ INSERT OR IGNORE INTO room_status (key, label, icon, color, sort_order) VALUES
 -- 列级迁移（operator.department_id / room.room_type_id / issuance.expires_at）
 -- 由 lib.rs 的 apply_v2() 用 PRAGMA table_info 探测后执行，这里不写 ALTER。
 
+-- ---------------- v8 ----------------
+-- 预定：入住—退房日期区间（**退房日不含**，2026-11-06 → 2026-11-07 表示住 1 晚）。
+-- 与当前房态解耦：未来预定不改房态；只有区间覆盖今天时才把空房标成「预定房」。
+-- 同一房间的有效预定不允许日期重叠；取消保留记录（status='cancelled' + cancelled_at）。
+CREATE TABLE IF NOT EXISTS reservation (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_no      TEXT NOT NULL,
+    check_in     TEXT NOT NULL,
+    check_out    TEXT NOT NULL,
+    guest_name   TEXT,
+    note         TEXT,
+    status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled')),
+    operator_id  INTEGER REFERENCES operator (id),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    cancelled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservation_room_dates ON reservation (room_no, check_in, check_out);
+CREATE INDEX IF NOT EXISTS idx_reservation_dates ON reservation (check_in, check_out);
+
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);

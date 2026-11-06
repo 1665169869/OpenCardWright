@@ -141,6 +141,22 @@ export interface CheckoutResult {
   status: string
 }
 
+/** 预定记录。日期是本地日期（YYYY-MM-DD），退房日不含（住 1 晚 = 今天→明天）。 */
+export interface Reservation {
+  id: number
+  roomNo: string
+  checkIn: string
+  checkOut: string
+  guestName: string | null
+  note: string | null
+  /** booked = 有效；cancelled = 已取消（保留记录） */
+  status: string
+  operatorName: string | null
+  createdAt: string
+  updatedAt: string
+  cancelledAt: string | null
+}
+
 /**
  * 换房预览：源房能带走什么。
  *
@@ -207,6 +223,8 @@ export interface LogFilter {
   to?: string | null
   page?: number
   pageSize?: number
+  /** 入住记录视图（TD-118）：true 只返回填了身份信息的发卡 */
+  guestOnly?: boolean
 }
 
 /** 备份结果：备份文件落在哪、多大。 */
@@ -439,6 +457,49 @@ export const api = {
   updateRoomStatusStyle: (key: string, icon: string, color: string) =>
     invoke<void>('update_room_status_style', { key, icon, color }),
   checkoutRoom: (roomNo: string) => invoke<CheckoutResult>('checkout_room', { roomNo }),
+  /** 列出与 [from, to) 相交的有效预定（YYYY-MM-DD） */
+  listReservations: (from: string, to: string, roomNo?: string | null) =>
+    invoke<Reservation[]>('list_reservations', { from, to, roomNo: roomNo ?? null }),
+  /** 新建预定；checkOut 是退房日（不含）。重叠 / 日期非法由后端拒绝 */
+  createReservation: (input: {
+    roomNo: string
+    checkIn: string
+    checkOut: string
+    guestName?: string | null
+    note?: string | null
+  }) =>
+    invoke<Reservation>('create_reservation', {
+      roomNo: input.roomNo,
+      checkIn: input.checkIn,
+      checkOut: input.checkOut,
+      guestName: input.guestName ?? null,
+      note: input.note ?? null,
+    }),
+  /** 改期 / 改预定信息 */
+  updateReservation: (
+    id: number,
+    input: {
+      roomNo: string
+      checkIn: string
+      checkOut: string
+      guestName?: string | null
+      note?: string | null
+    },
+  ) =>
+    invoke<Reservation>('update_reservation', {
+      id,
+      roomNo: input.roomNo,
+      checkIn: input.checkIn,
+      checkOut: input.checkOut,
+      guestName: input.guestName ?? null,
+      note: input.note ?? null,
+    }),
+  /** 取消预定（保留记录，重复取消幂等） */
+  cancelReservation: (id: number) => invoke<Reservation>('cancel_reservation', { id }),
+  /** 缩小到系统托盘（关窗确认框的「缩小」）；点托盘图标或再启动程序恢复 */
+  hideToTray: () => invoke<void>('hide_to_tray'),
+  /** 真正退出程序（确认框的「退出」） */
+  quitApp: () => invoke<void>('quit_app'),
   /** 换房第一步：查源房的有效卡 / 客人 / 到期时间（只读，不改库） */
   roomMovePreview: (roomNo: string) =>
     invoke<RoomMovePreview>('room_move_preview', { roomNo }),
@@ -477,6 +538,7 @@ export const api = {
       to: f.to ?? null,
       page: f.page ?? 1,
       pageSize: f.pageSize ?? 50,
+      guestOnly: f.guestOnly ?? false,
     }),
   /** 操作审计（登录即可） */
   listAudits: (f: { action?: string | null; from?: string | null; to?: string | null; page?: number; pageSize?: number }) =>
