@@ -2186,7 +2186,11 @@ pub fn log_frontend(level: String, message: String) {
         "warn" | "warning" => "WARN",
         _ => "INFO",
     };
-    eprintln!("[frontend][{lvl}] {message}");
+    // 截断 + 去换行：前端能把任意文本写进来，不设限等于开了个日志注入口
+    let safe: String = message.chars().take(2000).collect();
+    let safe = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::logging::line(lvl, "frontend", &safe);
+    eprintln!("[frontend][{lvl}] {safe}");
 }
 
 // ---------------------------------------------------------------- 到期提醒

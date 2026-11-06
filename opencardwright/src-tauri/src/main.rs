@@ -4,6 +4,7 @@
 mod auth;
 mod backup_job;
 mod commands;
+mod logging;
 #[cfg(debug_assertions)]
 mod demo_import;
 mod provision;
@@ -20,6 +21,7 @@ fn main() {
     // 把 panic 明确打到 stderr：dev 模式下终端/日志里能直接读到，不用去猜窗口为什么白屏
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[rust][PANIC] {info}");
+        crate::logging::line("ERROR", "panic", &format!("{info}"));
     }));
 
     tauri::Builder::default()
@@ -54,6 +56,26 @@ fn main() {
                     }
                 }
             }
+
+            // 文件日志：本地时区偏移问一次 SQLite（不引 chrono），失败也不影响启动
+            let offset: i64 = conn
+                .query_row(
+                    "SELECT CAST(strftime('%s','now','localtime') AS INTEGER) - CAST(strftime('%s','now') AS INTEGER)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            logging::init(root.join("logs"), offset);
+            logging::line(
+                "INFO",
+                "start",
+                &format!(
+                    "启动 v{} · db={} · runtime={}",
+                    env!("CARGO_PKG_VERSION"),
+                    db_path.display(),
+                    root.join("runtime").display()
+                ),
+            );
 
             let start_card_no = ocw_store::get_setting(&conn, "startCardNo")?
                 .unwrap_or_else(|| "2403".to_string());
