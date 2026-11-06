@@ -2631,6 +2631,81 @@ pub async fn import_backup_file(
     .await
 }
 
+// ---------------------------------------------------------------- 诊断包
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsResult {
+    pub path: String,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+/// 导出诊断包（管理员）：清单 + 脱敏库副本 + 运行状态 + 日志尾，打包成 zip。
+///
+/// 没有读卡器也能导出（不碰串口）；库副本是在线备份，导出期间正常发卡不受影响。
+#[tauri::command]
+pub async fn export_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<DiagnosticsResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    let db_path = state.db_path.clone();
+    let runtime = state.runtime_dir.clone();
+    let driver = state.driver_sha256.clone();
+    let sdk_source = state.sdk_source.clone();
+    let port = state.port();
+    let sim = state.device().is_sim();
+    blocking(move || {
+        // 先查计数再把锁放开 —— 诊断模块自己会加锁做在线备份，Mutex 不可重入
+        let (schema, rooms, issuances, operators) = {
+            let conn = lock_db(&db)?;
+            let schema: i64 = conn
+                .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            let count = |t: &str| -> i64 {
+                conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                    .unwrap_or(0)
+            };
+            (schema, count("room"), count("issuance"), count("operator"))
+        };
+
+        let meta = serde_json::json!({
+            "app": "OpenCardWright",
+            "version": env!("CARGO_PKG_VERSION"),
+            "schemaVersion": schema,
+            "dbPath": db_path.display().to_string(),
+            "runtimeDir": runtime.display().to_string(),
+            "driverSha256": driver,
+            "sdkSource": sdk_source,
+            "simulation": sim,
+            "port": port,
+            "os": std::env::var("OS").unwrap_or_default(),
+            "counts": { "rooms": rooms, "issuances": issuances, "operators": operators },
+        });
+
+        let res = crate::diagnostics::export(&db, &db_path, &runtime, meta)
+            .map_err(|m| CommandError::new(1, m, "把诊断包路径发给开发者"))?;
+
+        if let Ok(conn) = db.lock() {
+            let _ = ocw_store::record_audit(
+                &conn,
+                "export_diagnostics",
+                None,
+                Some(&format!("path={} warnings={}", res.path.display(), res.warnings.len())),
+                "ok",
+                Some(me.operator_id),
+            );
+        }
+        Ok(DiagnosticsResult {
+            path: res.path.display().to_string(),
+            bytes: res.bytes,
+            warnings: res.warnings,
+        })
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

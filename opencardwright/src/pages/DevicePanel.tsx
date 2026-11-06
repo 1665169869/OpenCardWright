@@ -16,6 +16,9 @@ const PORT_OPTIONS = Array.from({ length: 8 }, (_, i) => ({
  */
 export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
   const [info, setInfo] = useState<AppInfo | null>(null)
+  const [exporting, setExporting] = useState(false)
+  const [diagMsg, setDiagMsg] = useState<string | null>(null)
+  const [diagErr, setDiagErr] = useState<string | null>(null)
   const [port, setPort] = useState<number>(6)
   const [probes, setProbes] = useState<PortProbe[] | null>(null)
   const [selfTest, setSelfTest] = useState<SelfTestDto | null>(null)
@@ -83,6 +86,24 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
     }
   }
 
+  /** 导出诊断包：成功率不高也要把路径/告警原样告诉用户，方便手工压缩。 */
+  const exportDiag = async () => {
+    setExporting(true)
+    setDiagErr(null)
+    setDiagMsg(null)
+    try {
+      const r = await api.exportDiagnostics()
+      const size = r.bytes > 0 ? `${(r.bytes / 1024).toFixed(1)} KB` : '未压缩'
+      setDiagMsg(
+        `${r.path}（${size}）` + (r.warnings.length ? `；${r.warnings.join('；')}` : ''),
+      )
+    } catch (e) {
+      setDiagErr(describeError(e))
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <Space direction="vertical" size="middle" style={{ width: '100%' }}>
       {/* 模拟设备的横幅只在主界面顶部显示一次，这里不再重复 */}
@@ -104,6 +125,16 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
             索引 0 = COM1，索引 6 = COM7（驱动内部按 index + 1 打开串口）。原门锁软件会独占串口，切换前先退出它。
           </Text>
         </div>
+        {diagErr ? <Alert type="error" showIcon message="导出失败" description={diagErr} /> : null}
+        {diagMsg ? (
+          <Alert
+            type="success"
+            showIcon
+            style={{ marginTop: 8 }}
+            message="诊断包已生成"
+            description={<Text copyable>{diagMsg}</Text>}
+          />
+        ) : null}
       </Card>
 
       {error ? <Alert type="error" showIcon message="操作失败" description={error} /> : null}
@@ -155,7 +186,15 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
         </Card>
       ) : null}
 
-      <Card title="诊断信息" size="small">
+      <Card
+        title="诊断信息"
+        size="small"
+        extra={
+          <Button size="small" loading={exporting} onClick={() => void exportDiag()}>
+            导出诊断包
+          </Button>
+        }
+      >
         <Descriptions
           column={1}
           size="small"

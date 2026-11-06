@@ -4,6 +4,7 @@
 mod auth;
 mod backup_job;
 mod commands;
+mod diagnostics;
 mod logging;
 #[cfg(debug_assertions)]
 mod demo_import;
@@ -152,6 +153,7 @@ fn main() {
             commands::get_backup_settings,
             commands::set_backup_settings,
             commands::import_backup_file,
+            commands::export_diagnostics,
             commands::get_checkout_status,
             commands::set_checkout_status,
             commands::log_frontend,

@@ -3,6 +3,20 @@
 本文件记录 OpenCardWright 产品工作区（`opencardwright/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 2026.11.6+0048 — 2026-11-06
+
+### 诊断包导出（TD-403）
+
+- 设备页「诊断信息」新增「导出诊断包」：生成 `diagnostics\diag-<时间戳>.zip`，内含
+  `manifest.json`（版本 / schema / 驱动 SHA-256 / 串口 / 模拟 or 真机 / 计数 / 最近 300 行日志）、
+  **脱敏数据库副本**、`LockCard.ini`、`CardNo.state`、最近两个日志文件。
+- **脱敏硬标准**：副本上 `UPDATE operator SET pwd_hash='redacted'`、清空客人证件号与住址，
+  再 `VACUUM` —— 只 UPDATE 不 VACUUM 的话旧页里还能 `strings` 出哈希。单测直接扫文件字节确认搜不到 `$argon2id`。
+- 打包零依赖：`tar -a -c -f` → `%SystemRoot%\System32	ar.exe` → `Compress-Archive`，
+  全失败则返回暂存目录 + warning（用户可手工压缩）。
+- 导出不碰串口，无读卡器也能用；只读主库做在线备份，导出期间发卡不受影响。
+- 版本号 `2026.11.6+0047` → `2026.11.6+0048`。
+
 ## 2026.11.6+0047 — 2026-11-06
 
 ### 文件日志 + 轮转（TD-405）
