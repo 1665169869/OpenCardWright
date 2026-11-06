@@ -63,7 +63,8 @@ export default function AdminCards({
   roomsVersion?: number
   onChanged?: () => void
 }) {
-  const [kind, setKind] = useState<Kind>('reset')
+  // 默认停在总控卡：它是日常最常发的一类；复位卡会清空房间卡记录，不适合当默认值
+  const [kind, setKind] = useState<Kind>('master')
   const [rooms, setRooms] = useState<Room[]>([])
   const [roomNo, setRoomNo] = useState<string | null>(null)
   const [useHours, setUseHours] = useState(false)
