@@ -79,7 +79,7 @@ export default function AuthGate({
         <Space direction="vertical" size="middle" style={{ width: '100%' }}>
           <div>
             <Title level={4} style={{ marginBottom: 4 }}>
-              {firstRun ? '首次使用：设置管理员密码' : '登录 OpenCardWright'}
+              {firstRun ? '首次使用：设置管理员密码' : '登录 门锁发卡台'}
             </Title>
             <Text type="secondary">
               {firstRun

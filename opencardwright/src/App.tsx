@@ -312,9 +312,8 @@ export default function App() {
       >
         <Space size="middle" align="center">
           <Title level={4} style={{ margin: 0 }}>
-            OpenCardWright
+            门锁发卡台
           </Title>
-          <Text type="secondary">门锁发卡台</Text>
           {info ? <Tag>v{info.version}</Tag> : null}
           {info?.simulation ? <Tag color="orange">模拟设备</Tag> : info ? <Tag color="green">设备就绪</Tag> : null}
         </Space>
@@ -398,7 +397,7 @@ export default function App() {
         {/* 关窗确认（TD-109）：默认「缩小到托盘」，后台继续跑到期提醒与自动备份 */}
         <Modal
           open={closeAsk}
-          title="关闭 OpenCardWright？"
+          title="关闭门锁发卡台？"
           // antd 默认 top=100px 在高窗口下偏上；centered 垂直居中
           centered
           footer={null}

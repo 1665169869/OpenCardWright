@@ -4,6 +4,7 @@ node_modules/
 src-tauri/target/
 src-tauri/resources/sdk/
 release/
+output/
 .tmp/
 
 # 运行时数据（绝不入库）

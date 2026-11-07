@@ -4,8 +4,10 @@ import {
   Button,
   Card,
   DatePicker,
+  Descriptions,
   Input,
   InputNumber,
+  Modal,
   Select,
   Space,
   Table,
@@ -62,7 +64,8 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
   const [rows, setRows] = useState<IssuanceRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
+  /** 默认每页 20 条（用户设定，TD-128）——三个 tab 一致 */
+  const [pageSize, setPageSize] = useState(20)
   const [roomNo, setRoomNo] = useState('')
   const [cardNo, setCardNo] = useState<number | null>(null)
   const [kind, setKind] = useState<string | null>(null)
@@ -295,12 +298,15 @@ function CheckinTab() {
   const [rows, setRows] = useState<IssuanceRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
+  /** 默认每页 20 条（用户设定，TD-128） */
+  const [pageSize, setPageSize] = useState(20)
   const [roomNo, setRoomNo] = useState('')
   const [fromDay, setFromDay] = useState<string | null>(null)
   const [toDay, setToDay] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  /** 行「详情」弹窗（TD-122）：展示发卡时登记的全部身份信息，只读 */
+  const [detail, setDetail] = useState<IssuanceRow | null>(null)
 
   // 到期状态按当前时间计算，跨过到期点自动变色（同发卡记录，60 秒重渲染）
   const [, setTick] = useState(0)
@@ -429,8 +435,71 @@ function CheckinTab() {
               return <Tag color="green">有效</Tag>
             },
           },
+          {
+            title: '详情',
+            width: 70,
+            render: (_: unknown, r: IssuanceRow) => (
+              <Button size="small" onClick={() => setDetail(r)}>
+                详情
+              </Button>
+            ),
+          },
         ]}
       />
+
+      {/* 入住详情（TD-122）：发卡时登记的全部身份信息，只读展示，空字段回退「—」 */}
+      <Modal
+        open={detail !== null}
+        title={
+          detail
+            ? `入住详情 · ${detail.roomNo ?? '—'} · ${detail.guestName ?? '—'}`
+            : '入住详情'
+        }
+        onCancel={() => setDetail(null)}
+        footer={null}
+        width={620}
+      >
+        {detail ? (
+          <Descriptions
+            column={1}
+            size="small"
+            bordered
+            style={{ maxWidth: 560 }}
+            items={[
+              { key: 'room', label: '房号', children: detail.roomNo ?? '—' },
+              { key: 'name', label: '客人姓名', children: detail.guestName ?? '—' },
+              { key: 'gender', label: '性别', children: detail.guestGender ?? '—' },
+              { key: 'idType', label: '证件类型', children: detail.guestIdType ?? '—' },
+              { key: 'idNo', label: '证件号码', children: detail.guestIdNumber ?? '—' },
+              { key: 'nation', label: '民族', children: detail.guestNation ?? '—' },
+              { key: 'birth', label: '出生日期', children: detail.guestBirthDate ?? '—' },
+              { key: 'addr', label: '住址', children: detail.guestAddress ?? '—' },
+              { key: 'note', label: '备注', children: detail.guestNote ?? '—' },
+              { key: 'at', label: '入住时间', children: formatTime(detail.createdAt) },
+              {
+                key: 'card',
+                label: '卡型 / 时长',
+                children: `${detail.kind} · ${
+                  detail.days > 0
+                    ? `${detail.days} 天`
+                    : detail.hours > 0
+                      ? `${detail.hours} 小时`
+                      : '—'
+                }`,
+              },
+              {
+                key: 'cardNo',
+                label: '卡号',
+                children:
+                  detail.cardNo === null
+                    ? '—'
+                    : `0x${detail.cardNo.toString(16).toUpperCase().padStart(4, '0')}`,
+              },
+              { key: 'exp', label: '到期', children: detail.expiresAt ? formatTime(detail.expiresAt) : '—' },
+            ]}
+          />
+        ) : null}
+      </Modal>
     </Space>
   )
 }
@@ -439,7 +508,8 @@ function AuditTab() {
   const [rows, setRows] = useState<AuditRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(50)
+  /** 默认每页 20 条（用户设定，TD-128） */
+  const [pageSize, setPageSize] = useState(20)
   const [action, setAction] = useState('')
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)

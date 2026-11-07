@@ -135,7 +135,7 @@ CREATE TABLE IF NOT EXISTS reservation (
     check_out    TEXT NOT NULL,
     guest_name   TEXT,
     note         TEXT,
-    status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled')),
+    status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled', 'checked_in')),
     operator_id  INTEGER REFERENCES operator (id),
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),

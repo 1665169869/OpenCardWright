@@ -42,11 +42,11 @@ fn sim_issue_advances_card_number() {
     let sim = SimDevice::at(&dir);
 
     let first = sim
-        .issue_guest(0, "201", 1, 0)
+        .issue_guest(0, "201", 1, 0, None)
         .expect("模拟设备应提供构包器")
         .expect("第一张卡应构出来");
     let second = sim
-        .issue_guest(0, "201", 1, 0)
+        .issue_guest(0, "201", 1, 0, None)
         .expect("模拟设备应提供构包器")
         .expect("第二张卡应构出来");
 
@@ -85,8 +85,8 @@ fn sim_issue_honours_room_index_and_duration() {
     fs::write(dir.join("CardNo.state"), "240B").unwrap();
 
     let sim = SimDevice::at(&dir);
-    let day = sim.issue_guest(2, "219", 3, 0).unwrap().unwrap();
-    let hour = sim.issue_guest(2, "219", 0, 3).unwrap().unwrap();
+    let day = sim.issue_guest(2, "219", 3, 0, None).unwrap().unwrap();
+    let hour = sim.issue_guest(2, "219", 0, 3, None).unwrap().unwrap();
 
     assert_eq!(day.days, 3);
     assert_eq!(day.hours, 0);

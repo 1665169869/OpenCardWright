@@ -29,7 +29,7 @@ export default function NoCardCheckoutModal({
   onDone: (msg: string) => void
 }) {
   const [rows, setRows] = useState<IssuanceRow[]>([])
-  /** 选中的卡号（rowKey = cardNo）；初始为空 = 默认不勾选 */
+  /** 选中的**记录 id**（rowKey = id —— 同号多张各占一行，不能再用卡号当 key）；初始为空 = 默认不勾选 */
   const [selected, setSelected] = useState<number[]>([])
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -37,7 +37,8 @@ export default function NoCardCheckoutModal({
 
   const roomNo = room?.roomNo ?? ''
 
-  /** 按房拉有效客卡（与抽屉同口径）：result='ok'、有卡号、未退房、未过期、日租/钟点，按卡号取最新 */
+  /** 按房拉有效客卡（与抽屉同口径）：result='ok'、有卡号、未退房、未过期、日租/钟点；
+   *  按「张」逐条列出（TD-127）——同号多张各占一行；退房按卡号执行，同号会一起关。 */
   const load = async () => {
     if (!roomNo) return
     setLoading(true)
@@ -45,22 +46,16 @@ export default function NoCardCheckoutModal({
     try {
       const p = await api.listIssuances({ roomNo, page: 1, pageSize: 200 })
       const now = Date.now()
-      const best = new Map<number, IssuanceRow>()
-      for (const r of p.rows) {
-        if (
-          r.result !== 'ok' ||
-          r.cardNo === null ||
-          r.checkedOutAt !== null ||
-          !r.expiresAt ||
-          Date.parse(r.expiresAt) <= now ||
-          (r.kind !== '日租客卡' && r.kind !== '钟点客卡')
-        ) {
-          continue
-        }
-        const cur = best.get(r.cardNo)
-        if (!cur || r.createdAt > cur.createdAt) best.set(r.cardNo, r)
-      }
-      setRows([...best.values()].sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0)))
+      const valid = p.rows.filter(
+        (r) =>
+          r.result === 'ok' &&
+          r.cardNo !== null &&
+          r.checkedOutAt === null &&
+          !!r.expiresAt &&
+          Date.parse(r.expiresAt) > now &&
+          (r.kind === '日租客卡' || r.kind === '钟点客卡'),
+      )
+      setRows(valid.sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0) || a.id - b.id))
     } catch (e) {
       setErr(describeError(e))
     } finally {
@@ -80,12 +75,22 @@ export default function NoCardCheckoutModal({
     if (!room || selected.length === 0) return
     setBusy(true)
     setErr(null)
-    const done: string[] = []
+    // 选中行 → 卡号去重：同号多张是同一张逻辑卡，只调一次 checkout_card（后端一次关同号全部）
+    const selectedRows = rows.filter((r) => selected.includes(r.id))
+    const cardNos = [
+      ...new Set(
+        selectedRows.map((r) => r.cardNo).filter((n): n is number => n !== null),
+      ),
+    ]
+    const done: number[] = []
     const failed: string[] = []
-    for (const cardNo of selected) {
+    let remaining: number | null = null
+    for (const cardNo of cardNos) {
       try {
-        await api.checkoutCard(cardNo)
-        done.push(formatCardNo(cardNo))
+        // 无卡退房：用户手上没有卡，跳过读卡器（不读卡、不擦卡），只做数据库标记
+        const res = await api.checkoutCard(cardNo, true)
+        done.push(cardNo)
+        remaining = res.remaining
       } catch (e) {
         failed.push(`${formatCardNo(cardNo)}：${describeError(e)}`)
       }
@@ -93,17 +98,27 @@ export default function NoCardCheckoutModal({
     setBusy(false)
 
     if (failed.length === 0) {
-      const remaining = rows.length - done.length
+      const merged = selectedRows.length - cardNos.length
       onDone(
-        `${room.roomNo} 已退 ${done.length} 张有效卡（${done.join('、')}）` +
-          (remaining > 0 ? `，剩余 ${remaining} 张` : '，该房已无有效卡'),
+        `${room.roomNo} 已退 ${selectedRows.length} 张有效卡` +
+          (merged > 0 ? `（同号合并 ${merged} 次）` : '') +
+          `，剩余 ${remaining ?? 0} 张`,
       )
       onClose()
       return
     }
-    // 部分失败：留在弹窗，重拉列表并清掉已退卡的勾选，失败原因列出
-    setErr(`退房部分失败（成功 ${done.length}、失败 ${failed.length}）：${failed.join('；')}`)
-    setSelected((prev) => prev.filter((no) => !done.includes(formatCardNo(no))))
+    // 部分失败：留在弹窗，重拉列表并清掉已退卡对应的**所有选中行**（同号两行一起清），失败原因列出
+    setErr(
+      `退房部分失败（成功 ${done.length} 张卡、失败 ${failed.length} 张卡）：${failed.join('；')}`,
+    )
+    setSelected((prev) => {
+      const gone = new Set(
+        rows
+          .filter((r) => r.cardNo !== null && done.includes(r.cardNo))
+          .map((r) => r.id),
+      )
+      return prev.filter((id) => !gone.has(id))
+    })
     await load()
   }
 
@@ -149,12 +164,15 @@ export default function NoCardCheckoutModal({
         <Text>
           {roomNo} 当前有 <b>{rows.length}</b> 张有效卡，勾选要退的卡（可多选），只退选中的。
         </Text>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          同卡号的多张卡（客人要两张的那批）会一起退房——物理上是同一张逻辑卡，锁按卡号识别。
+        </Text>
 
         {err ? <Alert type="error" showIcon message="退房失败" description={err} /> : null}
 
         <Table<IssuanceRow>
           size="small"
-          rowKey="cardNo"
+          rowKey="id"
           loading={loading}
           dataSource={rows}
           locale={{ emptyText: '该房没有有效客卡' }}

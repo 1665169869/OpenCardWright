@@ -120,6 +120,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v6(conn)?;
     apply_v7(conn)?;
     apply_v8(conn)?;
+    apply_v9(conn)?;
     Ok(())
 }
 
@@ -139,7 +140,7 @@ pub struct BackupInfo {
 }
 
 /// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 把当前库**在线备份**到指定文件。
 ///
@@ -383,6 +384,53 @@ fn apply_v8(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v8 → v9：预定状态加「checked_in」（已入住，TD-128）——发卡后自动消除预定信息，
+/// 保留记录且与「取消」区分。SQLite 不能修改 CHECK 约束，按官方流程建新表迁数据再换名；
+/// 幂等：库里的建表 SQL 已含 checked_in（新库）就只登记版本号。
+fn apply_v9(conn: &Connection) -> Result<()> {
+    let ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reservation'",
+            [],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    if ddl.map(|s| s.contains("checked_in")).unwrap_or(false) {
+        conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (9)", [])?;
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE reservation_new (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            room_no      TEXT NOT NULL,
+            check_in     TEXT NOT NULL,
+            check_out    TEXT NOT NULL,
+            guest_name   TEXT,
+            note         TEXT,
+            status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled', 'checked_in')),
+            operator_id  INTEGER REFERENCES operator (id),
+            created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            cancelled_at TEXT
+        );
+        INSERT INTO reservation_new
+            (id, room_no, check_in, check_out, guest_name, note, status,
+             operator_id, created_at, updated_at, cancelled_at)
+        SELECT id, room_no, check_in, check_out, guest_name, note, status,
+               operator_id, created_at, updated_at, cancelled_at
+          FROM reservation;
+        DROP TABLE reservation;
+        ALTER TABLE reservation_new RENAME TO reservation;
+        CREATE INDEX IF NOT EXISTS idx_reservation_room_dates ON reservation (room_no, check_in, check_out);
+    ")?;
+    conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (9)", [])?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 房间
 
 fn row_to_room(r: &Row<'_>) -> rusqlite::Result<Room> {
@@ -405,7 +453,7 @@ fn row_to_room(r: &Row<'_>) -> rusqlite::Result<Room> {
 
 const ROOM_SELECT: &str = "SELECT r.room_no, r.room_index, r.building, r.floor, r.room_type_id, \
                                   t.name, r.max_cards, r.status, r.active, r.install_card_at, r.created_at, \
-                                  (SELECT COUNT(DISTINCT i.card_no) FROM issuance i \
+                                  (SELECT COUNT(*) FROM issuance i \
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
                                       AND i.card_no IS NOT NULL AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
@@ -476,8 +524,10 @@ pub fn set_room_max_cards(conn: &Connection, room_no: &str, max_cards: Option<i6
 /// 到期时间是按发卡时间估算的，所以这里的"有效"也是估算口径。
 /// 显式只算客卡：管理卡现在也有 expires_at，但不应计入房间占用。
 pub fn count_active_cards(conn: &Connection, room_no: &str) -> Result<i64> {
+    // 按「张」计数（TD-127）：同卡号多张（复用首卡号发给第二位客人）占多个名额，
+    // 不再按卡号去重 —— 否则 max_cards 拦不住、房态也不会升到「已满」。
     let n: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT card_no)
+        "SELECT COUNT(*)
            FROM issuance
           WHERE room_no = ?1
             AND result = 'ok'
@@ -992,6 +1042,24 @@ pub fn cancel_reservation(conn: &Connection, id: i64) -> Result<Reservation> {
     sync_room_status_for_reservation(conn, &old.room_no, was_covering_today)?;
     find_reservation(conn, id)?
         .ok_or_else(|| StoreError::Invalid("预定取消后读不到".into()))
+}
+
+/// 本地日期 `YYYY-MM-DD`（与预定 / 房态口径一致：SQLite `date('now','localtime')`）。
+pub fn local_today(conn: &Connection) -> Result<String> {
+    Ok(conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?)
+}
+
+/// 发卡即入住（TD-128）：把该房覆盖 `today` 的有效预定标为「已入住」（checked_in）。
+/// 口径与房态同步一致（TD-115）：check_in <= today < check_out。返回标记条数。
+pub fn check_in_reservations(conn: &Connection, room_no: &str, today: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE reservation
+            SET status = 'checked_in', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+          WHERE room_no = ?1 AND status = 'booked'
+            AND check_in <= ?2 AND check_out > ?2",
+        params![room_no, today],
+    )?;
+    Ok(n)
 }
 
 /// 0..=255 中未使用的最小序号。用尽返回 None。
@@ -1933,8 +2001,13 @@ pub struct IssuanceRow {
     pub hours: i64,
     pub card_no: Option<u16>,
     pub guest_name: Option<String>,
+    pub guest_gender: Option<String>,
     pub guest_id_type: Option<String>,
     pub guest_id_number: Option<String>,
+    pub guest_nation: Option<String>,
+    pub guest_address: Option<String>,
+    pub guest_birth_date: Option<String>,
+    pub guest_note: Option<String>,
     pub operator_name: Option<String>,
     pub result: String,
     pub expires_at: Option<String>,
@@ -2016,7 +2089,9 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
     let (size, offset) = limit_offset(f.page, f.page_size);
     let sql = format!(
         "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
-                i.guest_name, i.guest_id_type, i.guest_id_number, o.display_name,
+                i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
+                i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
+                o.display_name,
                 i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
            FROM issuance i
            LEFT JOIN operator o ON o.id = i.operator_id
@@ -2039,14 +2114,19 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
             hours: r.get(5)?,
             card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
             guest_name: r.get(7)?,
-            guest_id_type: r.get(8)?,
-            guest_id_number: r.get(9)?,
-            operator_name: r.get(10)?,
-            result: r.get(11)?,
-            expires_at: r.get(12)?,
-            checked_out_at: r.get(13)?,
-            duration_ms: r.get(14)?,
-            raw_hex: r.get(15)?,
+            guest_gender: r.get(8)?,
+            guest_id_type: r.get(9)?,
+            guest_id_number: r.get(10)?,
+            guest_nation: r.get(11)?,
+            guest_address: r.get(12)?,
+            guest_birth_date: r.get(13)?,
+            guest_note: r.get(14)?,
+            operator_name: r.get(15)?,
+            result: r.get(16)?,
+            expires_at: r.get(17)?,
+            checked_out_at: r.get(18)?,
+            duration_ms: r.get(19)?,
+            raw_hex: r.get(20)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2120,7 +2200,9 @@ pub fn list_audits(
 pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<IssuanceRow>> {
     let mut stmt = conn.prepare(
         "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
-                i.guest_name, i.guest_id_type, i.guest_id_number, o.display_name,
+                i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
+                i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
+                o.display_name,
                 i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
            FROM issuance i LEFT JOIN operator o ON o.id = i.operator_id
           WHERE i.card_no = ?1
@@ -2137,14 +2219,19 @@ pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<I
             hours: r.get(5)?,
             card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
             guest_name: r.get(7)?,
-            guest_id_type: r.get(8)?,
-            guest_id_number: r.get(9)?,
-            operator_name: r.get(10)?,
-            result: r.get(11)?,
-            expires_at: r.get(12)?,
-            checked_out_at: r.get(13)?,
-            duration_ms: r.get(14)?,
-            raw_hex: r.get(15)?,
+            guest_gender: r.get(8)?,
+            guest_id_type: r.get(9)?,
+            guest_id_number: r.get(10)?,
+            guest_nation: r.get(11)?,
+            guest_address: r.get(12)?,
+            guest_birth_date: r.get(13)?,
+            guest_note: r.get(14)?,
+            operator_name: r.get(15)?,
+            result: r.get(16)?,
+            expires_at: r.get(17)?,
+            checked_out_at: r.get(18)?,
+            duration_ms: r.get(19)?,
+            raw_hex: r.get(20)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2453,6 +2540,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires, expected, "总控卡到期 = 发卡时间 + 天数");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn check_in_reservations_marks_tonight_only() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "801", None, None, None, None).unwrap();
+        let day = |offset: &str| -> String {
+            conn.query_row(
+                "SELECT date('now','localtime', ?1)",
+                params![offset],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let today = day("+0 day");
+        let tomorrow = day("+1 day");
+        let day3 = day("+2 days");
+        let day4 = day("+3 days");
+        // 覆盖 today 的预定 → 标记 checked_in；未来预定不动（TD-128）
+        let a = create_reservation(
+            &conn,
+            &ReservationInput {
+                room_no: "801".into(),
+                check_in: today.clone(),
+                check_out: tomorrow.clone(),
+                guest_name: Some("张三".into()),
+                note: None,
+            },
+            None,
+        )
+        .unwrap();
+        let b = create_reservation(
+            &conn,
+            &ReservationInput {
+                room_no: "801".into(),
+                check_in: day3.clone(),
+                check_out: day4.clone(),
+                guest_name: None,
+                note: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            check_in_reservations(&conn, "801", &today).unwrap(),
+            1,
+            "只标记覆盖 today 的那一条"
+        );
+        assert_eq!(
+            find_reservation(&conn, a.id).unwrap().unwrap().status,
+            "checked_in"
+        );
+        assert_eq!(
+            find_reservation(&conn, b.id).unwrap().unwrap().status,
+            "booked",
+            "未来预定不受影响"
+        );
+        assert_eq!(
+            check_in_reservations(&conn, "801", &today).unwrap(),
+            0,
+            "再标记幂等：无 booked 可标"
+        );
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn list_rooms_active_cards_counts_same_no_separately() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "222", None, None, None, None).unwrap();
+        // 同号两条有效记录（TD-127）：房间列表的 active_cards 子查询也要按「张」计数
+        for offset in ["+1 day", "+2 days"] {
+            conn.execute(
+                "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
+                 VALUES (?1, '222', '日租客卡', 1, 0, 11, 'ok',
+                         strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
+                params![uuid::Uuid::new_v4().to_string(), offset],
+            )
+            .unwrap();
+        }
+        let rooms = list_rooms(&conn).unwrap();
+        let room = rooms.iter().find(|r| r.room_no == "222").unwrap();
+        assert_eq!(room.active_cards, 2, "房间卡片「有效卡 N」应按张计数");
         cleanup(conn, path);
     }
 
@@ -2894,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn active_card_count_ignores_expired_and_dedupes() {
+    fn active_card_count_counts_same_card_no_separately() {
         let (conn, path) = temp_db();
         insert_room(&conn, "220", None, None, None, None).unwrap();
         let mk = |card: i64, offset: &str| {
@@ -2909,9 +3079,31 @@ mod tests {
         mk(1, "+1 day");
         mk(2, "+2 hours");
         mk(3, "-1 hour"); // 已过期，不算
-        mk(1, "+3 days"); // 同一张卡重复发，按卡号去重
+        mk(1, "+3 days"); // 同号多张（TD-127 复用卡号）：按「张」计数，不再按卡号去重
 
-        assert_eq!(count_active_cards(&conn, "220").unwrap(), 2);
+        assert_eq!(count_active_cards(&conn, "220").unwrap(), 3);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn same_card_no_two_records_checkout_together() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "221", None, None, None, None).unwrap();
+        // 同房同号两张（TD-127：复用首卡号发给第二位客人）
+        for offset in ["+1 day", "+2 days"] {
+            conn.execute(
+                "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
+                 VALUES (?1, '221', '日租客卡', 1, 0, 9, 'ok',
+                         strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
+                params![uuid::Uuid::new_v4().to_string(), offset],
+            )
+            .unwrap();
+        }
+        assert_eq!(count_active_cards(&conn, "221").unwrap(), 2, "同号按张计数");
+        let dirty = checkout_status(&conn).unwrap();
+        let (room, remaining) = checkout_card(&conn, 9, &dirty).unwrap().unwrap();
+        assert_eq!(room, "221");
+        assert_eq!(remaining, 0, "同号两张一起关，剩余 0");
         cleanup(conn, path);
     }
 

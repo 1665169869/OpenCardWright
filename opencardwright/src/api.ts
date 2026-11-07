@@ -182,8 +182,13 @@ export interface IssuanceRow {
   hours: number
   cardNo: number | null
   guestName: string | null
+  guestGender: string | null
   guestIdType: string | null
   guestIdNumber: string | null
+  guestNation: string | null
+  guestAddress: string | null
+  guestBirthDate: string | null
+  guestNote: string | null
   operatorName: string | null
   result: string
   expiresAt: string | null
@@ -569,7 +574,8 @@ export const api = {
   importBackupFile: (name: string, bytes: number[]) =>
     invoke<BackupEntry>('import_backup_file', { name, bytes }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
-  checkoutCard: (cardNo: number) => invoke<CheckoutCardResult>('checkout_card', { cardNo }),
+  checkoutCard: (cardNo: number, noDevice?: boolean) =>
+    invoke<CheckoutCardResult>('checkout_card', { cardNo, noDevice }),
   /**
    * 强制退房：卡不是本系统发的，本地没有发卡记录，按前端从卡片里读出的房号
    * 直接写入退房数据（关闭该房全部有效卡 + 改房态）。调用前必须让用户二次确认。

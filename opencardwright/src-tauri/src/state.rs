@@ -24,15 +24,17 @@ impl Device {
     }
 
     /// 模拟设备专用：离线构一张客卡。真机返回 `None`，调用方继续走 CLI。
+    /// `serial` = 复用卡号（TD-127），Some 时构包器不推进 `CardNo.state`。
     pub fn sim_issue_guest(
         &self,
         room_index: u8,
         room_no: &str,
         days: u16,
         hours: u16,
+        serial: Option<u16>,
     ) -> Option<Result<CardSnapshot, DeviceError>> {
         match self {
-            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours),
+            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours, serial),
             Self::Cli(_) => None,
         }
     }
@@ -41,6 +43,16 @@ impl Device {
         match self {
             Self::Cli(d) => d.read_card(),
             Self::Sim(d) => d.read_card(),
+        }
+    }
+
+    /// 擦卡（TD-124）：把页1/页2 写零 → 28 字节全零 = 空白卡（锁不再认这张卡）。
+    /// 真实设备走 CLI `issue --type raw`（页3–7 原厂本就全零）；模拟设备没有真实写入
+    /// 闭环，直接回放空白卡快照。擦卡不消耗卡号（raw 卡不含卡号）。
+    pub fn erase_card(&self) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Cli(d) => d.issue(&["--type", "raw", "--p1", "00000000", "--p2", "00000000"]),
+            Self::Sim(_) => parse::parse_card(ocw_device::sim::BLANK_JSON, 0),
         }
     }
 

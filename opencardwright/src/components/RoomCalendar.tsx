@@ -92,24 +92,29 @@ export default function RoomCalendar({
   const [stayDetail, setStayDetail] = useState<{ roomNo: string; span: GuestSpan } | null>(null)
 
   const from = month.format('YYYY-MM-DD')
+  /** 视窗左界（TD-123）：含前导列（上月末日），跨月色块能画进前导格 */
+  const leadDay = month.subtract(1, 'day').format('YYYY-MM-DD')
   const today = dayjs().format('YYYY-MM-DD')
   /** 拉取范围固定「当月 + 下月 7 天」：一次拉够所有可能的溢出显示，
    *  避免「视窗依赖溢出天数、溢出天数依赖拉取结果」的循环依赖。 */
   const queryTo = month.date(month.daysInMonth() + 8).format('YYYY-MM-DD')
 
-  /** 溢出预览天数（TD-117）：当月数据（预定退房日、客卡到期日）超出月末的
-   *  最远天数，0–7 天封顶 —— 没有跨月数据就不加宽。 */
+  /** 溢出预览天数（TD-117/123）：当月数据（预定退房日、客卡到期日）超出月末的
+   *  最远天数，0–7 天封顶；**尾部至少 1 格**（下月 1 号，TD-123 用户要求）。
+   *  后缘按「0-based 格 index + 1」算，含前导列偏移 +1。 */
   const overflowDays = (() => {
     const n = month.daysInMonth()
     let farthest = 0
     const scan = (endDay: string) => {
-      // endDay 所在格的后缘（1-based 天数）；超过月末即需要溢出
-      const edge = dayjs(endDay).diff(month, 'day') + 1
+      // endDay 所在格的后缘（0-based index + 1；days[0] = 上月末日，故 +2）
+      const edge = dayjs(endDay).diff(month, 'day') + 2
       if (edge > farthest) farthest = edge
     }
     for (const r of list) if (r.status === 'booked') scan(r.checkOut)
     for (const v of Object.values(guestSpans)) scan(v.end)
-    return Math.max(0, Math.min(7, farthest - n))
+    // 溢出 = 超出「前导 1 格 + 当月 n 格」的部分
+    const spill = Math.max(0, farthest - (n + 1))
+    return Math.max(1, Math.min(7, spill))
   })()
 
   /** 视窗上界（开区间）：月末 + 溢出天数的次日；spanOf / guestSpanOf 按它截断，
@@ -118,10 +123,12 @@ export default function RoomCalendar({
 
   const days = useMemo(() => {
     const n = month.daysInMonth()
+    // 前导列（TD-123）：固定显示上月最后一天（如 11 月视图左侧的 10-31）
+    const lead = [month.subtract(1, 'day')]
     const base = Array.from({ length: n }, (_, i) => month.date(i + 1))
     // dayjs 的 date() 越界自动进位到下月：date(31) 在 11 月 = 12-01
     const over = Array.from({ length: overflowDays }, (_, i) => month.date(n + 1 + i))
-    return [...base, ...over]
+    return [...lead, ...base, ...over]
   }, [month, overflowDays])
 
   useEffect(() => {
@@ -148,6 +155,12 @@ export default function RoomCalendar({
     let alive = true
     // dayjs 默认按本地时区显示：带 Z 的 ISO 串 format 出来就是本地日期
     const localDay = (iso: string) => dayjs(iso).format('YYYY-MM-DD')
+    // 归属日（TD-125）：凌晨 00:00–05:59 办理入住归属前一晚（夜审惯例）。
+    // 只影响日历展示 —— created_at / expires_at 数据不动（TD-126 后 end 已是退房日）。
+    const ownedDay = (iso: string) => {
+      const d = dayjs(iso)
+      return (d.hour() < 6 ? d.subtract(1, 'day') : d).format('YYYY-MM-DD')
+    }
     const load = async () => {
       try {
         const [d, h] = await Promise.all([
@@ -171,7 +184,7 @@ export default function RoomCalendar({
           const cur = best[r.roomNo]
           if (!cur || r.createdAt > cur.at) {
             best[r.roomNo] = {
-              start: localDay(r.createdAt),
+              start: ownedDay(r.createdAt),
               end: localDay(r.expiresAt),
               guestName: r.guestName,
               cardNo: r.cardNo,
@@ -214,14 +227,15 @@ export default function RoomCalendar({
    *  起点 = 入住日格子左缘（前序退房日衔接时改中点，见下方 startHalf）。
    *  2026-11-06 用户要求退房日当天也显示，但相邻预定不能在同一列叠放。 */
   const spanOf = (r: Reservation): [number, number] | null => {
-    // 退房日 +1 天；与视窗 [from, to) 相交才画
+    // 退房日 +1 天；与视窗 [leadDay, to) 相交才画（TD-123：左界含前导列）
     const checkoutNext = dayjs(r.checkOut).add(1, 'day').format('YYYY-MM-DD')
-    if (r.checkIn >= to || checkoutNext <= from) return null
+    if (r.checkIn >= to || checkoutNext <= leadDay) return null
 
-    // 起点：入住日 < 本月 1 日从 0 起；否则从入住格起，衔接时退半格
+    // 起点：入住日 < 前导列从 0 起；否则列 index = diff(month) + 1（前导列偏移，TD-123），
+    // 衔接时退半格
     let startPos = 0
     if (r.checkIn >= from) {
-      startPos = dayjs(r.checkIn).diff(month, 'day')
+      startPos = dayjs(r.checkIn).diff(month, 'day') + 1
       // 衔接半格（TD-110）：同房前序预定退房日 = 本条入住日（张三 7 号退、李四 7 号入），
       // 本条从该格中点起画，前条占左半、本条占右半，同日退+入不叠放。
       const handover = list.some(
@@ -235,21 +249,22 @@ export default function RoomCalendar({
     }
 
     // 终点：退房日跨月（checkoutNext > 次月1日）画到本月右缘；
-    // 退房日在本月则落在退房日格的中点（含退房日 = 月末的情况）
+    // 退房日在视窗内则落在退房日格的中点（含退房日 = 月末的情况）
     const endPos =
-      checkoutNext > to ? days.length : dayjs(checkoutNext).diff(month, 'day') - 0.5
+      checkoutNext > to ? days.length : dayjs(checkoutNext).diff(month, 'day') + 1 - 0.5
 
     return startPos < endPos ? [startPos, endPos] : null
   }
 
-  /** 入住色块坐标（TD-116）：区间 [发卡日, 到期日]（含到期日当天，锁按首刷起算），
-   *  与视窗 [from, to) 相交才画，跨月截断到视窗边缘。 */
+  /** 入住色块坐标（TD-116/123）：区间 [归属日, 到期日]（含到期日当天，锁按首刷起算），
+   *  与视窗 [leadDay, to) 相交才画，跨月截断到视窗边缘。
+   *  列 index = diff(month) + 1（前导列偏移，TD-123）；start 早于视窗（含归属日前移到
+   *  上月末日）从左缘起画。 */
   const guestSpanOf = (span: { start: string; end: string }): [number, number] | null => {
     const endNext = dayjs(span.end).add(1, 'day').format('YYYY-MM-DD')
-    if (span.start >= to || endNext <= from) return null
-    const startPos = span.start >= from ? dayjs(span.start).diff(month, 'day') : 0
-    const endPos =
-      endNext > to ? days.length : dayjs(endNext).diff(month, 'day')
+    if (span.start >= to || endNext <= leadDay) return null
+    const startPos = span.start >= from ? dayjs(span.start).diff(month, 'day') + 1 : 0
+    const endPos = endNext > to ? days.length : dayjs(endNext).diff(month, 'day') + 1
     return startPos < endPos ? [startPos, endPos] : null
   }
 

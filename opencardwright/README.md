@@ -137,6 +137,9 @@ npm run tauri dev
 npm run tauri build    # 产出 NSIS 安装包
 ```
 
+- 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
+- **对外交付的安装包复制到 `opencardwright/output/`**（该目录不入库，见 `.gitignore`）；
+
 ### 两个环境坑（本机已踩过，写在这里省时间）
 
 **1. 仓库路径含中文时，MSVC 会报 `D8050`**

@@ -418,23 +418,18 @@ export default function RoomManager({
     try {
       const p = await api.listIssuances({ roomNo, page: 1, pageSize: 200 })
       const now = Date.now()
-      const best = new Map<number, IssuanceRow>()
-      for (const r of p.rows) {
-        if (
-          r.result !== 'ok' ||
-          r.cardNo === null ||
-          r.checkedOutAt !== null ||
-          !r.expiresAt ||
-          Date.parse(r.expiresAt) <= now ||
-          (r.kind !== '日租客卡' && r.kind !== '钟点客卡')
-        ) {
-          continue
-        }
-        const cur = best.get(r.cardNo)
-        if (!cur || r.createdAt > cur.createdAt) best.set(r.cardNo, r)
-      }
+      // 有效客卡按「张」逐条（TD-127）：同号多张（复用首卡号给第二位客人）各占一行，不再按卡号去重
+      const valid = p.rows.filter(
+        (r) =>
+          r.result === 'ok' &&
+          r.cardNo !== null &&
+          r.checkedOutAt === null &&
+          !!r.expiresAt &&
+          Date.parse(r.expiresAt) > now &&
+          (r.kind === '日租客卡' || r.kind === '钟点客卡'),
+      )
       setDrawerCards(
-        [...best.values()].sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0)),
+        valid.sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0) || a.id - b.id),
       )
     } catch {
       // 拉取失败：区块显示空态，不阻断抽屉其它操作
@@ -1316,14 +1311,16 @@ export default function RoomManager({
                 <Text type="secondary">备注：{issueConfirm.res.note}</Text>
               ) : null}
             </div>
-            <Text>是给这位预定的客人发卡吗？选「是」会把预定姓名带进发卡表单。</Text>
+            <Text>
+              {issueConfirm.res.guestName
+                ? '是给这位预定的客人发卡吗？选「是」会把预定姓名带进发卡表单。'
+                : '该预定未填姓名，仍可发卡——客人信息在发卡表单里手动填写。'}
+            </Text>
             <Space wrap>
-              <Button
-                type="primary"
-                disabled={!issueConfirm.res.guestName}
-                onClick={() => confirmIssue(true)}
-              >
-                是，按预定客人发卡
+              <Button type="primary" onClick={() => confirmIssue(true)}>
+                {issueConfirm.res.guestName
+                  ? '是，按预定客人发卡'
+                  : '是，继续发卡（预定未填姓名）'}
               </Button>
               <Button onClick={() => confirmIssue(false)}>不是，手动填写</Button>
               <Button onClick={() => setIssueConfirm(null)}>取消</Button>

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OpenCardWright",
+  "productName": "门锁发卡台",
   "version": "2026.11.6+0056",
   "identifier": "io.opencardwright.desktop",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "OpenCardWright · 门锁发卡台",
+        "title": "门锁发卡台",
         "width": 1280,
         "height": 820,
         "minWidth": 1024,

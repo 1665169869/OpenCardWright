@@ -1099,6 +1099,25 @@ pub async fn issue_guest(
             ));
         }
 
+        // 同房第二张卡复用有效首卡序号（TD-127，已实测：同号刷门会刷新锁内有效期）：
+        // 首卡仍在有效期内且未到上限 → 复用它的卡号构包（不推进 CardNo.state），
+        // 第一张卡不会被顶掉；上限口径用 count_active_cards（DISTINCT 卡号，同号合并计一张）。
+        let reuse_serial: Option<u16> = {
+            let conn = lock_db(&db)?;
+            match ocw_store::latest_active_guest_card(&conn, &room_no)? {
+                Some(rec) => {
+                    let active = ocw_store::count_active_cards(&conn, &room_no)?;
+                    let within_limit = room.max_cards.map_or(true, |max| active < max);
+                    if within_limit {
+                        rec.card_no.map(|n| n as u16)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+
         // 4) 写卡前统一先读卡：确认卡在机器上，并记录原卡信息
         pre_read_card(&device)?;
 
@@ -1106,13 +1125,19 @@ pub async fn issue_guest(
         let started = Instant::now();
         let amount_text = amount.to_string();
         let flag = if use_days { "--days" } else { "--hours" };
-        let args = vec!["--room", room_no.as_str(), flag, amount_text.as_str()];
+        let serial_text = reuse_serial.map(|n| format!("{n:04X}"));
+        let mut args: Vec<&str> = vec!["--room", room_no.as_str(), flag, amount_text.as_str()];
+        if let Some(s) = serial_text.as_deref() {
+            args.push("--serial");
+            args.push(s);
+        }
         // 模拟设备会离线构包并推进 CardNo.state；真机返回 None，继续走 CLI
         let card = match device.sim_issue_guest(
             room.room_index,
             &room_no,
             if use_days { amount } else { 0 },
             if use_days { 0 } else { amount },
+            reuse_serial,
         ) {
             Some(res) => res?,
             None => device.issue(&args, Some(room.room_index))?,
@@ -1166,6 +1191,11 @@ pub async fn issue_guest(
                 };
                 ocw_store::set_room_status(&conn, &room_no, new_status)?;
             }
+
+            // 7) 发卡即入住（TD-128）：把该房覆盖今天的有效预定标为「已入住」——
+            //    日历 / 房号列的「预定」随即消失，再发第二张卡不会重复弹确认框。
+            let today = ocw_store::local_today(&conn)?;
+            let _ = ocw_store::check_in_reservations(&conn, &room_no, &today)?;
 
             Ok(IssuedDto {
                 card,
@@ -2000,8 +2030,45 @@ pub struct CheckoutCardResult {
 pub async fn checkout_card(
     state: State<'_, AppState>,
     card_no: u16,
+    // 无卡退房（TD-121 的选卡弹窗）：true = 用户手上没有卡，跳过读卡器（不读卡、不擦卡），
+    // 只做数据库标记；缺省 = 持卡退房（TD-124：先擦卡后改库）。
+    no_device: Option<bool>,
 ) -> Result<CheckoutCardResult, CommandError> {
     let me = require_login(&state)?;
+    let skip_device = no_device.unwrap_or(false);
+    let device = state.device();
+
+    // 持卡退房（TD-124）：先擦卡、后改库 —— 卡要在读卡器上、擦卡成功才登记退房。
+    // 模拟设备没有真实读写闭环：只做「尽力擦卡」，跳过读卡确认与读回校验。
+    if !skip_device {
+        if device.is_sim() {
+            let _ = device.erase_card();
+        } else {
+            let on_card = device.read_card()?;
+            if on_card.card_no != Some(card_no) {
+                let on_card_text = on_card
+                    .card_no
+                    .map(|n| format!("0x{n:04X}"))
+                    .unwrap_or_else(|| "空白 / 无法识别".into());
+                return Err(CommandError::new(
+                    1,
+                    format!("读卡器上的卡号与要退的不一致（卡上 {on_card_text}，要退 0x{card_no:04X}）"),
+                    "请确认放在读卡器上的是这张卡；手上没卡请改用无卡退房",
+                ));
+            }
+            // 写零擦卡 → 读回确认已是空白卡
+            device.erase_card()?;
+            let after = device.read_card()?;
+            if !after.kind.is_blank() {
+                return Err(CommandError::new(
+                    1,
+                    "擦卡失败：卡内数据没有写成空白卡",
+                    "请把卡重新放正后重试；卡片损坏时可用无卡退房",
+                ));
+            }
+        }
+    }
+
     let db = state.db.clone();
     blocking(move || {
         let conn = lock_db(&db)?;
@@ -2018,7 +2085,10 @@ pub async fn checkout_card(
             &conn,
             "checkout_card",
             Some(&room_no),
-            Some(&format!("cardNo={card_no} remaining={remaining}")),
+            Some(&format!(
+                "cardNo={card_no} remaining={remaining} erased={}",
+                if skip_device { 0 } else { 1 }
+            )),
             "ok",
             Some(me.operator_id),
         );
@@ -3279,6 +3349,15 @@ mod tests {
     }
 
     #[test]
+    fn sim_erase_card_returns_blank_snapshot() {
+        // 模拟设备没有真实写入闭环：擦卡直接回放空白卡快照（真实设备写 28 字节全零）
+        let dev = Device::Sim(ocw_device::SimDevice::default());
+        let card = dev.erase_card().expect("模拟擦卡应成功");
+        assert!(card.kind.is_blank(), "擦卡结果必须是空白卡");
+        assert!(card.card_no.is_none(), "空白卡不含卡号");
+    }
+
+    #[test]
     fn checkout_and_raw_are_formatted() {
         assert_eq!(
             args(AdminCardRequest::Checkout { hour: 12 }),
@@ -3556,8 +3635,13 @@ mod tests {
             hours: 0,
             card_no: Some(0x2404),
             guest_name: Some("张三,李四".into()),
+            guest_gender: None,
             guest_id_type: Some("身份证".into()),
             guest_id_number: Some("=1+1".into()),
+            guest_nation: None,
+            guest_address: None,
+            guest_birth_date: None,
+            guest_note: None,
             operator_name: Some("值班\"甲".into()),
             result: "ok".into(),
             expires_at: None,

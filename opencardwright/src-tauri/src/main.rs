@@ -135,7 +135,7 @@ fn main() {
                 let quit = MenuItem::with_id(app, "quit", "退出程序", true, None::<&str>)?;
                 let tray_menu = Menu::with_items(app, &[&show, &quit])?;
                 let mut builder = TrayIconBuilder::with_id("main-tray")
-                    .tooltip("OpenCardWright · 门锁发卡台")
+                    .tooltip("门锁发卡台")
                     .menu(&tray_menu)
                     // 左键走 on_tray_icon_event（单击恢复窗口），菜单由右键弹出
                     .show_menu_on_left_click(false)
@@ -247,5 +247,5 @@ fn main() {
             commands::set_port,
         ])
         .run(tauri::generate_context!())
-        .expect("OpenCardWright 启动失败");
+        .expect("门锁发卡台启动失败");
 }
