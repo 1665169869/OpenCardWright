@@ -138,7 +138,10 @@ npm run tauri build    # 产出 NSIS 安装包
 ```
 
 - 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
-- **对外交付的安装包复制到 `opencardwright/output/`**（该目录不入库，见 `.gitignore`）；
+- `opencardwright/output/` 存放构建产出的副本（该目录不入库，见 `.gitignore`）；
+- **交付/安装时把安装包复制到纯 ASCII 路径并使用 ASCII 文件名**（如 `C:\ocw-setup\setup.exe`）：
+  NSIS 安装器在「中文路径 + 中文文件名」下可能报 `Error writing temporary file. Make sure your temp folder is valid.`
+  （安装器自解包到 `%TEMP%` 失败）；快捷方式与安装目录名不受影响（由 `productName`「门锁发卡台」决定）；
 
 ### 两个环境坑（本机已踩过，写在这里省时间）
 
