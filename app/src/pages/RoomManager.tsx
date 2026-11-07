@@ -1331,7 +1331,7 @@ export default function RoomManager({
 
       {/* 预定：新建（房间卡片按钮）/ 改期取消（日历色块点开） */}
       <ReservationModal
-        key={reserveSession}
+        key={`reserve-${reserveSession}`}
         open={reserveTarget !== null || reserveEditing !== null}
         room={reserveTarget}
         editing={reserveEditing}
@@ -1674,7 +1674,7 @@ export default function RoomManager({
 
       {/* 读卡退房 / 持卡退房：先读卡核对，再确认退房（每次打开都重新挂载，不带上次的卡） */}
       <CheckoutCardModal
-        key={checkoutSession}
+        key={`checkout-${checkoutSession}`}
         open={checkoutOpen}
         target={checkoutTarget}
         rooms={rooms}

@@ -100,6 +100,9 @@
 - **备份列表漏列导入/自动备份**（TD-133）：`list_backups` 的过滤只认 `ocw-*` 与 `.bak`，
   导入的 `imported-*`、自动的 `auto-*` 落盘成功却不显示（导入后因此看不到「恢复」按钮）；
   抽出 `is_backup_name()` 统一识别三种来源并补单测。
+- **dev 控制台 React key 重复警告**（TD-134）：`RoomManager` 两个兄弟组件用自增计数器当 key、初始值都是 0
+  （`key={reserveSession}` / `key={checkoutSession}`），同级 key 撞车；改为 `reserve-*` / `checkout-*` 前缀，
+  顺带把 `ReservationModal` 的 `destroyOnClose` 换成 `destroyOnHidden`（antd 弃用告警）。
 - 版本号 `2026.11.6+0055` → `2026.11.6+0056`。
 
 ## 2026.11.6+0055 — 2026-11-06

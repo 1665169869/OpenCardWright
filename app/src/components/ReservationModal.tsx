@@ -114,7 +114,7 @@ export default function ReservationModal({
       okButtonProps={{ disabled: !canSubmit }}
       onOk={() => void submit()}
       onCancel={onClose}
-      destroyOnClose
+      destroyOnHidden
     >
       <Space direction="vertical" size="middle" style={{ width: '100%' }}>
         <Space wrap size="large">
