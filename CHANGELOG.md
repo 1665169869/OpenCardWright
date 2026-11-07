@@ -97,6 +97,9 @@
 - **前端包管理改用 pnpm**（TD-131）：`package-lock.json` → `pnpm-lock.yaml`；`@ant-design/icons`、
   `dayjs` 从隐性依赖改为显式声明（pnpm 隔离结构下才暴露）；`pnpm-workspace.yaml` 的
   `allowBuilds: esbuild` 是安装能通过的前提；scripts / `tauri.conf.json` / CI / 文档同步为 pnpm。
+- **备份列表漏列导入/自动备份**（TD-133）：`list_backups` 的过滤只认 `ocw-*` 与 `.bak`，
+  导入的 `imported-*`、自动的 `auto-*` 落盘成功却不显示（导入后因此看不到「恢复」按钮）；
+  抽出 `is_backup_name()` 统一识别三种来源并补单测。
 - 版本号 `2026.11.6+0055` → `2026.11.6+0056`。
 
 ## 2026.11.6+0055 — 2026-11-06

@@ -1844,6 +1844,19 @@ pub async fn backup_database(
     .await
 }
 
+/// 备份文件名的识别规则（TD-133）：手动 `ocw-*`、自动 `auto-*`、导入 `imported-*`，
+/// 以及恢复前安全副本 `*.before-restore-*.bak` / `*.bak`。
+///
+/// 之前只认 `ocw-` 与 `.bak`，导致导入的备份（`imported-*`）和自动备份（`auto-*`）
+/// 落盘成功却不出现在列表里，用户看不到「恢复」按钮。
+fn is_backup_name(name: &str) -> bool {
+    name.starts_with("ocw-")
+        || name.starts_with("auto-")
+        || name.starts_with("imported-")
+        || name.contains(".before-restore-")
+        || name.ends_with(".bak")
+}
+
 /// 列出已有的备份文件（管理员）：`backups\` 目录 + 库同级的安全副本。
 #[tauri::command]
 pub async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupEntry>, CommandError> {
@@ -1877,7 +1890,8 @@ pub async fn list_backups(state: State<'_, AppState>) -> Result<Vec<BackupEntry>
                 if safety_only && !is_safety {
                     continue;
                 }
-                if !(is_safety || name.starts_with("ocw-")) {
+                // 三种来源都要认：手动 ocw-*、自动 auto-*、导入 imported-*（TD-133）
+                if !is_backup_name(&name) {
                     continue;
                 }
                 let bytes = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -3523,6 +3537,22 @@ mod tests {
     /// 这条测试的价值在于「删掉某个 require_admin 会立刻变红」——
     /// 比人工逐条 review 可靠，也让新加的命令无处可逃。
     #[test]
+    #[test]
+    fn backup_name_filter_covers_all_sources() {
+        // TD-133：导入的 imported-*、自动的 auto-* 之前被过滤掉，列表里看不到、也就无法恢复
+        assert!(is_backup_name("ocw-20261107-211000.db"), "手动备份");
+        assert!(is_backup_name("auto-20261107-211000.db"), "自动备份");
+        assert!(is_backup_name("imported-20261107-211000-backup.db"), "导入备份");
+        assert!(
+            is_backup_name("opencardwright.db.before-restore-20261107.bak"),
+            "恢复前副本"
+        );
+        assert!(is_backup_name("opencardwright.db.bak"), "安全副本");
+        assert!(!is_backup_name("opencardwright.db"), "正在用的库不算备份");
+        assert!(!is_backup_name("opencardwright.db-wal"), "WAL 不算备份");
+        assert!(!is_backup_name("notes.txt"), "无关文件不算备份");
+    }
+
     fn auth_matrix_matches_every_command() {
         let bodies = command_bodies();
         assert!(!bodies.is_empty(), "没切出任何命令，正则/切片逻辑坏了");
