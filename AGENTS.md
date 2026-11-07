@@ -199,15 +199,15 @@ npm run tauri build    # 出 NSIS 安装包；不要用 cargo build --release（
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 仓库路径含中文必须设，否则 MSVC 报 D8050
-cargo test --workspace                                   # 全部；2026-11-06 实测 118 项全绿
+cargo test --workspace                                   # 全部；2026-11-07 实测 120 项全绿
 cargo test -p ocw-store                                  # 只跑存储层（41）
 cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件（5）
 cargo test -p ocw-store insert_room                      # 按用例名子串单跑
 ```
 
 > 2026-11-06 起 `real_selftest_is_all_green_and_parses` 已改用 `ocw_device::cli::decode`，
-> GBK 红灯已修复；`cargo test --workspace` 实测 118 项全绿
-> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 41 + 命令层 44）。
+> GBK 红灯已修复；`cargo test --workspace` 实测 120 项全绿
+> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 43 + 命令层 44）。
 
 无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`。模拟设备会调用 `OCWCardBuild.exe`
 离线构包并推进 `CardNo.state`，卡号/字节与真机一致，只是不真写卡（缺构包器时退回固定样本）。

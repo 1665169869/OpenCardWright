@@ -237,6 +237,8 @@ fn main() {
             commands::change_own_password,
             commands::get_reminder_settings,
             commands::set_reminder_settings,
+            commands::get_checkout_hour,
+            commands::set_checkout_hour,
             commands::expiring_cards,
             commands::hide_to_tray,
             commands::quit_app,

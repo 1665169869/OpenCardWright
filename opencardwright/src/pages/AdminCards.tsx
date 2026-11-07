@@ -70,6 +70,14 @@ export default function AdminCards({
   const [useHours, setUseHours] = useState(false)
   const [amount, setAmount] = useState<number>(1)
   const [hour, setHour] = useState<number>(12)
+  /** 退房钟点（TD-126）：发卡传设置值；UI 只读，改配置去「设置」页。与 timeSync 用的 hour 分开。 */
+  const [checkoutHour, setCheckoutHour] = useState<number>(12)
+  useEffect(() => {
+    api
+      .getCheckoutHour()
+      .then((h) => setCheckoutHour(h))
+      .catch(() => {})
+  }, [])
   const [minute, setMinute] = useState<number>(0)
   const [now, setNow] = useState(true)
   const [p1, setP1] = useState('')
@@ -103,7 +111,7 @@ export default function AdminCards({
       case 'install':
         return roomNo ? { kind: 'install', roomNo } : null
       case 'checkout':
-        return { kind: 'checkout', hour }
+        return { kind: 'checkout', hour: checkoutHour }
       case 'timeSync':
         return now ? { kind: 'timeSync' } : { kind: 'timeSync', hour, minute }
       case 'raw':
@@ -226,8 +234,11 @@ export default function AdminCards({
           {kind === 'checkout' ? (
             <Space>
               <Text>退房钟点</Text>
-              <InputNumber min={0} max={23} value={hour} onChange={(v) => setHour(typeof v === 'number' ? v : 12)} />
+              <Text>{checkoutHour}</Text>
               <Text type="secondary">点</Text>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                发卡使用设置值；要改去「设置」页
+              </Text>
             </Space>
           ) : null}
 

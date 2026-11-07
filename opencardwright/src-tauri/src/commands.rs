@@ -2354,6 +2354,46 @@ pub struct ReminderSettings {
     pub voice: bool,
 }
 
+/// 退房钟点（TD-126）：日租卡「预计退房 / 写库到期」用的钟点（0–23），默认 12。
+/// 读 = 登录即可（前台发卡页要显示），写 = 管理员（配置是管理行为）。
+#[tauri::command]
+pub async fn get_checkout_hour(state: State<'_, AppState>) -> Result<u32, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let hour = ocw_store::get_setting(&conn, "checkoutHour")?
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v <= 23)
+            .unwrap_or(12);
+        Ok(hour)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_checkout_hour(state: State<'_, AppState>, hour: u32) -> Result<u32, CommandError> {
+    let me = require_admin(&state)?;
+    if hour > 23 {
+        return Err(CommandError::new(1, "退房钟点必须在 0–23", ""));
+    }
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_setting(&conn, "checkoutHour", &hour.to_string())?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "set_checkout_hour",
+            None,
+            Some(&format!("hour={hour}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(hour)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn get_reminder_settings(
     state: State<'_, AppState>,
@@ -3321,6 +3361,7 @@ mod tests {
         ("get_checkout_status", Level::Login),
         ("change_own_password", Level::Login),
         ("get_reminder_settings", Level::Login),
+        ("get_checkout_hour", Level::Login),
         ("expiring_cards", Level::Login),
         ("list_issuances", Level::Login),
         ("list_audits", Level::Login),
@@ -3361,6 +3402,7 @@ mod tests {
         ("reset_operator_password", Level::Admin),
         ("set_operator_active", Level::Admin),
         ("set_reminder_settings", Level::Admin),
+        ("set_checkout_hour", Level::Admin),
         ("get_backup_settings", Level::Admin),
         ("set_backup_settings", Level::Admin),
         ("import_backup_file", Level::Admin),
@@ -3444,8 +3486,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (35, 28, 6));
-        assert_eq!(command_bodies().len(), 69, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (36, 29, 6));
+        assert_eq!(command_bodies().len(), 71, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {

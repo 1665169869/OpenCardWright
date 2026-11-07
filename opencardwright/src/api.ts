@@ -615,6 +615,9 @@ export const api = {
     invoke<void>('change_own_password', { oldPassword, newPassword }),
 
   getReminderSettings: () => invoke<ReminderSettings>('get_reminder_settings'),
+  /** 退房钟点（TD-126）：读 = 登录即可；写 = 管理员（0–23，返回保存值） */
+  getCheckoutHour: () => invoke<number>('get_checkout_hour'),
+  setCheckoutHour: (hour: number) => invoke<number>('set_checkout_hour', { hour }),
   setReminderSettings: (enabled: boolean, minutes: number, sound: boolean, voice?: boolean) =>
     invoke<ReminderSettings>('set_reminder_settings', {
       enabled,

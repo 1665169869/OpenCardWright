@@ -1287,7 +1287,37 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
 
     // 凡带时长的卡型（客卡、总控卡等）都写到期时间。用 SQLite 的日期运算，
     // 保证和 created_at 同格式（ISO UTC）。
-    if let Some(modifier) = expiry_modifier(new.days, new.hours) {
+    // 日租客卡（TD-126）：到期 = 退房日（本地开卡日 + N 天）的「退房钟点」设置项（默认 12），
+    // 不再按开卡时刻顺延 —— 18:00 开 1 天卡 → 次日 12:00 到期，而非次日 18:00。
+    // 中国无夏令时、localtime 偏移固定（见 logging.rs 注释）；钟点卡 / 管理卡 / 复位仍走
+    // expiry_modifier 顺延原逻辑，历史数据（backfill）不回溯，卡内时长码与锁的判定不受影响。
+    // 已知风险：05:00 开 1 天卡时库显示次日 12:00，而锁按刷入 +1 天（日界 docs【待定】）
+    // 可能次日 05:00 已失效 —— 软件比锁宽松最多 7 小时；18:00 开卡则库比锁严 6 小时（安全方向）。
+    let guest_checkout_hour = if new.kind == "日租客卡" && new.days > 0 {
+        Some(
+            get_setting(conn, "checkoutHour")?
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|v| (0..=23).contains(v))
+                .unwrap_or(12),
+        )
+    } else {
+        None
+    };
+    if let Some(hour) = guest_checkout_hour {
+        // 本地「开卡日 + N 天」的 HH:00，用 'utc' 修饰符转回 UTC 存储。
+        // 不要用 unixepoch(...,'localtime')：SQLite 会把已带 'localtime' 的值二次转换
+        //（实测本地 6 点变成 22 点），TD-126 回归用例会拦住。
+        conn.execute(
+            "UPDATE issuance
+                SET expires_at = strftime(
+                    '%Y-%m-%dT%H:%M:%SZ',
+                    strftime('%Y-%m-%d', created_at, ?1, 'localtime')
+                        || printf(' %02d:00:00', ?2),
+                    'utc')
+              WHERE id = ?3",
+            params![format!("+{} days", new.days), hour, id],
+        )?;
+    } else if let Some(modifier) = expiry_modifier(new.days, new.hours) {
         conn.execute(
             "UPDATE issuance
                 SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, ?1)
@@ -2423,6 +2453,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires, expected, "总控卡到期 = 发卡时间 + 天数");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn guest_day_expiry_uses_checkout_hour_setting() {
+        let (conn, path) = temp_db();
+        // 默认退房钟点 12：日租 1 天 → 到期 = 本地「开卡日 + 1 天」的 12:00（TD-126）
+        let id = record_issuance(&conn, &sample_issuance(Some("220"), "日租客卡", 1, 0)).unwrap();
+        let local_day: String = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%d', created_at, '+1 days', 'localtime')
+                   FROM issuance WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (expires_day, expires_hour): (String, String) = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%d', expires_at, 'localtime'),
+                        strftime('%H', expires_at, 'localtime')
+                   FROM issuance WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(expires_day, local_day, "到期日 = 本地开卡日 + 天数");
+        assert_eq!(expires_hour, "12", "默认退房钟点 12");
+
+        // 改设置项为 6 点 → 新发的卡到期时刻跟着变
+        set_setting(&conn, "checkoutHour", "6").unwrap();
+        let id2 = record_issuance(&conn, &sample_issuance(Some("221"), "日租客卡", 2, 0)).unwrap();
+        let hour: String = conn
+            .query_row(
+                "SELECT strftime('%H', expires_at, 'localtime') FROM issuance WHERE id = ?1",
+                params![id2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hour, "06", "到期时刻 = 设置项钟点");
+
+        // 钟点卡不受影响：仍按发卡时刻顺延小时
+        let id3 = record_issuance(&conn, &sample_issuance(Some("222"), "钟点客卡", 0, 3)).unwrap();
+        let expected3: String = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+3 hours')
+                   FROM issuance WHERE id = ?1",
+                params![id3],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let actual3: String = conn
+            .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![id3], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual3, expected3, "钟点卡仍按发卡时刻顺延");
+
         cleanup(conn, path);
     }
 

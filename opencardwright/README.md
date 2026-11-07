@@ -31,7 +31,7 @@
 npm run build:sdk     # 编译 sdk/ → resources/sdk，跑 27 条黄金向量
 npx tsc --noEmit      # 前端类型检查
 npx vite build        # 前端产物
-- `cargo test --workspace` — **118 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 41、命令层 44）
+- `cargo test --workspace` — **120 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 43、命令层 44）
 ```
 
 功能规划、验收标准、风险登记见 `../plan/开源门锁发卡软件-建设方案-v0.2.md`；
@@ -273,15 +273,15 @@ fixtures/               CLI 输出样本（解析器测试用）
 
 ## 8. 命令 × 角色对照表
 
-后端 69 条 `#[tauri::command]` 的校验级别。**这张表是可执行的**：`commands.rs` 的
+后端 71 条 `#[tauri::command]` 的校验级别。**这张表是可执行的**：`commands.rs` 的
 `auth_matrix_matches_every_command` 会用 `include_str!` 扫源码逐条比对，删掉任何一处
 `require_admin` 都会让测试变红；新增命令必须先登记到测试里的 `MATRIX`。
 
 | 级别 | 数量 | 命令 |
 |---|---|---|
 | 公开（无需登录） | 6 | `app_info` `auth_status` `initialize_admin` `login` `logout` `log_frontend` |
-| 登录即可（前台日常 + 只读） | 28 | `read_card` `list_rooms` `run_selftest` `probe_ports` `card_no_status` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `expiring_cards` `list_issuances` `list_audits` `card_history` `get_onboarding_status` `list_reservations` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
-| 管理员 | 35 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `set_water_warn_at` `reset_water_mark` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `get_backup_settings` `set_backup_settings` `import_backup_file` `export_diagnostics` `export_issuances_csv` `import_rooms` `complete_onboarding` |
+| 登录即可（前台日常 + 只读） | 29 | `read_card` `list_rooms` `run_selftest` `probe_ports` `card_no_status` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `get_checkout_hour` `expiring_cards` `list_issuances` `list_audits` `card_history` `get_onboarding_status` `list_reservations` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
+| 管理员 | 36 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `set_water_warn_at` `reset_water_mark` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `set_checkout_hour` `get_backup_settings` `set_backup_settings` `import_backup_file` `export_diagnostics` `export_issuances_csv` `import_rooms` `complete_onboarding` |
 
 约定：
 - 错误码 **401 = 未登录**、**403 = 权限不足**，前端按 `code` 区分提示，不要只匹配文案。

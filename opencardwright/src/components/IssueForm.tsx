@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Alert, Button, Card, Descriptions, Input, Radio, Select, Space, Tag, Typography } from 'antd'
 import {
   api,
@@ -59,8 +59,15 @@ export default function IssueForm({
   const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
   /** 长有效期卡（>62 天）必须原样输入这个确认词 */
   const [confirmWord, setConfirmWord] = useState('')
-  /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数 */
+  /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数。
+   *  TD-126：初值读「退房钟点」设置项（默认 12），只读展示，改配置去设置页。 */
   const [checkoutTime, setCheckoutTime] = useState('12:00')
+  useEffect(() => {
+    void api
+      .getCheckoutHour()
+      .then((h) => setCheckoutTime(`${String(h).padStart(2, '0')}:00`))
+      .catch(() => {})
+  }, [])
   const needsLongConfirm = mode === 'day' && amount > GUEST_MAX_DAYS
   const longConfirmed = !needsLongConfirm || confirmWord.trim() === LONG_CONFIRM_WORD
 
@@ -172,14 +179,9 @@ export default function IssueForm({
         {mode === 'day' ? (
           <Space wrap align="center">
             <Text type="secondary">预计退房时刻</Text>
-            <input
-              type="time"
-              value={checkoutTime}
-              onChange={(e) => setCheckoutTime(e.target.value || '12:00')}
-              style={{ padding: '2px 6px', border: '1px solid #d9d9d9', borderRadius: 6 }}
-            />
+            <Text>{checkoutTime}</Text>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              只影响这里的估算与记录，写进卡里的仍然是「{amount} 天」
+              钟点在「设置」页配置；这里只是估算，写进卡里的仍然是「{amount} 天」
             </Text>
           </Space>
         ) : null}

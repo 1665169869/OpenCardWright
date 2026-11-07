@@ -48,6 +48,7 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
           // 设备曾是顶级页签，现在收进设置里做第一个二级页签
           { key: 'device', label: '设备', children: <DevicePanel onChanged={onChanged} /> },
           { key: 'reminder', label: '到期提醒', children: <ReminderPanel onChanged={onChanged} /> },
+          { key: 'checkout', label: '退房钟点', children: <CheckoutHourPanel onChanged={onChanged} /> },
           { key: 'departments', label: '部门', children: <DepartmentPanel onChanged={onChanged} /> },
           { key: 'operators', label: '用户', children: <OperatorPanel onChanged={onChanged} /> },
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
@@ -138,6 +139,64 @@ function ReminderPanel({ onChanged }: { onChanged?: () => void }) {
         提醒基于**发卡时间**计算。卡内只有时长码、没有绝对到期时间，而锁实际是从"首次刷卡"起算，
         所以提醒可能比真实到期偏早；长于 62/63 天的月码卡本身到期日也是近似值。
       </Paragraph>
+    </Space>
+  )
+}
+
+// ---------------------------------------------------------------- 退房钟点（TD-126）
+
+function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
+  const [hour, setHour] = useState<number | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+
+  useEffect(() => {
+    api
+      .getCheckoutHour()
+      .then(setHour)
+      .catch((e: unknown) => setErr(describeError(e)))
+  }, [])
+
+  const save = async () => {
+    if (hour === null) return
+    setBusy(true)
+    setErr(null)
+    setMsg(null)
+    try {
+      setHour(await api.setCheckoutHour(hour))
+      setMsg('已保存；发卡页与日租卡到期时间将按此钟点计算')
+      onChanged?.()
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (hour === null) return <Text type="secondary">加载中…</Text>
+
+  return (
+    <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space>
+        <Text>退房钟点</Text>
+        <InputNumber
+          min={0}
+          max={23}
+          value={hour}
+          onChange={(v) => setHour(typeof v === 'number' ? v : 12)}
+        />
+        <Text type="secondary">点（0–23，默认 12）</Text>
+        <Button type="primary" loading={busy} onClick={() => void save()}>
+          保存
+        </Button>
+      </Space>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        影响：发卡页「预计退房时刻」展示、日租卡写库到期时间（退房日的该钟点）、管理卡「退房
+        钟点卡」发卡取值。
+      </Text>
+      {msg ? <Text type="success">{msg}</Text> : null}
+      {err ? <Text type="danger">{err}</Text> : null}
     </Space>
   )
 }
