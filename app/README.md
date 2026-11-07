@@ -146,22 +146,23 @@ pnpm tauri build    # 产出 NSIS 安装包
 
 ### 两个环境坑（本机已踩过，写在这里省时间）
 
-**1. 仓库路径含中文时，MSVC 会报 `D8050`**（历史注记）
+**1. MSVC 报 `D8050`（命令行过长，与中文路径无关）**
 
 ```
 cl: 命令行 error D8050 :无法执行 c1.dll: 未能将命令行放入调试记录中
 ```
 
-`cl.exe` 在 `/Z7` 调试信息下处理含非 ASCII 字符的输出路径会失败。**2026-11-07 起仓库已改名
-`D:\source-code\OpenCardWright`（纯 ASCII），默认 target 在 `app/src-tauri/target/`——
-`CARGO_TARGET_DIR` 不再必需**。若在中文路径的副本里构建，仍可临时绕开：
+真因：`libsqlite3-sys` 编 `sqlite3.c` 时命令行极长（`-Z7` 调试信息 + 一长串 `-D` 宏 + 输出路径），
+超过 `cl.exe` 的调试记录上限；**输出路径越长越容易触发**。2026-11-07 仓库改名成纯 ASCII
+（`D:\source-code\opencardwright`）后，默认 target 仍在 `app\src-tauri\target\debug\…` 这种长路径上，
+**实测照样 D8050**——所以这两条环境变量在 `app/` 内所有 cargo 构建/测试都要设：
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 产物放到纯 ASCII 路径
+$env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 产物放到短路径
 $env:DEBUG = 'false'                       # 让 cc-rs 不再传 /Z7
 ```
 
-CI 跑在 `windows-latest` 的 ASCII 路径下，不受影响。
+CI 跑在 `windows-latest` 的短路径下，不受影响。
 
 **2. `vite build` 报 `Access is denied`（esbuild 删临时文件失败）**
 
