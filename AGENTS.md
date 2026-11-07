@@ -3,7 +3,7 @@
 本仓库是「智能门锁管理软件（LOCK_V8 / V8.9）」TEMIC 卡的**逆向成果 + 独立发卡 SDK**，
 并在其上开发开源发卡台 **OpenCardWright**。`sdk/` 侧不是常规应用工程：没有解决方案文件、
 没有包管理，也没有单元测试框架（回归靠 `PMSLockCard.exe selftest`）；产品侧
-`opencardwright/` 是独立的 Tauri + Rust + React 工程，有自己的构建链（见第 9 节）。
+`app/` 是独立的 Tauri + Rust + React 工程，有自己的构建链（见第 9 节）。
 仓库已纳入 git，见第 8 节。
 
 改动前先读 `docs/`，那里是唯一权威来源；代码是文档的实现。
@@ -27,9 +27,9 @@
 | `sdk/IOServer/LC2000/*.dll` | 原厂读卡器驱动（x86，随包分发） | **不要动**，见第 3 节哈希 |
 | `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、16 位卡号计数器 | 状态文件是现场数据 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
-| `opencardwright/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链 | 见第 9 节 |
-| `opencardwright/docs/使用手册.md`、`CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
-| `opencardwright/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder` / `CardNoStore`） | 随 SDK 接口同步 |
+| `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链 | 见第 9 节 |
+| `app/docs/使用手册.md`、`CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
+| `app/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder` / `CardNoStore`） | 随 SDK 接口同步 |
 | `plan/` | 建设方案（v0.1 作废留档、v0.2 已批准）与 `待办清单.md` | 方案改结论要留痕；待办清单每轮更新，见第 10 节 |
 
 `sdk/` 会被**整目录拷到现场 32 位 Windows** 直接运行，所以不要在 `sdk/` 里塞构建中间物或文档。
@@ -54,7 +54,7 @@ csc /target:library /platform:x86 /out:PMSLockSDK.Com.dll /r:PMSLockSDK.dll PMSL
 - COM 注册（管理员，32 位）：`regasm.exe PMSLockSDK.Com.dll /tlb /codebase`。
 - 源码含中文注释与中文输出：若编译后乱码，加 `/codepage:65001`，**不要**转成 GBK 保存。
 - 交付物是 `.dll/.exe`，仓库里已提交编译结果；改源码后要同步重建，否则现场跑的是旧二进制。
-- **产品侧不要手工执行上面的 csc**：统一走 `opencardwright/scripts/build-sdk.ps1`
+- **产品侧不要手工执行上面的 csc**：统一走 `app/scripts/build-sdk.ps1`
   （额外编 `OCWCardBuild.exe`、跑 27 条自检门禁、不复制 `CardNo.state`）。
 
 ## 3. 验证（不需要读卡器）
@@ -134,7 +134,7 @@ PMSLockCard.exe selftest
 
 **仍存在的不一致（无害）**：
 
-- `opencardwright/README.md` §1 的 M3/M4/M5 状态表是历史快照，部分 ⬜ 实际已完成；
+- `app/README.md` §1 的 M3/M4/M5 状态表是历史快照，部分 ⬜ 实际已完成；
   判断“还差什么”只看 `plan/待办清单.md`，不要据此开工。
 - `RoomIndex.ini` 有两份（`data/` 与 `sdk/`）；运行时读 `sdk/` 侧（`LockCard.ini` 用相对路径），
   增删房间要两份同步。
@@ -150,11 +150,11 @@ PMSLockCard.exe selftest
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
 - 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
   常规改动直接提交即可；但 `sdk/CardNo.state` 是现场计数器，提交前确认值未被误改。
-  注意 `opencardwright/src-tauri/resources/sdk/` 是构建产物，不入库。
+  注意 `app/src-tauri/resources/sdk/` 是构建产物，不入库。
 
 ---
 
-## 9. 产品工作区 `opencardwright/`
+## 9. 产品工作区 `app/`
 
 2026-11-05 起，在本仓库内并行开发开源产品 **OpenCardWright**（方案见
 `plan/开源门锁发卡软件-建设方案-v0.2.md`）。两者的关系是**只读依赖**，不是同一套构建：
@@ -165,14 +165,14 @@ PMSLockCard.exe selftest
 | 能否修改 `sdk/` | **不能**（沿用第 1、4、6 节约束）。需要改设备行为时，改的是产品的适配层，不是 SDK |
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
 | 回归口径 | `sdk` 自带的 27 条黄金向量；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
-| 构建命令 | 在 `opencardwright/` 内：`pwsh -File scripts/build-sdk.ps1` → `npm run build:sdk`；随后 `npm run tauri build` |
-| 编译环境坑 | 仓库路径含中文时 MSVC 会报 `D8050`：设 `CARGO_TARGET_DIR` 到 ASCII 路径 + `DEBUG=false`。详见 `opencardwright/README.md` §4 |
+| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `npm run build:sdk`；随后 `npm run tauri build` |
+| 编译环境坑 | 仓库路径含中文时 MSVC 会报 `D8050`：设 `CARGO_TARGET_DIR` 到 ASCII 路径 + `DEBUG=false`。详见 `app/README.md` §4 |
 
-新产品自己的约定（技术栈、目录、阶段）以 `opencardwright/README.md` 为准，不要套用本文件的 csc 构建命令。
+新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准，不要套用本文件的 csc 构建命令。
 
 ### 产品侧模块（改代码先定位）
 
-| 位置（相对 `opencardwright/`） | 职责 |
+| 位置（相对 `app/`） | 职责 |
 |---|---|
 | `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/` |
 | `src-tauri/src/commands.rs` | 全部 `#[tauri::command]`：发卡 / 退房 / 房间 / 管理卡 / 备份 / 诊断 / 登录，以及命令 × 角色矩阵 |
@@ -182,7 +182,7 @@ PMSLockCard.exe selftest
 | `src-tauri/crates/ocw-device/` | 启动 `PMSLockCard.exe` 子进程、GBK 解码、解析、模拟设备 |
 | `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 运行目录 + 首启卡号、自动备份、文件日志、诊断包 |
 
-产品工作区常用命令（在 `opencardwright/` 内）：
+产品工作区常用命令（在 `app/` 内）：
 
 ```powershell
 npm install
@@ -233,12 +233,12 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 - **HMR 会保留组件 state**，弹窗/抽屉里上次的表单数据会残留。修法是给组件加一个自增计数
   当 `key` 强制重挂载（`RoomManager` 的 `checkoutSession` 就是为此）。
 - `npm install` 会重写 `package-lock.json` 的 `libc` 元数据，产生无意义 diff；误改就
-  `git checkout -- opencardwright/package-lock.json` 还原，别把它带进提交。
+  `git checkout -- app/package-lock.json` 还原，别把它带进提交。
 
-产品侧高频踩坑（详见 `opencardwright/README.md` §7）：设备 CLI 输出是 GBK，必须经
+产品侧高频踩坑（详见 `app/README.md` §7）：设备 CLI 输出是 GBK，必须经
 `ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。
 
-- 新增/改名 Tauri 命令必须同步 `opencardwright/README.md` §8 的「命令 × 角色」表；
+- 新增/改名 Tauri 命令必须同步 `app/README.md` §8 的「命令 × 角色」表；
   `commands.rs` 的 `auth_matrix_matches_every_command` 会机械校验，漏登记即红。
 - 时长边界改一处不算完：`src-tauri/src/rules.rs` 与 `src/api.ts` 的档位表必须同步。
 
@@ -256,7 +256,7 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 | 唯一载体 | 未完成项只登记在 `plan/待办清单.md`，按模块分组、按 ID（`TD-xxx`）引用 |
 | 每轮收口 | 一轮开发结束、**提交之前**，把本轮没做完的项写进去，「状态 / 现状 / 验收标准」三样齐全；没有新增就把状态改准 |
 | 进度不再写方案 | `plan/…建设方案-v0.2.md` §15 只记已完成与偏差，不再追加「未实现」；新需求一律进待办清单 |
-| 其它文档只写结论 | `opencardwright/README.md` 面向使用者写「现在能不能用」，`CHANGELOG.md` 面向版本写「这版有什么」，都只放指针、不复制条目 |
+| 其它文档只写结论 | `app/README.md` 面向使用者写「现在能不能用」，`CHANGELOG.md` 面向版本写「这版有什么」，都只放指针、不复制条目 |
 | 不引入外部跟踪 | 不用 GitHub Issues 或在线看板：另一台电脑可能没网、没 gh 登录 |
 | 来源可追溯 | 每条待办在清单 §7「来源登记表」有出处；登记前先查表，避免同一需求登记两次 |
 | 待拍板显式化 | 需要用户决定的（有效期怎么存、音色怎么来、某功能是否废弃）必须写进条目「待拍板」并给建议默认，不许自行假设 |

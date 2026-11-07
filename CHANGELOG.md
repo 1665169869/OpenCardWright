@@ -91,6 +91,9 @@
 - **应用显示名统一为「门锁发卡台」**（TD-129）：`productName`、窗口标题、`index.html`、顶栏、登录页、
   关窗确认框、托盘 tooltip 全部改为「门锁发卡台」（`identifier` 不变）；桌面快捷方式 / 开始菜单随
   `productName` 同步——需重新打包，**旧版（OpenCardWright）先卸载再装**。
+- **仓库改名为 `OpenCardWright` + 产品目录改 `app`**（TD-130）：消除中文路径——MSVC 不再需要
+  `CARGO_TARGET_DIR` 绕路，构建产物回到 `app/src-tauri/target/`，安装包目录 `app/output/`；
+  `package.json` / crate name 与 `identifier` 不变；文档与 `.gitignore` 路径同步。
 - 版本号 `2026.11.6+0055` → `2026.11.6+0056`。
 
 ## 2026.11.6+0055 — 2026-11-06

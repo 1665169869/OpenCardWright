@@ -1,21 +1,21 @@
 # ---------------- 依赖与构建产物 ----------------
 node_modules/
-opencardwright/node_modules/
+app/node_modules/
 
 # Rust 构建目录（本项目用 CARGO_TARGET_DIR 指到 C:\ocw-target，这里兜底）
 target/
-opencardwright/src-tauri/target/
+app/src-tauri/target/
 
 # 前端构建与打包产物
-opencardwright/dist/
-opencardwright/release/
+app/dist/
+app/release/
 
 # 构建脚本生成的 SDK 运行副本（由 sdk/*.cs 现编，不入库）
-opencardwright/src-tauri/resources/sdk/
+app/src-tauri/resources/sdk/
 
 # ---------------- 调试 / 临时 ----------------
 .tmp/
-opencardwright/.tmp/
+app/.tmp/
 *.log
 *.TMP
 *~RF*

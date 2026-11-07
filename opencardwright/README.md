@@ -138,20 +138,22 @@ npm run tauri build    # 产出 NSIS 安装包
 ```
 
 - 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
-- `opencardwright/output/` 存放构建产出的副本（该目录不入库，见 `.gitignore`）；
+- `app/output/` 存放构建产出的副本（该目录不入库，见 `.gitignore`）；
 - **交付/安装时把安装包复制到纯 ASCII 路径并使用 ASCII 文件名**（如 `C:\ocw-setup\setup.exe`）：
   NSIS 安装器在「中文路径 + 中文文件名」下可能报 `Error writing temporary file. Make sure your temp folder is valid.`
   （安装器自解包到 `%TEMP%` 失败）；快捷方式与安装目录名不受影响（由 `productName`「门锁发卡台」决定）；
 
 ### 两个环境坑（本机已踩过，写在这里省时间）
 
-**1. 仓库路径含中文时，MSVC 会报 `D8050`**
+**1. 仓库路径含中文时，MSVC 会报 `D8050`**（历史注记）
 
 ```
 cl: 命令行 error D8050 :无法执行 c1.dll: 未能将命令行放入调试记录中
 ```
 
-`cl.exe` 在 `/Z7` 调试信息下处理含非 ASCII 字符的输出路径会失败。绕开办法（二选一，建议都用）：
+`cl.exe` 在 `/Z7` 调试信息下处理含非 ASCII 字符的输出路径会失败。**2026-11-07 起仓库已改名
+`D:\source-code\OpenCardWright`（纯 ASCII），默认 target 在 `app/src-tauri/target/`——
+`CARGO_TARGET_DIR` 不再必需**。若在中文路径的副本里构建，仍可临时绕开：
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 产物放到纯 ASCII 路径
