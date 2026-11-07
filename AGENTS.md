@@ -141,8 +141,10 @@ PMSLockCard.exe selftest
 
 ## 8. 环境注记
 
-- 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用，`npm run build:sdk`
-  实测 27/27 通过。若某会话 `pwsh` 启动失败（`0xC0000142` DLL 初始化失败），先确认能否编译，
+- 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用；2026-11-07 起前端包管理改用
+  **pnpm 12**（`pnpm build:sdk` 实测 27/27 通过）。`app/pnpm-workspace.yaml` 的 `allowBuilds: esbuild`
+  不能删，否则 `pnpm install` 会以 `ERR_PNPM_IGNORED_BUILDS` 失败。若某会话 `pwsh` 启动失败
+  （`0xC0000142` DLL 初始化失败），先确认能否编译，
   不要把“没跑过命令”当成验证通过。
 - `cargo` 可能不在 bash 的 PATH：本机在 `~/.cargo/bin/cargo.exe`。跑 Rust 测试前先设
   `CARGO_TARGET_DIR='C:\ocw-target'`（仓库路径含中文，见第 9 节），否则 MSVC 可能报 `D8050`。
@@ -165,7 +167,7 @@ PMSLockCard.exe selftest
 | 能否修改 `sdk/` | **不能**（沿用第 1、4、6 节约束）。需要改设备行为时，改的是产品的适配层，不是 SDK |
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
 | 回归口径 | `sdk` 自带的 27 条黄金向量；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
-| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `npm run build:sdk`；随后 `npm run tauri build` |
+| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build` |
 | 编译环境坑 | 仓库路径含中文时 MSVC 会报 `D8050`：设 `CARGO_TARGET_DIR` 到 ASCII 路径 + `DEBUG=false`。详见 `app/README.md` §4 |
 
 新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准，不要套用本文件的 csc 构建命令。
@@ -185,14 +187,14 @@ PMSLockCard.exe selftest
 产品工作区常用命令（在 `app/` 内）：
 
 ```powershell
-npm install
-npm run build:sdk      # 编译 ../sdk → resources/sdk，跑 27 条黄金向量门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
-npm run dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
-npm run tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
-npm run build          # build:sdk + tsc --noEmit + vite build
-npx tsc --noEmit       # 只做前端类型检查
-npm run setup:nsis     # 打包前预置 NSIS 工具链（本机联网下载会超时）
-npm run tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出的是 dev 壳）
+pnpm install
+pnpm build:sdk      # 编译 ../sdk → resources/sdk，跑 27 条黄金向量门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
+pnpm dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
+pnpm tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
+pnpm build          # build:sdk + tsc --noEmit + vite build
+pnpm exec tsc --noEmit       # 只做前端类型检查
+pnpm setup:nsis     # 打包前预置 NSIS 工具链（本机联网下载会超时）
+pnpm tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出的是 dev 壳）
 ```
 
 测试在 `src-tauri/` 内跑，几种粒度都常用：
@@ -232,8 +234,8 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 
 - **HMR 会保留组件 state**，弹窗/抽屉里上次的表单数据会残留。修法是给组件加一个自增计数
   当 `key` 强制重挂载（`RoomManager` 的 `checkoutSession` 就是为此）。
-- `npm install` 会重写 `package-lock.json` 的 `libc` 元数据，产生无意义 diff；误改就
-  `git checkout -- app/package-lock.json` 还原，别把它带进提交。
+- npm 时代 `pnpm install` 会重写 `package-lock.json` 的 `libc` 元数据产生无意义 diff；2026-11-07 起改用
+  **pnpm**（`pnpm-lock.yaml`），此坑基本消失；若 lock 出现无意义 diff，`git checkout -- app/pnpm-lock.yaml` 还原。
 
 产品侧高频踩坑（详见 `app/README.md` §7）：设备 CLI 输出是 GBK，必须经
 `ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。

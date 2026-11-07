@@ -94,6 +94,9 @@
 - **仓库改名为 `OpenCardWright` + 产品目录改 `app`**（TD-130）：消除中文路径——MSVC 不再需要
   `CARGO_TARGET_DIR` 绕路，构建产物回到 `app/src-tauri/target/`，安装包目录 `app/output/`；
   `package.json` / crate name 与 `identifier` 不变；文档与 `.gitignore` 路径同步。
+- **前端包管理改用 pnpm**（TD-131）：`package-lock.json` → `pnpm-lock.yaml`；`@ant-design/icons`、
+  `dayjs` 从隐性依赖改为显式声明（pnpm 隔离结构下才暴露）；`pnpm-workspace.yaml` 的
+  `allowBuilds: esbuild` 是安装能通过的前提；scripts / `tauri.conf.json` / CI / 文档同步为 pnpm。
 - 版本号 `2026.11.6+0055` → `2026.11.6+0056`。
 
 ## 2026.11.6+0055 — 2026-11-06

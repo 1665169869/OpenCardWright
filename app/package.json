@@ -8,15 +8,17 @@
   "scripts": {
     "build:sdk": "pwsh -NoProfile -File scripts/build-sdk.ps1",
     "setup:nsis": "pwsh -NoProfile -File scripts/setup-nsis.ps1",
-    "dev": "npm run build:sdk && vite",
-    "build": "npm run build:sdk && tsc --noEmit && vite build",
+    "dev": "pnpm build:sdk && vite",
+    "build": "pnpm build:sdk && tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@ant-design/icons": "^5.6.1",
     "@ant-design/v5-patch-for-react-19": "^1.0.3",
     "@tauri-apps/api": "^2.0.0",
     "antd": "^5.20.0",
+    "dayjs": "^1.11.23",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

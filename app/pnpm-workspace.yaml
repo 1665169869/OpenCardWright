@@ -1,0 +1,4 @@
+# pnpm 设置（pnpm 10+ 不再读 package.json 的 pnpm 字段；pnpm 12 的键名是 allowBuilds）
+# esbuild 需要跑 postinstall 校验平台二进制；不批准时 pnpm 会以 ERR_PNPM_IGNORED_BUILDS 拒绝安装
+allowBuilds:
+  esbuild: true

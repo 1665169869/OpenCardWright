@@ -28,9 +28,9 @@
 已实测通过的命令：
 
 ```powershell
-npm run build:sdk     # 编译 sdk/ → resources/sdk，跑 27 条黄金向量
-npx tsc --noEmit      # 前端类型检查
-npx vite build        # 前端产物
+pnpm build:sdk     # 编译 sdk/ → resources/sdk，跑 27 条黄金向量
+pnpm exec tsc --noEmit      # 前端类型检查
+pnpm exec vite build        # 前端产物
 - `cargo test --workspace` — **120 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 43、命令层 44）
 ```
 
@@ -122,19 +122,20 @@ React (WebView2)  ──Tauri IPC──▶  OpenCardWright.exe (x64)
 | Rust | stable（本机 1.99.1） | 需要 `x86_64-pc-windows-msvc` |
 | **MSVC 生成工具** | VS Build Tools 2022 + VCTools + Windows 11 SDK | **必需**：没有 `link.exe` 连 `cargo check` 都跑不了 |
 | Node.js | ≥ 20（本机 26.13） | 前端与 Tauri CLI |
+| pnpm | 12.x（本机 12.18） | 前端包管理；`pnpm-workspace.yaml` 的 `allowBuilds: esbuild` 不要删（否则 install 报 `ERR_PNPM_IGNORED_BUILDS`） |
 | .NET Framework | 4.8（系统自带） | 编译与运行 SDK 组件需要 `csc.exe` |
 | WebView2 Runtime | 已随 Win11 预装 | Tauri 依赖 |
 
 ```powershell
-npm install
-npm run build:sdk      # 编译 ../sdk 并跑 selftest 门禁
-npm run tauri dev
+pnpm install
+pnpm build:sdk      # 编译 ../sdk 并跑 selftest 门禁
+pnpm tauri dev
 ```
 
 打包：
 
 ```powershell
-npm run tauri build    # 产出 NSIS 安装包
+pnpm tauri build    # 产出 NSIS 安装包
 ```
 
 - 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
@@ -168,7 +169,7 @@ CI 跑在 `windows-latest` 的 ASCII 路径下，不受影响。
 
 ```powershell
 $env:TEMP = "$PWD\.tmp"; $env:TMP = $env:TEMP
-npx vite build
+pnpm exec vite build
 ```
 
 **3. `tauri build` 打包阶段 `failed to bundle project: timeout: global`**
@@ -177,8 +178,8 @@ tauri-cli 自带的 NSIS 下载器在本机会超时（同样的 URL 用 PowerSh
 先预置工具链缓存，再打包：
 
 ```powershell
-npm run setup:nsis            # 下载 nsis-3.13 + nsis_tauri_utils.dll，按 Tauri 期望的层级摆好并校验 SHA1
-npm run tauri build           # 之后不再联网取 NSIS
+pnpm setup:nsis            # 下载 nsis-3.13 + nsis_tauri_utils.dll，按 Tauri 期望的层级摆好并校验 SHA1
+pnpm tauri build           # 之后不再联网取 NSIS
 ```
 
 > 目录层级是坑：工具链要解到 `%LOCALAPPDATA%\tauri\NSIS\` 下**直接一层**
@@ -191,8 +192,8 @@ npm run tauri build           # 之后不再联网取 NSIS
 `ERR_CONNECTION_REFUSED`，因为前端资源没有内嵌。发布/演示一律走：
 
 ```powershell
-npx tauri build --no-bundle   # 只出可执行文件，不打包
-npx tauri build               # 出安装包
+pnpm exec tauri build --no-bundle   # 只出可执行文件，不打包
+pnpm exec tauri build               # 出安装包
 ```
 
 `Cargo.toml` 里已经补了 `custom-protocol` feature；若确实要手工 `cargo build --release`，
@@ -234,8 +235,8 @@ fixtures/               CLI 输出样本（解析器测试用）
 
 ## 6. 已知限制（务必先读）
 
-1. **打包要先预置 NSIS**：`npm run tauri build` 的 NSIS 阶段会用 tauri-cli 自带下载器，
-   在本机会 `timeout: global`。先跑一次 `npm run setup:nsis`（幂等，已就绪会秒退），之后打包不再联网。
+1. **打包要先预置 NSIS**：`pnpm tauri build` 的 NSIS 阶段会用 tauri-cli 自带下载器，
+   在本机会 `timeout: global`。先跑一次 `pnpm setup:nsis`（幂等，已就绪会秒退），之后打包不再联网。
    实测产物 `OpenCardWright_0.1.0_x64-setup.exe` 1.96 MiB，静默安装后 `resources/sdk` 完整携带驱动。
 2. **图标是占位**：`src-tauri/icons/icon.ico` 是脚本生成的纯色图，发布前应换成正式图标。
 3. **未实现**：诊断包、发卡记录页与 CSV 导出、首启向导、初始房间导入、文件日志轮转（逐条见 `../plan/待办清单.md`）。
@@ -263,13 +264,13 @@ fixtures/               CLI 输出样本（解析器测试用）
 5. **别把窗口设成置顶**：截图/自动化脚本里用 `SetWindowPos(..., HWND_TOPMOST, ...)` 会把窗口黏在最前面，
    用户只能强关。需要在前台截图时用 `SetForegroundWindow` 就够了，不要动 `WS_EX_TOPMOST`。
 6. **写库失败要能回滚**：多步写库（如发卡记录 + 身份信息）先做校验再写，避免半条记录。
-7. **改前端走 `npm run tauri dev`**：Vite 会热更新（`[vite] hmr update ...`），不用重新打包；
+7. **改前端走 `pnpm tauri dev`**：Vite 会热更新（`[vite] hmr update ...`），不用重新打包；
    只有改 Rust 才会自动重编译+重启（约 10 秒），此时会话失效需重新登录。
 8. **看日志，不要看截图猜**：前端 `console.error/warn`、未捕获异常会经 `log_frontend` 转到后端，
    和后端日志一起打在终端（`[frontend][ERROR] ...`、`[guard] ...`、`[rust][PANIC] ...`）。
 9. **dev 时密码是 `Test12345`**：`import.meta.env.DEV` 下首启/登录页会预填，发布版为空。
 10. **串口用「索引」不是 COM 号**：驱动按 `index + 1` 打开串口，所以 **索引 2 = COM3**。
-    `npm run tauri dev` 崩溃若报 `EBUSY ... ~RF*.TMP`，是编辑器保存的临时文件被 Windows 短锁，
+    `pnpm tauri dev` 崩溃若报 `EBUSY ... ~RF*.TMP`，是编辑器保存的临时文件被 Windows 短锁，
     `vite.config.ts` 已把这些临时名加进 watch ignore。
 11. **改 Rust 源码前先停 dev**：tauri dev 的 cargo 在编译时会短暂占住源文件，
     这时保存会报 `ReplaceFileW EIO (Win32 1175)`。停掉 dev（或等编译结束）再改。
