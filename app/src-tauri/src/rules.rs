@@ -46,29 +46,12 @@ impl CardTier {
     }
 }
 
-/// 长有效期卡（月码段）发卡前必须输入的确认词。
+/// 是否属于长有效期卡（天数进入 `0xC0` 月码段）。
 ///
-/// 为什么要有这道门：卡刷一次门就会把该房间的"当前有效卡号"顶到三年后，
-/// 之后发的正常卡号比它小，会**被锁当成旧卡拒开**，只能给全部门锁刷复位卡才能恢复。
-pub const LONG_CONFIRM_WORD: &str = "顶高水位";
-
-/// 是否属于"会顶高水位"的长有效期卡（天数进入 `0xC0` 月码段）。
+/// 2026-11-08：**确认词机制已移除**（用户要求「水位功能整体移除」），
+/// 这里只保留判定，供 UI 做「长卡会长期占用该房间卡号」的提示，不再拦截发卡。
 pub fn needs_long_confirm(tier: CardTier, days: u16) -> bool {
     days > tier.max_simple_days()
-}
-
-/// 校验确认词。不需要确认的档位直接通过；需要时**必须**一字不差。
-pub fn check_long_confirm(tier: CardTier, days: u16, word: Option<&str>) -> Result<(), String> {
-    if !needs_long_confirm(tier, days) {
-        return Ok(());
-    }
-    if word.map(|w| w.trim()) == Some(LONG_CONFIRM_WORD) {
-        return Ok(());
-    }
-    Err(format!(
-        "{days} 天属于长有效期卡：刷一次门会把该房间的有效卡号顶到 {} 年后，之后正常卡全部失效，         只能用复位卡恢复。确认请原样输入「{LONG_CONFIRM_WORD}」",
-        (days as f32 / 365.0).ceil() as u16
-    ))
 }
 
 fn tiers_text() -> String {
@@ -157,26 +140,11 @@ mod tests {
         assert!(e.contains("90"), "应列出固定档位");
     }
     #[test]
-    fn long_confirm_required_only_beyond_simple_tier() {
+    fn long_tier_detected_only_beyond_simple_limit() {
         assert!(!needs_long_confirm(CardTier::Guest, 62));
         assert!(needs_long_confirm(CardTier::Guest, 90));
         assert!(!needs_long_confirm(CardTier::Master, 63));
         assert!(needs_long_confirm(CardTier::Master, 90));
-
-        assert!(check_long_confirm(CardTier::Guest, 62, None).is_ok());
-        assert!(check_long_confirm(CardTier::Guest, 90, None).is_err());
-        assert!(check_long_confirm(CardTier::Guest, 90, Some("顶高水位")).is_ok());
-        assert!(check_long_confirm(CardTier::Guest, 90, Some(" 顶高水位 ")).is_ok(), "允许首尾空格");
-        assert!(check_long_confirm(CardTier::Guest, 90, Some("顶高")).is_err());
-        assert!(check_long_confirm(CardTier::Guest, 1095, Some("顶高水位")).is_ok());
-    }
-
-    #[test]
-    fn long_confirm_message_explains_recovery() {
-        let msg = check_long_confirm(CardTier::Guest, 1095, None).unwrap_err();
-        assert!(msg.contains("复位卡"), "必须写清恢复手段：{msg}");
-        assert!(msg.contains("顶高水位"), "必须给出确认词：{msg}");
-        assert!(msg.contains("3 年"), "要写清顶到几年：{msg}");
     }
 
 }

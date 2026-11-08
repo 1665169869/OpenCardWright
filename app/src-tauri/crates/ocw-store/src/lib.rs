@@ -121,6 +121,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v7(conn)?;
     apply_v8(conn)?;
     apply_v9(conn)?;
+    apply_v10(conn)?;
     Ok(())
 }
 
@@ -140,7 +141,7 @@ pub struct BackupInfo {
 }
 
 /// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 把当前库**在线备份**到指定文件。
 ///
@@ -387,6 +388,27 @@ fn apply_v8(conn: &Connection) -> Result<()> {
 /// v8 → v9：预定状态加「checked_in」（已入住，TD-128）——发卡后自动消除预定信息，
 /// 保留记录且与「取消」区分。SQLite 不能修改 CHECK 约束，按官方流程建新表迁数据再换名；
 /// 幂等：库里的建表 SQL 已含 checked_in（新库）就只登记版本号。
+/// v10：身份证读卡扩展字段（有效期起止 / 签发机关 / 设备型号序列）。
+/// **头像 base64 不入库**，因此这里只加 5 个文本列；列已存在时跳过（幂等）。
+fn apply_v10(conn: &Connection) -> Result<()> {
+    let cols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('issuance') WHERE name = 'id_valid_from'",
+        [],
+        |r| r.get(0),
+    )?;
+    if cols == 0 {
+        conn.execute_batch(
+            "ALTER TABLE issuance ADD COLUMN id_valid_from TEXT;
+             ALTER TABLE issuance ADD COLUMN id_valid_to TEXT;
+             ALTER TABLE issuance ADD COLUMN id_authority TEXT;
+             ALTER TABLE issuance ADD COLUMN id_device_model TEXT;
+             ALTER TABLE issuance ADD COLUMN id_device_serial TEXT;",
+        )?;
+    }
+    conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (10)", [])?;
+    Ok(())
+}
+
 fn apply_v9(conn: &Connection) -> Result<()> {
     let ddl: Option<String> = conn
         .query_row(
@@ -1276,6 +1298,12 @@ pub struct GuestIdentity<'a> {
     pub address: Option<&'a str>,
     pub birth_date: Option<&'a str>,
     pub note: Option<&'a str>,
+    /// 身份证扩展字段（schema v10）。**头像不入库**。
+    pub id_valid_from: Option<&'a str>,
+    pub id_valid_to: Option<&'a str>,
+    pub id_authority: Option<&'a str>,
+    pub device_model: Option<&'a str>,
+    pub device_serial: Option<&'a str>,
 }
 
 impl GuestIdentity<'_> {
@@ -1288,6 +1316,11 @@ impl GuestIdentity<'_> {
             && self.address.is_none()
             && self.birth_date.is_none()
             && self.note.is_none()
+            && self.id_valid_from.is_none()
+            && self.id_valid_to.is_none()
+            && self.id_authority.is_none()
+            && self.device_model.is_none()
+            && self.device_serial.is_none()
     }
 }
 
@@ -1303,7 +1336,9 @@ pub fn update_guest_identity(
     conn.execute(
         "UPDATE issuance
             SET guest_name = ?2, guest_gender = ?3, guest_id_type = ?4, guest_id_number = ?5,
-                guest_nation = ?6, guest_address = ?7, guest_birth_date = ?8, guest_note = ?9
+                guest_nation = ?6, guest_address = ?7, guest_birth_date = ?8, guest_note = ?9,
+                id_valid_from = ?10, id_valid_to = ?11, id_authority = ?12,
+                id_device_model = ?13, id_device_serial = ?14
           WHERE id = ?1",
         params![
             issuance_id,
@@ -1315,6 +1350,11 @@ pub fn update_guest_identity(
             guest.address,
             guest.birth_date,
             guest.note,
+            guest.id_valid_from,
+            guest.id_valid_to,
+            guest.id_authority,
+            guest.device_model,
+            guest.device_serial,
         ],
     )?;
     Ok(())
@@ -2014,6 +2054,12 @@ pub struct IssuanceRow {
     pub checked_out_at: Option<String>,
     pub duration_ms: Option<i64>,
     pub raw_hex: Option<String>,
+    /// 身份证扩展字段（v10）；头像不入库
+    pub id_valid_from: Option<String>,
+    pub id_valid_to: Option<String>,
+    pub id_authority: Option<String>,
+    pub id_device_model: Option<String>,
+    pub id_device_serial: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2092,7 +2138,8 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
                 i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
                 i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
                 o.display_name,
-                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
+                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex,
+                i.id_valid_from, i.id_valid_to, i.id_authority, i.id_device_model, i.id_device_serial
            FROM issuance i
            LEFT JOIN operator o ON o.id = i.operator_id
            {where_sql}
@@ -2127,6 +2174,11 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
             checked_out_at: r.get(18)?,
             duration_ms: r.get(19)?,
             raw_hex: r.get(20)?,
+            id_valid_from: r.get(21)?,
+            id_valid_to: r.get(22)?,
+            id_authority: r.get(23)?,
+            id_device_model: r.get(24)?,
+            id_device_serial: r.get(25)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2203,7 +2255,8 @@ pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<I
                 i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
                 i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
                 o.display_name,
-                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex
+                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex,
+                i.id_valid_from, i.id_valid_to, i.id_authority, i.id_device_model, i.id_device_serial
            FROM issuance i LEFT JOIN operator o ON o.id = i.operator_id
           WHERE i.card_no = ?1
           ORDER BY i.created_at ASC, i.id ASC
@@ -2232,6 +2285,11 @@ pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<I
             checked_out_at: r.get(18)?,
             duration_ms: r.get(19)?,
             raw_hex: r.get(20)?,
+            id_valid_from: r.get(21)?,
+            id_valid_to: r.get(22)?,
+            id_authority: r.get(23)?,
+            id_device_model: r.get(24)?,
+            id_device_serial: r.get(25)?,
         })
     })?;
     let mut out = Vec::new();

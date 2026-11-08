@@ -56,6 +56,7 @@ export default function ReadCard() {
           <CardSnapshotView
             card={data.card}
             expiresAt={data.lookup.status === 'found' ? data.lookup.latest.expiresAt : null}
+            createdAt={data.lookup.status === 'found' ? data.lookup.latest.createdAt : null}
           />
           <RecordBanner lookup={data.lookup} />
         </Space>

@@ -15,10 +15,18 @@ pub struct RuntimeInfo {
 }
 
 pub fn data_root() -> PathBuf {
+    // 调试构建与正式安装包用**不同的数据目录**，避免 dev 调试把真实营业数据改坏：
+    //   cargo run / tauri dev  → %PROGRAMDATA%\OpenCardWright-dev\
+    //   安装包（release）      → %PROGRAMDATA%\OpenCardWright\
+    let dir_name = if cfg!(debug_assertions) {
+        "OpenCardWright-dev"
+    } else {
+        "OpenCardWright"
+    };
     std::env::var_os("PROGRAMDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("OpenCardWright")
+        .join(dir_name)
 }
 
 /// 按优先级列出可能的 SDK 目录。

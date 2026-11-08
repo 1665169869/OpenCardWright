@@ -1,4 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
+import { ReloadOutlined } from '@ant-design/icons'
+
+/** 证件有效期：`20231106` → `23年11月06日`（缺值显示 `—`） */
+function fmtIdDate(raw: string | null): string {
+  if (!raw) return '—'
+  const d = raw.replace(/[^0-9]/g, '')
+  if (d.length !== 8) return raw
+  return `${d.slice(2, 4)}年${d.slice(4, 6)}月${d.slice(6, 8)}日`
+}
 import {
   Alert,
   Button,
@@ -181,6 +190,9 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
             setPage(1)
           }}
         />
+        <Button icon={<ReloadOutlined />} onClick={() => void load()}>
+          刷新
+        </Button>
         <Button onClick={() => void load()}>查询</Button>
         {canAdmin ? (
           <Button type="primary" onClick={() => void doExport()}>
@@ -367,6 +379,9 @@ function CheckinTab() {
             setPage(1)
           }}
         />
+        <Button icon={<ReloadOutlined />} onClick={() => void load()}>
+          刷新
+        </Button>
         <Button onClick={() => void load()}>查询</Button>
         <Text type="secondary" style={{ fontSize: 12 }}>
           只显示发卡时填写了身份信息的记录；未填写的不计入入住记录
@@ -473,6 +488,11 @@ function CheckinTab() {
               { key: 'idNo', label: '证件号码', children: detail.guestIdNumber ?? '—' },
               { key: 'nation', label: '民族', children: detail.guestNation ?? '—' },
               { key: 'birth', label: '出生日期', children: detail.guestBirthDate ?? '—' },
+              { key: 'validFrom', label: '证件有效期起', children: fmtIdDate(detail.idValidFrom) },
+              { key: 'validTo', label: '证件有效期止', children: fmtIdDate(detail.idValidTo) },
+              { key: 'authority', label: '签发机关', children: detail.idAuthority ?? '—' },
+              { key: 'devModel', label: '读卡设备型号', children: detail.idDeviceModel ?? '—' },
+              { key: 'devSerial', label: '读卡设备序列', children: detail.idDeviceSerial ?? '—' },
               { key: 'addr', label: '住址', children: detail.guestAddress ?? '—' },
               { key: 'note', label: '备注', children: detail.guestNote ?? '—' },
               { key: 'at', label: '入住时间', children: formatTime(detail.createdAt) },

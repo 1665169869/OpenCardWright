@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Card, Descriptions, Input, Radio, Select, Space, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Checkbox, Descriptions, Input, Radio, Select, Space, Tag, Typography } from 'antd'
 import {
   api,
   dayOptions,
@@ -10,7 +10,6 @@ import {
   GENDERS,
   hourOptions,
   GUEST_MAX_DAYS,
-  LONG_CONFIRM_WORD,
   GUEST_MAX_HOURS,
   ID_TYPES,
   type GuestInput,
@@ -58,11 +57,11 @@ export default function IssueForm({
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<IssuedCard | null>(null)
   const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
-  /** 长有效期卡（>62 天）必须原样输入这个确认词 */
-  const [confirmWord, setConfirmWord] = useState('')
   /** 身份证读卡（TD-135）：独立设备，按钮 loading 与失败提示 */
   const [idBusy, setIdBusy] = useState(false)
   const [idError, setIdError] = useState<string | null>(null)
+  /** 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效 */
+  const [lost, setLost] = useState(false)
   /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数。
    *  TD-126：初值读「退房钟点」设置项（默认 12），只读展示，改配置去设置页。 */
   const [checkoutTime, setCheckoutTime] = useState('12:00')
@@ -72,9 +71,6 @@ export default function IssueForm({
       .then((h) => setCheckoutTime(`${String(h).padStart(2, '0')}:00`))
       .catch(() => {})
   }, [])
-  const needsLongConfirm = mode === 'day' && amount > GUEST_MAX_DAYS
-  const longConfirmed = !needsLongConfirm || confirmWord.trim() === LONG_CONFIRM_WORD
-
   const setGuestField = (key: keyof GuestInput, value: string) => {
     setGuest((prev) => ({ ...prev, [key]: value }))
   }
@@ -132,7 +128,7 @@ export default function IssueForm({
         duration,
         crypto.randomUUID(),
         guestHasInput ? guest : undefined,
-        needsLongConfirm ? confirmWord.trim() : null,
+        lost,
       )
       setResult(issued)
       setGuest({})
@@ -154,7 +150,7 @@ export default function IssueForm({
           type="primary"
           loading={loading}
           onClick={issue}
-          disabled={!room.active || !longConfirmed}
+          disabled={!room.active}
         >
           发卡
         </Button>
@@ -227,6 +223,9 @@ export default function IssueForm({
           <Button size="small" loading={idBusy} onClick={() => void onReadIdCard()}>
             读取身份证
           </Button>
+          <Checkbox checked={lost} onChange={(e) => setLost(e.target.checked)}>
+            挂失卡（让本房间在用卡失效）
+          </Checkbox>
         </Space>
         {idError ? (
           <Alert
@@ -306,28 +305,6 @@ export default function IssueForm({
             showIcon
             message={`${amount} 天会用月码编码（1 月 ≈ 31 天）`}
             description="锁端按 0xC0|月数 解释有效期；与软件逐字节一致，但实际到期日会是近似值。"
-          />
-        ) : null}
-
-        {needsLongConfirm ? (
-          <Alert
-            type="error"
-            showIcon
-            message={`${amount} 天是长有效期卡：刷一次门会把该房间水位顶到 ${Math.ceil(amount / 365)} 年后`}
-            description={
-              <Space direction="vertical" size={4} style={{ width: '100%' }}>
-                <Text>
-                  之后给这个房间发的新卡号比它小，门锁会当成旧卡拒开；只能给全部门锁各刷一次复位卡才恢复。
-                </Text>
-                <Input
-                  placeholder={`原样输入「${LONG_CONFIRM_WORD}」才能发卡`}
-                  value={confirmWord}
-                  onChange={(e) => setConfirmWord(e.target.value)}
-                  status={longConfirmed ? undefined : 'error'}
-                  style={{ maxWidth: 260 }}
-                />
-              </Space>
-            }
           />
         ) : null}
 

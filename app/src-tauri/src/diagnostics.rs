@@ -125,7 +125,9 @@ fn redact(path: &Path) -> Result<(), String> {
     let conn = Connection::open(path).map_err(|e| format!("打开副本失败：{e}"))?;
     conn.execute_batch(
         "UPDATE operator SET pwd_hash = 'redacted';
-         UPDATE issuance SET guest_id_number = NULL, guest_address = NULL;
+         UPDATE issuance SET guest_id_number = NULL, guest_address = NULL,
+             id_valid_from = NULL, id_valid_to = NULL, id_authority = NULL,
+             id_device_model = NULL, id_device_serial = NULL;
          PRAGMA journal_mode = DELETE;
          PRAGMA wal_checkpoint(TRUNCATE);
          VACUUM;",

@@ -199,7 +199,6 @@ fn main() {
             commands::rename_room_type,
             commands::delete_room_type,
             commands::set_room_type,
-            commands::set_room_max_cards,
             commands::set_room_type_color,
             commands::list_room_statuses,
             commands::update_room_status_style,

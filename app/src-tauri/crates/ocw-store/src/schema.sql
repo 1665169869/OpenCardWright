@@ -49,7 +49,13 @@ CREATE TABLE IF NOT EXISTS issuance (
     error_code      INTEGER,
     idempotency_key TEXT UNIQUE,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    duration_ms     INTEGER
+    duration_ms     INTEGER,
+    -- 身份证读取的扩展字段（v10）：这些项随发卡记录落库；头像 base64 **不入库**
+    id_valid_from    TEXT,
+    id_valid_to      TEXT,
+    id_authority     TEXT,
+    id_device_model  TEXT,
+    id_device_serial TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_issuance_card_no ON issuance (card_no);

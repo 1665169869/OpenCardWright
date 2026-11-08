@@ -30,7 +30,6 @@ import {
   isAdmin,
   type AppInfo,
   type AuthStatus,
-  type CardNoStatus,
   type ExpiringCard,
   type ReminderSettings,
 } from './api'
@@ -61,7 +60,6 @@ export default function App() {
   const [infoLoading, setInfoLoading] = useState(true)
   /** 设备可用性：null = 还没有结果；先由 appInfo 快判，再由后台 probePorts 覆盖 */
   const [deviceOk, setDeviceOk] = useState<boolean | null>(null)
-  const [status, setStatus] = useState<CardNoStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   // 房间列表的版本号：房间页一变就 +1，让发卡页/管理卡页重新拉列表
   const [roomsVersion, setRoomsVersion] = useState(0)
@@ -94,13 +92,6 @@ export default function App() {
       .catch((e: unknown) => setBootError(describeError(e)))
   }, [])
 
-  const refreshStatus = useCallback(() => {
-    api
-      .cardNoStatus()
-      .then(setStatus)
-      .catch(() => setStatus(null))
-  }, [])
-
   const refreshInfo = useCallback(() => {
     setInfoLoading(true)
     api
@@ -120,8 +111,7 @@ export default function App() {
         setDeviceOk(false)
       })
       .finally(() => setInfoLoading(false))
-    refreshStatus()
-  }, [refreshStatus])
+  }, [])
 
   const loggedIn = auth?.loggedIn === true
   useEffect(() => {
@@ -213,15 +203,13 @@ export default function App() {
 
   const onRoomsChanged = useCallback(() => {
     setRoomsVersion((v) => v + 1)
-    refreshStatus()
-  }, [refreshStatus])
+  }, [])
 
   const logout = async () => {
     try {
       const next = await api.logout()
       setAuth(next)
       setInfo(null)
-      setStatus(null)
       // 换账号后同一张卡要能再播一次，否则"上一个前台看过就不再提醒"
       alerted.current.clear()
       setReminders([])
@@ -285,7 +273,6 @@ export default function App() {
           <AdminCards
             roomsVersion={roomsVersion}
             onChanged={() => {
-              refreshStatus()
               refreshInfo()
             }}
           />
@@ -299,8 +286,6 @@ export default function App() {
           <Settings
             onChanged={() => {
               refreshInfo()
-              // 水位警戒线、退房后房态这些设置改完，顶部的状态条要跟着变
-              refreshStatus()
               // 房型标签颜色、房态图标颜色改完，房间页要立刻重画，不能等手动刷新
               setSettingsVersion((v) => v + 1)
               api
@@ -352,22 +337,6 @@ export default function App() {
 
         <Space size="middle">
           <ExpiryBell items={reminders} />
-          <Text
-            style={{
-              fontSize: 12,
-              color:
-                status?.level === 'blocked'
-                  ? '#cf1322'
-                  : status?.level === 'warn'
-                    ? '#d46b08'
-                    : undefined,
-              fontWeight: status && status.level !== 'normal' ? 600 : undefined,
-            }}
-            type={status && status.level !== 'normal' ? undefined : 'secondary'}
-          >
-            水位 {status ? formatCardNo(status.current) : '—'}
-            {status ? ` / 警戒 ${formatCardNo(status.warnAt)}` : ''}
-          </Text>
           <Text type="secondary" style={{ fontSize: 12 }}>
             驱动 {info?.driverSha256 ? info.driverSha256.slice(0, 12).toLowerCase() : '未识别'}
           </Text>
@@ -402,24 +371,6 @@ export default function App() {
             style={{ marginBottom: 16 }}
             message="当前是前台账号"
             description="可以读卡、发客卡、查记录；管理卡、房间维护、设备设置需要管理员账号。"
-          />
-        ) : null}
-
-        {status && status.level !== 'normal' ? (
-          <Alert
-            type={status.level === 'blocked' ? 'error' : 'warning'}
-            showIcon
-            style={{ marginBottom: 16 }}
-            message={
-              status.level === 'blocked'
-                ? `卡号水位已到 ${formatCardNo(status.current)}，已停止发客卡`
-                : `卡号水位已过警戒线 ${formatCardNo(status.warnAt)}（当前 ${formatCardNo(status.current)}）`
-            }
-            description={
-              status.level === 'blocked'
-                ? '继续发卡会让部分旧卡被锁拒开。请先给全部门锁各刷一次复位卡，然后到「设置 → 水位」重置到低位。'
-                : '请给全部门锁各刷一次复位卡（把各房的有效卡号归零），然后到「设置 → 水位」把水位重置到低位；没刷复位就拨低，新卡会被锁当成旧卡拒开。'
-            }
           />
         ) : null}
 

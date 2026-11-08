@@ -4,7 +4,6 @@ import {
   Button,
   Card,
   ColorPicker,
-  Descriptions,
   Input,
   InputNumber,
   Modal,
@@ -36,7 +35,6 @@ import { confirmIssue, passwordIssues } from '../utils/password'
 import { loginIssue, textIssue } from '../utils/validate'
 import { ICON_CHOICES, statusIcon } from '../components/StatusIcon'
 import type { RoomStatus } from '../api'
-import type { CardNoStatus } from '../api'
 
 const { Text, Paragraph } = Typography
 
@@ -53,7 +51,6 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
           { key: 'operators', label: '用户', children: <OperatorPanel onChanged={onChanged} /> },
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
           { key: 'roomstatus', label: '房态', children: <RoomStatusPanel onChanged={onChanged} /> },
-          { key: 'water', label: '水位', children: <WaterPanel onChanged={onChanged} /> },
           { key: 'rooms', label: '房间', children: <RoomsPanel onChanged={onChanged} /> },
           { key: 'backup', label: '备份', children: <BackupPanel onChanged={onChanged} /> },
         ]}
@@ -968,184 +965,6 @@ function RoomStatusPanel({ onChanged }: { onChanged?: () => void }) {
       <Text type="secondary">
         房态用途固定，只改外观；房间卡片、筛选和退房都会用这里的颜色与图标。
       </Text>
-    </Space>
-  )
-}
-
-// ---------------------------------------------------------------- 水位
-
-/**
- * 卡号水位（全局统一）。
- *
- * 水位 = max(本地已发最大卡号, CardNo.state)。到警戒线就该给**全部**门锁刷一次复位卡，
- * 然后在这里把水位拨回低位；锁里的高水位是每房独立的，没刷复位就拨低会让新卡被拒开。
- */
-function WaterPanel({ onChanged }: { onChanged?: () => void }) {
-  const [st, setSt] = useState<CardNoStatus | null>(null)
-  const [warnAt, setWarnAt] = useState('E000')
-  const [startAt, setStartAt] = useState('2403')
-  const [busy, setBusy] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
-  const [msg, setMsg] = useState<string | null>(null)
-  const [confirmReset, setConfirmReset] = useState(false)
-
-  const hex = (v: number | null) => (v === null ? '—' : `0x${v.toString(16).toUpperCase().padStart(4, '0')}`)
-
-  const reload = useCallback(async () => {
-    try {
-      const s = await api.cardNoStatus()
-      setSt(s)
-      setWarnAt(s.warnAt.toString(16).toUpperCase().padStart(4, '0'))
-    } catch (e) {
-      setErr(describeError(e))
-    }
-  }, [])
-
-  useEffect(() => {
-    void reload()
-  }, [reload])
-
-  const saveWarn = async () => {
-    setBusy(true)
-    setErr(null)
-    setMsg(null)
-    try {
-      const s = await api.setWaterWarnAt(warnAt)
-      setSt(s)
-      setMsg(`警戒线已设为 ${hex(s.warnAt)}`)
-      // 主界面顶部的"水位/警戒"和告警条也要跟着刷新
-      onChanged?.()
-    } catch (e) {
-      setErr(describeError(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const doReset = async () => {
-    setConfirmReset(false)
-    setBusy(true)
-    setErr(null)
-    setMsg(null)
-    try {
-      const s = await api.resetWaterMark(startAt)
-      setSt(s)
-      setMsg(`水位已重置为 ${hex(s.current)}。如果还没给全部门锁刷复位卡，请马上补齐。`)
-      onChanged?.()
-    } catch (e) {
-      setErr(describeError(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (!st) return <Text type="secondary">加载中…</Text>
-
-  return (
-    <Space direction="vertical" size="middle" style={{ width: '100%' }}>
-      <Descriptions
-        size="small"
-        column={3}
-        items={[
-          { key: 'cur', label: '当前水位', children: <b>{hex(st.current)}</b> },
-          { key: 'warn', label: '警戒线', children: hex(st.warnAt) },
-          { key: 'block', label: '阻断线', children: hex(st.blockAt) },
-          {
-            key: 'state',
-            label: 'CardNo.state',
-            children: `${hex(st.stateFile)}（SDK 计数器）`,
-          },
-          { key: 'max', label: '已发最大号', children: `${hex(st.maxIssued)}（发卡流水）` },
-          {
-            key: 'rule',
-            label: '口径',
-            children: <Text type="secondary">以计数器为准，历史号仅参考</Text>,
-          },
-        ]}
-      />
-
-      {st.maxIssued !== null && st.current !== null && st.maxIssued > st.current ? (
-        <Alert
-          type="warning"
-          showIcon
-          message={`发卡流水里有比计数器更大的卡号（${hex(st.maxIssued)} > ${hex(st.current)}）`}
-          description="多半是导入/测试数据插进来的号，也可能是有卡被写到更大的号段。水位不按它算，但如果这些卡真的在锁上用过，请确认对应房间的高水位。"
-        />
-      ) : null}
-
-      <Alert
-        type={st.level === 'blocked' ? 'error' : st.level === 'warn' ? 'warning' : 'success'}
-        showIcon
-        message={
-          st.level === 'blocked'
-            ? '水位已到阻断线：客卡停发，只能发管理卡'
-            : st.level === 'warn'
-              ? '水位已过警戒线：请给全部门锁刷一次复位卡，然后重置水位'
-              : '水位正常'
-        }
-        description={
-          st.level === 'normal'
-            ? `距离警戒线还有 ${st.current === null ? '—' : st.warnAt - st.current} 个号。`
-            : '锁里的高水位是按房间各自记的：只拨低软件水位而不刷复位卡，新卡会被那些锁当成旧卡拒开。'
-        }
-      />
-
-      {msg ? <Alert type="success" showIcon message={msg} /> : null}
-      {err ? <Alert type="error" showIcon message={err} /> : null}
-
-      <Space wrap align="end">
-        <div>
-          <Text type="secondary">警戒线（十六进制）</Text>
-          <Input
-            style={{ width: 140, display: 'block', marginTop: 4 }}
-            value={warnAt}
-            onChange={(e) => setWarnAt(e.target.value)}
-            placeholder="E000"
-          />
-        </div>
-        <Button type="primary" loading={busy} onClick={saveWarn}>
-          保存警戒线
-        </Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          到这条线开始提醒；上限 FF00，到 FF00 客卡就停发了。
-        </Text>
-      </Space>
-
-      <Space wrap align="end">
-        <div>
-          <Text type="secondary">重置为（十六进制）</Text>
-          <Input
-            style={{ width: 140, display: 'block', marginTop: 4 }}
-            value={startAt}
-            onChange={(e) => setStartAt(e.target.value)}
-            placeholder="2403"
-          />
-        </div>
-        <Button danger onClick={() => setConfirmReset(true)}>
-          重置水位
-        </Button>
-        <Text type="secondary" style={{ fontSize: 12 }}>
-          只在给全部门锁刷完复位卡之后才做。
-        </Text>
-      </Space>
-
-      <Modal
-        open={confirmReset}
-        title="确认重置水位？"
-        okText="我已刷完全部锁，重置"
-        okButtonProps={{ danger: true }}
-        cancelText="取消"
-        onOk={doReset}
-        onCancel={() => setConfirmReset(false)}
-      >
-        <p>
-          把卡号计数器从 <b>{hex(st.current)}</b> 拨回 <b>0x{startAt.toUpperCase()}</b>。
-        </p>
-        <p style={{ color: '#cf1322' }}>
-          前提：**每一把门锁**都已经刷过复位卡（复位卡会把该房的"当前有效卡号"归零）。
-          没刷就拨低，新发的卡号比锁里记的小，那些锁会直接拒开。
-        </p>
-      </Modal>
     </Space>
   )
 }

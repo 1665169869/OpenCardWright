@@ -94,6 +94,10 @@ export function CheckoutCardModal({
    */
   const blockReason: string | null = (() => {
     if (!card) return '还没有读卡：请先把卡放到读卡器上，再点「读卡」'
+    // 读卡退房只处理客卡（日租 / 钟点）；管理卡会被擦成空白，破坏仍需在场的开门工具
+    if (card.kind !== 'guestDay' && card.kind !== 'guestHour') {
+      return `这张卡是「${card.kindLabel}」，读卡退房只处理日租/钟点客卡`
+    }
     if (cardNo === null) return `这张卡没有卡号（${card.kindLabel}），不能用读卡退房`
     if (!belongsToTarget && target) {
       return `这张卡属于 ${card.room ?? `序号 ${card.roomIndex}`}，不是 ${target.roomNo} 房`
@@ -207,6 +211,7 @@ export function CheckoutCardModal({
               <CardSnapshotView
                 card={card}
                 expiresAt={lookup?.status === 'found' ? lookup.latest.expiresAt : null}
+                createdAt={lookup?.status === 'found' ? lookup.latest.createdAt : null}
               />
               {recordText ? (
                 <Text type="secondary" style={{ fontSize: 12 }}>

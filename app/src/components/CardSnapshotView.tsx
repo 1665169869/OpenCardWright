@@ -1,5 +1,5 @@
 import { Alert, Card, Descriptions, Divider, Tag, Typography } from 'antd'
-import { formatCardNo, formatExpiry, type CardSnapshot } from '../api'
+import { formatCardNoText, formatExpiry, type CardSnapshot } from '../api'
 
 const { Text, Paragraph } = Typography
 
@@ -15,9 +15,13 @@ const { Text, Paragraph } = Typography
 export function CardSnapshotView({
   card,
   expiresAt,
+  createdAt,
 }: {
   card: CardSnapshot
+  /** 本地发卡记录里的到期时间；没有记录时由卡内数据推算 */
   expiresAt?: string | null
+  /** 本地发卡记录里的发卡时间；没有记录时用卡内的发卡时刻 */
+  createdAt?: string | null
 }) {
   const duration =
     card.days > 0 ? `${card.days} 天` : card.hours > 0 ? `${card.hours} 小时` : '—'
@@ -32,6 +36,40 @@ export function CardSnapshotView({
 
   const abnormal = card.rawHex.length !== 56
 
+  /**
+   * 卡内有效期：**完全由卡内数据算**（发卡时刻 + 时长码），与数据库里的 expires_at 无关。
+   * 发卡时刻 = 页2[3] 的年月 + 卡号的「日/时」；时长 = 页2[0] 解出的 days / hours。
+   * 月数卡（0xC_ 段）的 days 是「月数×30」的近似，这里照此推算并标注。
+   */
+  const cardValidText = (() => {
+    const hi = (card.cardYm >> 4) & 0x0f
+    const month = card.cardYm & 0x0f
+    if (month < 1 || month > 12) return '—'
+    if (card.issueDay < 1 || card.issueHour < 0) return '—'
+    if (card.days <= 0 && card.hours <= 0) return '—'
+    const nowYear = new Date().getFullYear()
+    const base = 2000 + 16 * Math.floor((nowYear - 2000) / 16)
+    const start = new Date(base + hi, month - 1, card.issueDay, card.issueHour, 0, 0)
+    const end =
+      card.hours > 0
+        ? new Date(start.getTime() + card.hours * 3600_000)
+        : new Date(start.getTime() + card.days * 86400_000)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    const text = `${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())} ${pad(end.getHours())}:${pad(end.getMinutes())}`
+    return card.days > 63 ? `${text}（按月数近似）` : text
+  })()
+
+  /** 卡内入住时刻：页2[3] 的年月 + 卡号里的日/时，格式 `YYYY-MM-DD HH:00` */
+  const cardCheckInText = (() => {
+    const hi = (card.cardYm >> 4) & 0x0f
+    const month = card.cardYm & 0x0f
+    if (month < 1 || month > 12 || card.issueDay < 1 || card.issueHour < 0) return null
+    const nowYear = new Date().getFullYear()
+    const base = 2000 + 16 * Math.floor((nowYear - 2000) / 16)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    return `${base + hi}-${pad(month)}-${pad(card.issueDay)} ${pad(card.issueHour)}:00`
+  })()
+
   return (
     <Card type="inner" title="卡片数据" extra={<Tag color="blue">{card.kindLabel}</Tag>}>
       <Descriptions
@@ -40,8 +78,20 @@ export function CardSnapshotView({
         items={[
           { key: 'kind', label: '卡型', children: card.kindLabel },
           { key: 'room', label: '房号', children: roomText },
-          { key: 'duration', label: '有效期', children: expiry ? `${duration} · ${expiry}` : duration },
-          { key: 'cardNo', label: '卡号', children: formatCardNo(card.cardNo) },
+          { key: 'duration', label: '有效期', children: duration },
+          // 库里有记录就用库的，没有记录就按卡内数据推算
+          { key: 'expire', label: '到期时间', children: expiry ?? cardValidText ?? '—' },
+          {
+            key: 'checkIn',
+            label: '入住时间',
+            children: formatExpiry(createdAt) ?? cardCheckInText ?? '—',
+          },
+          { key: 'cardNo', label: '卡号', children: formatCardNoText(card) },
+          {
+            key: 'lost',
+            label: '挂失',
+            children: card.isLost ? <Tag color="red">挂失卡</Tag> : '否',
+          },
         ]}
       />
 

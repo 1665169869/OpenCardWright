@@ -69,6 +69,8 @@ impl SimDevice {
         hours: u16,
         // 复用卡号（TD-127）：Some 时构包器用 `--serial` 指定卡号、不推进计数器
         serial: Option<u16>,
+        // 挂失卡（TD-150）：页1[2] 低 4 位 = 1
+        lost: bool,
     ) -> Option<Result<CardSnapshot, DeviceError>> {
         let dir = self.runtime.as_ref()?;
         let exe = dir.join("OCWCardBuild.exe");
@@ -86,6 +88,9 @@ impl SimDevice {
             .arg(room_index.to_string());
         if let Some(s) = serial {
             cmd.arg("--serial").arg(format!("{s:04X}"));
+        }
+        if lost {
+            cmd.arg("--lost");
         }
         if hours > 0 {
             cmd.arg("--hours").arg(hours.to_string());

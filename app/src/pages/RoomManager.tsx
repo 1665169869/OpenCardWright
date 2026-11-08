@@ -127,7 +127,6 @@ export default function RoomManager({
   // 抽屉里的房间
   const [active, setActiveRoom] = useState<Room | null>(null)
   const [editTypeId, setEditTypeId] = useState<number | null>(null)
-  const [editMax, setEditMax] = useState<number | null>(null)
   const [savingEdit, setSavingEdit] = useState(false)
   // 改房号（房间显示名称）是独立动作：序号不变，房号不能与其它房间重复
   const [editRoomNo, setEditRoomNo] = useState('')
@@ -440,7 +439,6 @@ export default function RoomManager({
   const openRoom = (room: Room) => {
     setActiveRoom(room)
     setEditTypeId(room.roomTypeId)
-    setEditMax(room.maxCards)
     setEditRoomNo(room.roomNo)
     setRenameErr(null)
     setRenameOk(null)
@@ -577,9 +575,6 @@ export default function RoomManager({
     try {
       if (editTypeId !== active.roomTypeId) {
         await api.setRoomType(active.roomNo, editTypeId)
-      }
-      if ((editMax ?? null) !== (active.maxCards ?? null)) {
-        await api.setRoomMaxCards(active.roomNo, editMax ?? null)
       }
       setNotice(`${active.roomNo} 的房间参数已保存`)
       await reload()
@@ -998,8 +993,6 @@ export default function RoomManager({
               {visible.map((room) => {
                 const st = statusOf(room.status)
                 const color = st?.color ?? '#8c8c8c'
-                const overLimit =
-                  room.maxCards !== null && room.activeCards >= room.maxCards
                 const isSelected = selected.includes(room.roomNo)
                 return (
                   <Dropdown
@@ -1069,9 +1062,8 @@ export default function RoomManager({
 
                       <Text type="secondary" style={{ fontSize: 12 }}>
                         序号 {room.roomIndex} · 有效卡{' '}
-                        <Text style={{ fontSize: 12, color: overLimit ? '#cf1322' : '#595959' }} strong>
+                        <Text style={{ fontSize: 12, color: '#595959' }} strong>
                           {room.activeCards}
-                          {room.maxCards === null ? '' : `/${room.maxCards}`}
                         </Text>
                       </Text>
 
@@ -1198,17 +1190,6 @@ export default function RoomManager({
                     value={editTypeId ?? undefined}
                     onChange={(v) => setEditTypeId(typeof v === 'number' ? v : null)}
                     options={typeOptions}
-                  />
-                </div>
-                <div>
-                  <Text type="secondary">最大发卡数</Text>
-                  <InputNumber
-                    style={{ width: 150, display: 'block', marginTop: 4 }}
-                    min={1}
-                    max={99}
-                    placeholder="不限"
-                    value={editMax ?? undefined}
-                    onChange={(v) => setEditMax(typeof v === 'number' ? v : null)}
                   />
                 </div>
                 <Button loading={savingEdit} onClick={saveParams}>

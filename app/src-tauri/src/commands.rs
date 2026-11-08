@@ -608,14 +608,8 @@ pub async fn issue_admin_card(
     state: State<'_, AppState>,
     request: AdminCardRequest,
     confirm: bool,
-    // 总控卡长有效期（>63 天）的确认词
-    confirm_long: Option<String>,
 ) -> Result<IssuedDto, CommandError> {
     let me = require_admin(&state)?;
-    if let AdminCardRequest::Master { days: Some(d), hours: None } = &request {
-        rules::check_long_confirm(CardTier::Master, *d, confirm_long.as_deref())
-            .map_err(|m| CommandError::new(1, m, "总控卡长有效期要先确认水位后果"))?;
-    }
     if !confirm {
         return Err(CommandError::new(
             1,
@@ -910,6 +904,28 @@ pub async fn card_no_status(state: State<'_, AppState>) -> Result<CardNoStatus, 
 // ---------------------------------------------------------------- 发客卡
 
 fn snapshot_from_record(rec: &IssuanceRecord, room: &Room) -> CardSnapshot {
+    let raw_hex = rec.raw_hex.clone().unwrap_or_default();
+    let card_no = rec.card_no.and_then(|v| u16::try_from(v).ok());
+    // 页1[2] 低 4 位 = 挂失（TD-150）；与 ocw_device::parse 的解码口径一致
+    let is_lost = raw_hex.len() >= 6
+        && u8::from_str_radix(&raw_hex[4..6], 16)
+            .map(|b| b & 0x0F != 0)
+            .unwrap_or(false);
+    // 页2[3] = 年(高4位)+月(低4位)；与 ocw_device::parse 同一口径
+    let card_ym = if raw_hex.len() >= 16 {
+        u8::from_str_radix(&raw_hex[14..16], 16).unwrap_or(0)
+    } else {
+        0
+    };
+    // 卡号 = 日(5) + 时(5) + 小时内序号(6)
+    let (issue_day, issue_hour, issue_seq) = match card_no {
+        Some(n) => (
+            ((n >> 11) & 0x1F) as i32,
+            ((n >> 6) & 0x1F) as i32,
+            (n & 0x3F) as i32,
+        ),
+        None => (-1, -1, -1),
+    };
     CardSnapshot {
         kind: CardKind::from_label(&rec.kind),
         kind_label: rec.kind.clone(),
@@ -917,8 +933,13 @@ fn snapshot_from_record(rec: &IssuanceRecord, room: &Room) -> CardSnapshot {
         room_index: room.room_index as i32,
         days: rec.days as i32,
         hours: rec.hours as i32,
-        card_no: rec.card_no.and_then(|v| u16::try_from(v).ok()),
-        raw_hex: rec.raw_hex.clone().unwrap_or_default(),
+        card_no,
+        card_ym,
+        is_lost,
+        issue_day,
+        issue_hour,
+        issue_seq,
+        raw_hex,
     }
 }
 
@@ -982,6 +1003,13 @@ pub struct GuestInput {
     pub address: Option<String>,
     pub birth_date: Option<String>,
     pub note: Option<String>,
+    /// 身份证扩展字段（schema v10）：有效期起止 / 签发机关 / 设备型号序列。
+    /// **头像 base64 不入库**，前端解析后就丢弃。
+    pub id_valid_from: Option<String>,
+    pub id_valid_to: Option<String>,
+    pub id_authority: Option<String>,
+    pub device_model: Option<String>,
+    pub device_serial: Option<String>,
 }
 
 /// 去掉首尾空白、空串转 None、限制长度（防止一次粘贴几 MB 进库）。
@@ -1005,8 +1033,8 @@ pub async fn issue_guest(
     hours: Option<u16>,
     idempotency_key: String,
     guest: Option<GuestInput>,
-    // 长有效期卡（>62 天）的确认词，必须原样等于「顶高水位」；普通档位可不传
-    confirm_long: Option<String>,
+    // 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效
+    lost: Option<bool>,
 ) -> Result<IssuedDto, CommandError> {
     let me = require_login(&state)?;
     let (use_days, amount) = match (days, hours) {
@@ -1014,8 +1042,6 @@ pub async fn issue_guest(
             rules::validate_days(CardTier::Guest, d).map_err(|m| {
                 CommandError::new(1, m, "客卡超过 62 天的有效期请从固定档位（90/120/…）选择")
             })?;
-            rules::check_long_confirm(CardTier::Guest, d, confirm_long.as_deref())
-                .map_err(|m| CommandError::new(1, m, "长有效期卡要先确认水位后果"))?;
             (true, d)
         }
         (None, Some(h)) => {
@@ -1039,7 +1065,6 @@ pub async fn issue_guest(
 
     let device = state.device();
     let db = state.db.clone();
-    let state_path = state.runtime_dir.join("CardNo.state");
     let room_no = room_no.trim().to_string();
 
     // 身份信息只存库，长度做个上限，避免误粘贴
@@ -1052,6 +1077,12 @@ pub async fn issue_guest(
     let g_address = clip(&g.address, 200);
     let g_birth_date = clip(&g.birth_date, 10);
     let g_note = clip(&g.note, 500);
+    // 身份证扩展字段（v10）；头像不入库
+    let g_id_valid_from = clip(&g.id_valid_from, 10);
+    let g_id_valid_to = clip(&g.id_valid_to, 10);
+    let g_id_authority = clip(&g.id_authority, 100);
+    let g_device_model = clip(&g.device_model, 64);
+    let g_device_serial = clip(&g.device_serial, 64);
 
     blocking(move || {
         // 1) 幂等回放：同一个键已经发过，直接把上次结果还回去
@@ -1083,65 +1114,23 @@ pub async fn issue_guest(
             ));
         }
 
-        // 房间级发卡上限：看还剩几个名额，再动卡
-        if let Some(max) = room.max_cards {
-            let active = {
-                let conn = lock_db(&db)?;
-                ocw_store::count_active_cards(&conn, &room_no)?
-            };
-            if active >= max {
-                eprintln!(
-                    "[guard] {room_no} 房已达最大发卡数 {max}（当前有效 {active} 张），拒绝发卡"
-                );
-                return Err(CommandError::new(
-                    409,
-                    format!("{room_no} 房当前有效客卡 {active} 张，已达上限 {max} 张"),
-                    "等旧卡过期，或到房间页调大「最大发卡数」",
-                ));
-            }
-        }
+        // 注：房间级「最大发卡数」与「同房复用首卡卡号」逻辑已于 2026-11-08 移除
+        //（用户要求：同房间发多张卡各自用新卡号，靠锁的卡号水位自然区分；
+        //  让旧卡失效请用「挂失卡」，两套机制互不替代）。
 
-        // 3) 水位闸门
-        let status = compute_status(&db, &state_path)?;
-        if status.level == WaterLevel::Blocked {
-            return Err(CommandError::new(
-                6,
-                "卡号水位已超过 0xFF00，已停止发客卡",
-                "请在空房时段按「复位作业向导」逐锁刷复位卡，再继续发卡",
-            ));
-        }
-
-        // 同房第二张卡复用有效首卡序号（TD-127，已实测：同号刷门会刷新锁内有效期）：
-        // 首卡仍在有效期内且未到上限 → 复用它的卡号构包（不推进 CardNo.state），
-        // 第一张卡不会被顶掉；上限口径用 count_active_cards（DISTINCT 卡号，同号合并计一张）。
-        let reuse_serial: Option<u16> = {
-            let conn = lock_db(&db)?;
-            match ocw_store::latest_active_guest_card(&conn, &room_no)? {
-                Some(rec) => {
-                    let active = ocw_store::count_active_cards(&conn, &room_no)?;
-                    let within_limit = room.max_cards.map_or(true, |max| active < max);
-                    if within_limit {
-                        rec.card_no.map(|n| n as u16)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
-        };
+        // 3) 水位闸门已移除（2026-11-08）：卡号改成「时刻 + 本小时序号」后不会再触顶
+        //    （旧逻辑是卡号逼近 0xFF00 时拒发），`CardNo.state` 保留仅用于算「本小时第几张」。
 
         // 4) 写卡前统一先读卡：确认卡在机器上，并记录原卡信息
         pre_read_card(&device)?;
 
-        // 4) 发卡（设备调用期间不持锁）
+        // 4) 发卡（设备调用期间不持锁）；每张新卡都取新卡号（不再复用首卡卡号）
         let started = Instant::now();
         let amount_text = amount.to_string();
         let flag = if use_days { "--days" } else { "--hours" };
-        let serial_text = reuse_serial.map(|n| format!("{n:04X}"));
         let mut args: Vec<&str> = vec!["--room", room_no.as_str(), flag, amount_text.as_str()];
-        if let Some(s) = serial_text.as_deref() {
-            args.push("--serial");
-            args.push(s);
+        if lost.unwrap_or(false) {
+            args.push("--lost");
         }
         // 模拟设备会离线构包并推进 CardNo.state；真机返回 None，继续走 CLI
         let card = match device.sim_issue_guest(
@@ -1149,7 +1138,8 @@ pub async fn issue_guest(
             &room_no,
             if use_days { amount } else { 0 },
             if use_days { 0 } else { amount },
-            reuse_serial,
+            None,
+            lost.unwrap_or(false),
         ) {
             Some(res) => res?,
             None => device.issue(&args, Some(room.room_index))?,
@@ -1187,21 +1177,21 @@ pub async fn issue_guest(
                     address: g_address.as_deref(),
                     birth_date: g_birth_date.as_deref(),
                     note: g_note.as_deref(),
+                    id_valid_from: g_id_valid_from.as_deref(),
+                    id_valid_to: g_id_valid_to.as_deref(),
+                    id_authority: g_id_authority.as_deref(),
+                    device_model: g_device_model.as_deref(),
+                    device_serial: g_device_serial.as_deref(),
                 },
             )?;
             let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
                 .and_then(|r| r.expires_at);
 
-            // 6) 发卡成功后同步房态（TD-115）：空净房 / 预定房 → 未满房；
-            //    设了上限且有效卡已到顶 → 已满房。维修 / 其他 / 已满 不动。
+            // 6) 发卡成功后同步房态（TD-115）：空净房 / 预定房 → 未满房。
+            //    维修 / 其他 / 已满 不动；「已满房」不再按发卡数自动判定（最大发卡数已移除，改人工维护）。
             //    只在成功分支执行 —— 写卡失败保持原房态。
             if matches!(room.status.as_str(), "vacant_clean" | "reserved") {
-                let active_after = ocw_store::count_active_cards(&conn, &room_no)?;
-                let new_status = match room.max_cards {
-                    Some(max) if active_after >= max => "occupied_full",
-                    _ => "occupied_partial",
-                };
-                ocw_store::set_room_status(&conn, &room_no, new_status)?;
+                ocw_store::set_room_status(&conn, &room_no, "occupied_partial")?;
             }
 
             // 7) 发卡即入住（TD-128）：把该房覆盖今天的有效预定标为「已入住」——
@@ -1409,31 +1399,6 @@ pub async fn set_room_type(
             "set_room_type",
             Some(&room_no),
             Some(&format!("roomTypeId={room_type_id:?}")),
-            "ok",
-            Some(me.operator_id),
-        );
-        Ok(())
-    })
-    .await
-}
-
-/// 修改房间参数：最多同时有效的客卡数（`None` = 不限）。
-#[tauri::command]
-pub async fn set_room_max_cards(
-    state: State<'_, AppState>,
-    room_no: String,
-    max_cards: Option<i64>,
-) -> Result<(), CommandError> {
-    let me = require_admin(&state)?;
-    let db = state.db.clone();
-    blocking(move || {
-        let conn = lock_db(&db)?;
-        ocw_store::set_room_max_cards(&conn, &room_no, max_cards)?;
-        let _ = ocw_store::record_audit(
-            &conn,
-            "set_room_max_cards",
-            Some(&room_no),
-            Some(&format!("maxCards={max_cards:?}")),
             "ok",
             Some(me.operator_id),
         );
@@ -2071,6 +2036,15 @@ pub async fn checkout_card(
             let _ = device.erase_card();
         } else {
             let on_card = device.read_card()?;
+            // 读卡退房**只处理客卡**（日租 / 钟点）；管理卡（总控/复位/清除/安装/校时）不走退房流程，
+            // 否则会把卡擦成空白，破坏仍需在场的开门工具。
+            if !matches!(on_card.kind, CardKind::GuestDay | CardKind::GuestHour) {
+                return Err(CommandError::new(
+                    1,
+                    format!("这张卡是「{}」，不能用读卡退房", on_card.kind_label),
+                    "读卡退房只处理日租/钟点客卡；管理卡请用对应的作废或重写流程",
+                ));
+            }
             if on_card.card_no != Some(card_no) {
                 let on_card_text = on_card
                     .card_no
@@ -3450,7 +3424,7 @@ mod tests {
     }
 
     /// 全量对照表。**新增命令必须在这里登记**，否则矩阵测试会报「未登记」。
-    /// 三档数量：35 / 28 / 6（改动数量时同步改 `auth_matrix_counts`）。
+    /// 三档数量：35 / 29 / 6（改动数量时同步改 `auth_matrix_counts`）。
     const MATRIX: &[(&str, Level)] = &[
         // 公开（启动即调用 / 认证入口）
         ("app_info", Level::Public),
@@ -3506,7 +3480,6 @@ mod tests {
         ("rename_room_type", Level::Admin),
         ("delete_room_type", Level::Admin),
         ("set_room_type", Level::Admin),
-        ("set_room_max_cards", Level::Admin),
         ("update_room_status_style", Level::Admin),
         ("backup_database", Level::Admin),
         ("list_backups", Level::Admin),
@@ -3618,8 +3591,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (36, 29, 6));
-        assert_eq!(command_bodies().len(), 71, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (35, 29, 6));
+        assert_eq!(command_bodies().len(), 70, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {
@@ -3701,6 +3674,12 @@ mod tests {
             checked_out_at: None,
             duration_ms: Some(120),
             raw_hex: Some("5BECF100810424AB".into()),
+            // v10 新增字段：此用例不涉及身份证，统一 None（不构造任何真实/示例证件数据）
+            id_valid_from: None,
+            id_valid_to: None,
+            id_authority: None,
+            id_device_model: None,
+            id_device_serial: None,
         };
         let csv = issuances_to_csv(&[row]);
         assert!(csv.starts_with('\u{feff}'), "必须以 BOM 开头");

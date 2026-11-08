@@ -21,6 +21,14 @@ export interface CardSnapshot {
   days: number
   hours: number
   cardNo: number | null
+  /** 卡内「年+月」字节（页2[3]）：高 4 位 = (年−2000)&0x0F、低 4 位 = 月；0 = 无 */
+  cardYm: number
+  /** 挂失卡（页1[2] 低 4 位 = 1；TD-150） */
+  isLost: boolean
+  /** 发卡日 / 小时 / 小时内序号（从卡号解码，-1 = 无卡号） */
+  issueDay: number
+  issueHour: number
+  issueSeq: number
   rawHex: string
 }
 
@@ -48,6 +56,12 @@ export interface IssuanceRecord {
   guestAddress: string | null
   guestBirthDate: string | null
   guestNote: string | null
+  /** 身份证扩展字段（只来自读卡器；头像不入库） */
+  idValidFrom: string | null
+  idValidTo: string | null
+  idAuthority: string | null
+  idDeviceModel: string | null
+  idDeviceSerial: string | null
 }
 
 /** 发卡时录入的客人信息，全部可选。 */
@@ -60,6 +74,12 @@ export interface GuestInput {
   address?: string
   birthDate?: string
   note?: string
+  /** 身份证扩展字段（只来自读卡器，头像不入库） */
+  idValidFrom?: string
+  idValidTo?: string
+  idAuthority?: string
+  deviceModel?: string
+  deviceSerial?: string
 }
 
 /**
@@ -195,6 +215,12 @@ export interface IssuanceRow {
   checkedOutAt: string | null
   durationMs: number | null
   rawHex: string | null
+  /** 身份证扩展字段（只来自读卡器；头像不入库） */
+  idValidFrom: string | null
+  idValidTo: string | null
+  idAuthority: string | null
+  idDeviceModel: string | null
+  idDeviceSerial: string | null
 }
 
 /** 操作审计行；`detail` 是后端拼的文本（列名叫 detail_json 但实际不是 JSON）。 */
@@ -453,9 +479,6 @@ export const api = {
   deleteRoom: (roomNo: string) => invoke<void>('delete_room', { roomNo }),
   setRoomType: (roomNo: string, roomTypeId: number | null) =>
     invoke<void>('set_room_type', { roomNo, roomTypeId }),
-  /** 房间参数：最多同时有效的客卡数（null = 不限） */
-  setRoomMaxCards: (roomNo: string, maxCards: number | null) =>
-    invoke<void>('set_room_max_cards', { roomNo, maxCards }),
 
   listRoomStatuses: () => invoke<RoomStatus[]>('list_room_statuses'),
   setRoomStatus: (roomNo: string, status: string) =>
@@ -641,8 +664,8 @@ export const api = {
     duration: { days: number } | { hours: number },
     idempotencyKey: string,
     guest?: GuestInput,
-    /** 长有效期卡（>62 天）的确认词，必须原样等于「顶高水位」 */
-    confirmLong?: string | null,
+    /** 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效 */
+    lost?: boolean,
   ) =>
     invoke<IssuedCard>('issue_guest', {
       roomNo,
@@ -650,13 +673,12 @@ export const api = {
       hours: 'hours' in duration ? duration.hours : null,
       idempotencyKey,
       guest: guest ?? null,
-      confirmLong: confirmLong ?? null,
+      lost: lost ?? false,
     }),
-  issueAdminCard: (request: AdminCardRequest, confirm: boolean, confirmLong?: string | null) =>
+  issueAdminCard: (request: AdminCardRequest, confirm: boolean) =>
     invoke<IssuedCard>('issue_admin_card', {
       request,
       confirm,
-      confirmLong: confirmLong ?? null,
     }),
   cardNoStatus: () => invoke<CardNoStatus>('card_no_status'),
   setWaterWarnAt: (hex: string) => invoke<CardNoStatus>('set_water_warn_at', { hex }),
@@ -710,6 +732,24 @@ export function hourOptions(maxHours: number): SelectGroup[] {
 export function formatCardNo(cardNo: number | null): string {
   if (cardNo === null || cardNo === undefined) return '—'
   return `0x${cardNo.toString(16).toUpperCase().padStart(4, '0')}`
+}
+
+/**
+ * 卡号 → `YYMMDDHHnn`（年/月/日/时/序号各两位），例如 `2711081601`。
+ *
+ * 数据全部来自卡内：`页2[3]` 的年月 + 卡号里的日/时 + 小时内序号（0 起算，显示时 +1）。
+ * 数据不完整（无卡号、年月非法、无发卡时刻）时回退到十六进制显示，不猜。
+ */
+export function formatCardNoText(card: CardSnapshot): string {
+  const hi = (card.cardYm >> 4) & 0x0f
+  const month = card.cardYm & 0x0f
+  if (month < 1 || month > 12 || card.issueDay < 1 || card.issueHour < 0) {
+    return formatCardNo(card.cardNo)
+  }
+  const nowYear = new Date().getFullYear()
+  const base = 2000 + 16 * Math.floor((nowYear - 2000) / 16)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad((base + hi) % 100)}${pad(month)}${pad(card.issueDay)}${pad(card.issueHour)}${pad(card.issueSeq + 1)}`
 }
 
 /**

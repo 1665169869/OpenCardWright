@@ -32,9 +32,10 @@ impl Device {
         days: u16,
         hours: u16,
         serial: Option<u16>,
+        lost: bool,
     ) -> Option<Result<CardSnapshot, DeviceError>> {
         match self {
-            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours, serial),
+            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours, serial, lost),
             Self::Cli(_) => None,
         }
     }

@@ -11,6 +11,11 @@
 
 export const ID_CARD_WS_URL = 'ws://127.0.0.1:9001'
 
+/** 读卡请求：服务不会主动推送，必须由客户端发起（03 = 读身份证，超时 10 秒） */
+const READ_CMD = '03?timeout=10000'
+/** 停止读卡（读失败/超时时发一条，只做复位，不阻塞界面） */
+const STOP_CMD = '04?timeout=10000'
+
 /** 读到的身份证信息，字段名与发卡表单的 `GuestInput` 对齐 */
 export interface IdCardInfo {
   name?: string
@@ -19,10 +24,50 @@ export interface IdCardInfo {
   birthDate?: string
   address?: string
   idNumber?: string
+  /** 证件有效期起 / 止（`YYYYMMDD`，原样保留） */
+  idValidFrom?: string
+  idValidTo?: string
+  /** 签发机关 */
+  idAuthority?: string
+  /** 读卡设备型号 / 序列号 */
+  deviceModel?: string
+  deviceSerial?: string
 }
 
-/** 同一含义的不同键名（华视各版本服务的输出差异） */
-const ALIASES: Record<keyof IdCardInfo, string[]> = {
+/**
+ * 厂商服务的 `|` 分隔文本协议（本机实测格式）。
+ *
+ * 字段顺序：设备型号 | 设备序列 | 证件类型 | 姓名 | 性别 | 民族 | 出生 | 地址 |
+ * 身份证号 | 签发机关 | 有效期起 | 有效期止 | …（空位）… | 头像 base64（最后一项）
+ *
+ * **头像不读取**：拆出后直接丢弃，不进任何状态、不落库、不写日志。
+ * 解析失败一律返回 null（调用方只报「格式不符」，**不回显原文**——里面有隐私）。
+ */
+export function parsePipePayload(text: string): IdCardInfo | null {
+  if (!text.includes('|')) return null
+  const f = text.split('|')
+  if (f.length < 12) return null
+  const at = (i: number) => (f[i] ?? '').trim()
+  const info: IdCardInfo = {
+    deviceModel: at(0) || undefined,
+    deviceSerial: at(1) || undefined,
+    name: at(3) || undefined,
+    gender: normalizeGender(at(4)) || undefined,
+    nation: at(5) || undefined,
+    birthDate: normalizeBirth(at(6)) || undefined,
+    address: at(7) || undefined,
+    idNumber: at(8) || undefined,
+    idAuthority: at(9) || undefined,
+    idValidFrom: at(10) || undefined,
+    idValidTo: at(11) || undefined,
+  }
+  // 头像（f[18] 及以后）根本不赋给任何变量，随函数返回被 GC
+  return Object.values(info).some((v) => v) ? info : null
+}
+
+/** 同一含义的不同键名（华视各版本服务的输出差异）；只覆盖 JSON 协议里可映射的字段 */
+type AliasKey = 'name' | 'gender' | 'nation' | 'birthDate' | 'address' | 'idNumber'
+const ALIASES: Record<AliasKey, string[]> = {
   name: ['name', 'Name', '姓名', 'xm', 'XM'],
   gender: ['sex', 'Sex', 'gender', '性别', 'xb', 'XB'],
   nation: ['nation', 'Nation', '民族', 'mz', 'MZ'],
@@ -92,10 +137,18 @@ export function readIdCard(timeoutMs = 8000): Promise<IdCardInfo> {
     let settled = false
     let ws: WebSocket | undefined
 
-    const finish = (fn: () => void) => {
+    const finish = (fn: () => void, abort = false) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (abort) {
+        // 让设备停止读卡（只做复位，不等回执、不阻塞界面）
+        try {
+          ws?.send(STOP_CMD)
+        } catch {
+          // 连接已经断了就算了
+        }
+      }
       try {
         ws?.close()
       } catch {
@@ -105,13 +158,15 @@ export function readIdCard(timeoutMs = 8000): Promise<IdCardInfo> {
     }
 
     const timer = setTimeout(() => {
-      finish(() =>
-        reject(
-          new Error(
-            `读卡超时（${Math.round(timeoutMs / 1000)} 秒）：确认身份证读卡服务在运行，` +
-              '并且身份证已经放到读卡器上',
+      finish(
+        () =>
+          reject(
+            new Error(
+              `读卡超时（${Math.round(timeoutMs / 1000)} 秒）：确认身份证读卡服务在运行，` +
+                '并且身份证已经放到读卡器上',
+            ),
           ),
-        ),
+        true, // 通知设备停止读卡
       )
     }, timeoutMs)
 
@@ -122,12 +177,28 @@ export function readIdCard(timeoutMs = 8000): Promise<IdCardInfo> {
       return
     }
 
+    ws.onopen = () => {
+      // 服务不会主动推送，必须由客户端发起读卡请求（不发就永远等不到数据）
+      try {
+        ws?.send(READ_CMD)
+      } catch {
+        // 发送失败交给超时/错误分支收敛
+      }
+    }
+
     ws.onmessage = (ev: MessageEvent) => {
+      const text = String(ev.data)
+      // 优先按 `|` 文本协议解析（本机实测格式，含设备/证件/有效期字段）
+      const pipe = parsePipePayload(text)
+      if (pipe) {
+        finish(() => resolve(pipe))
+        return
+      }
       let payload: unknown
       try {
-        payload = JSON.parse(String(ev.data))
+        payload = JSON.parse(text)
       } catch {
-        return // 非 JSON（日志/心跳），继续等
+        return // 既不是 `|` 也不是 JSON（日志/心跳），继续等
       }
       const info = normalizeIdCard(payload)
       if (!info) return // 空壳/心跳，继续等

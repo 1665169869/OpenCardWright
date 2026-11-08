@@ -149,7 +149,7 @@ export default function AdminCards({
     setLoading(true)
     setError(null)
     try {
-      setResult(await api.issueAdminCard(pending, true, needsLongConfirm ? confirmWord.trim() : null))
+      setResult(await api.issueAdminCard(pending, true))
       onChanged?.()
     } catch (e) {
       setError(describeError(e))

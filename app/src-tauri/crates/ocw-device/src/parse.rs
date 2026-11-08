@@ -71,6 +71,15 @@ pub struct CardSnapshot {
     pub days: i32,
     pub hours: i32,
     pub card_no: Option<u16>,
+    /// 挂失卡（页1[2] 低 4 位 = 1；TD-150 实测）
+    pub is_lost: bool,
+    /// 发卡日 / 小时 / 小时内序号：从卡号解码（卡号 = 日5 + 时5 + 序号6）
+    pub issue_day: i32,
+    pub issue_hour: i32,
+    pub issue_seq: i32,
+    /// 卡内「年 + 月」字节（`页2[3]`）：高 4 位 = `(年−2000)&0x0F`、低 4 位 = 月。
+    /// 只存原始字节，年份的还原（16 年循环）由前端按当前年做。
+    pub card_ym: u8,
     /// 28 字节的十六进制原文（56 个字符）。
     pub raw_hex: String,
 }
@@ -288,6 +297,28 @@ pub fn parse_card(stdout: &str, exit_code: i32) -> Result<CardSnapshot, DeviceEr
         .ok_or_else(|| DeviceError::Protocol("返回 ok 但没有 card 字段".into()))?;
 
     let kind = CardKind::from_label(&raw.kind);
+    let card_no = raw.card_no.as_deref().and_then(parse_card_no);
+    let raw_hex = raw.raw.trim().to_uppercase();
+    // 页1[2] 的低 4 位 = 挂失标志（TD-150 实测）；raw_hex 每字节两个 hex 字符
+    let is_lost = raw_hex.len() >= 6
+        && u8::from_str_radix(&raw_hex[4..6], 16)
+            .map(|b| b & 0x0F != 0)
+            .unwrap_or(false);
+    // 卡号 = 日(5) + 时(5) + 小时内序号(6)，解出发卡时刻
+    let (issue_day, issue_hour, issue_seq) = match card_no {
+        Some(n) => (
+            ((n >> 11) & 0x1F) as i32,
+            ((n >> 6) & 0x1F) as i32,
+            (n & 0x3F) as i32,
+        ),
+        None => (-1, -1, -1),
+    };
+    // 页2[3] = 年(高4位)+月(低4位)；raw_hex 第 8 个字节 = 字符 14..16
+    let card_ym = if raw_hex.len() >= 16 {
+        u8::from_str_radix(&raw_hex[14..16], 16).unwrap_or(0)
+    } else {
+        0
+    };
     Ok(CardSnapshot {
         kind,
         kind_label: raw.kind.trim().to_string(),
@@ -295,8 +326,13 @@ pub fn parse_card(stdout: &str, exit_code: i32) -> Result<CardSnapshot, DeviceEr
         room_index: raw.room_index,
         days: raw.days,
         hours: raw.hours,
-        card_no: raw.card_no.as_deref().and_then(parse_card_no),
-        raw_hex: raw.raw.trim().to_uppercase(),
+        card_no,
+        card_ym,
+        is_lost,
+        issue_day,
+        issue_hour,
+        issue_seq,
+        raw_hex,
     }
     .fix_master_marker())
 }
