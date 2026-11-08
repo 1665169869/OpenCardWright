@@ -10,7 +10,7 @@ const { Text, Title } = Typography
  *  2026-11-06 按用户反馈加大：44×36 看不清预定信息，改 64×44 + 更高的可视区。 */
 const COL_W = 64
 const ROW_H = 44
-const ROOM_COL_W = 132
+const ROOM_COL_W = 156
 
 const WEEK = ['日', '一', '二', '三', '四', '五', '六']
 
@@ -386,7 +386,7 @@ export default function RoomCalendar({
                       gap: 2,
                     }}
                   >
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
                       <span
                         style={{
                           width: 6,
@@ -396,11 +396,34 @@ export default function RoomCalendar({
                           flex: '0 0 6px',
                         }}
                       />
-                      <Text style={{ fontSize: 13, fontWeight: 600 }}>{room.roomNo}</Text>
+                      <Text style={{ fontSize: 13, fontWeight: 600, flex: '0 0 auto' }}>{room.roomNo}</Text>
+                      {/* 房型：弹性项，空间不够就省略（title 里看全称） */}
+                      {room.roomTypeName ? (
+                        <Text
+                          type="secondary"
+                          title={room.roomTypeName}
+                          style={{
+                            fontSize: 11,
+                            flex: '1 1 auto',
+                            minWidth: 0,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {room.roomTypeName}
+                        </Text>
+                      ) : null}
                       {st ? (
                         <Tag
                           color={st.color}
-                          style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '16px', padding: '0 4px' }}
+                          style={{
+                            marginInlineEnd: 0,
+                            fontSize: 11,
+                            lineHeight: '16px',
+                            padding: '0 4px',
+                            flex: '0 0 auto',
+                          }}
                         >
                           {st.label}
                         </Tag>
@@ -516,8 +539,8 @@ export default function RoomCalendar({
                           >
                             入住中
                           </span>
-                          {/* 完整入退房日期（TD-117）：跨年带年份 */}
-                          入住 {shortRange(g.start, g.end)}
+                          {/* 有客人姓名就只显示姓名（用户要求）；没姓名才显示入住日期区间 */}
+                          {g.guestName ? g.guestName : `入住 ${shortRange(g.start, g.end)}`}
                         </div>
                       )
                     })()}
@@ -533,7 +556,6 @@ export default function RoomCalendar({
                       const locked = r.checkOut < today
                       // 完整入退房日期（TD-117）：跨年带年份，同年内 MM-DD
                       const range = shortRange(r.checkIn, r.checkOut)
-                      const detail = [r.guestName, r.note].filter(Boolean).join(' · ')
                       return (
                         <div
                           key={r.id}
@@ -587,8 +609,8 @@ export default function RoomCalendar({
                           >
                             预定
                           </span>
-                          {/* 完整日期区间为主，姓名 · 备注跟随 */}
-                          {detail ? `${range} · ${detail}` : range}
+                          {/* 有客人姓名就只显示姓名（用户要求）；否则退到备注，再退到日期区间 */}
+                          {r.guestName ? r.guestName : r.note ? r.note : range}
                         </div>
                       )
                     })}
