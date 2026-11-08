@@ -144,11 +144,11 @@ pnpm tauri build    # 产出 NSIS 安装包
 
 - 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
 - `app/output/` 存放构建产出的副本（该目录不入库，见 `.gitignore`）；
-- **安装包名已是 ASCII**（`productName=OpenCardWright`，如 `OpenCardWright_2026.11.9+0057_x64-setup.exe`）；
-  仍建议复制到纯 ASCII 路径（如 `C:\ocw-setup\setup.exe`）交付，避免 `%TEMP%`/路径异常时 NSIS 报
+- 构建产物为中文名 `门锁发卡台_2026.11.9+0057_x64-setup.exe`；**交付/安装时复制为纯 ASCII 文件名**
+  （如 `C:\ocw-setup\setup.exe`）再运行，避免中文文件名触发 NSIS
   `Error writing temporary file. Make sure your temp folder is valid.`
-- 窗口标题与开始菜单仍显示「门锁发卡台」；安装目录/卸载项使用 `OpenCardWright`。
-  旧中文 `productName` 版本的安装目录不同，**先卸载旧版再装新版**。
+- `productName=门锁发卡台`：快捷方式、开始菜单、安装目录、卸载项与安装页面均为中文。
+  旧 ASCII `productName=OpenCardWright` 版本的安装目录不同，**先卸载旧版再装新版**。
 
 ### 两个环境坑（本机已踩过，写在这里省时间）
 

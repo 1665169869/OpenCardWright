@@ -319,15 +319,13 @@ $env:DEBUG = 'false'
 ```
 
 - 首次打包前先 `pnpm setup:nsis`（本机联网下载 NSIS 会超时；已缓存可跳过）。
-- 安装包：`OpenCardWright_<version>_x64-setup.exe`（**ASCII 文件名**）。
-- `productName = OpenCardWright`；窗口标题与开始菜单仍显示「门锁发卡台」。
+- 构建产物：`门锁发卡台_<version>_x64-setup.exe`（中文文件名）。
+- `productName = 门锁发卡台`；快捷方式、开始菜单、安装目录、卸载项、安装页面均为中文。
 - 安装器/卸载器图标：`app/src-tauri/icons/icon.ico`（`bundle.windows.nsis.installerIcon`）。
-- 旧版若安装的是中文 `productName`（「门锁发卡台」），**先卸载旧版再装新版**；两者安装目录不同。
+- **交付时把安装包复制为 ASCII 文件名（如 `C:\ocw-setup\setup.exe`）再运行**，避免 NSIS 在中文文件名下报
+  `Error writing temporary file. Make sure your temp folder is valid.`
+- 旧版若安装的是 ASCII `productName=OpenCardWright`，安装目录不同，**先卸载旧版再装新版**。
 - 数据目录：release 用 `%PROGRAMDATA%\OpenCardWright\`，debug 用 `%PROGRAMDATA%\OpenCardWright-dev\`。
-
-> 早期 NSIS 在「中文文件名 + 中文路径」下可能报
-> `Error writing temporary file. Make sure your temp folder is valid.`；
-> 现在安装包名已是 ASCII，仍建议放在纯 ASCII 路径（如 `C:\ocw-setup\setup.exe`）交付。
 
 ---
 
