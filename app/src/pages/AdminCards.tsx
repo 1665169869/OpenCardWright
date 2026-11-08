@@ -3,13 +3,13 @@ import {
   Alert,
   Button,
   Card,
-  Descriptions,
   Input,
   InputNumber,
   Modal,
   Radio,
   Select,
   Space,
+  Spin,
   Tag,
   Typography,
 } from 'antd'
@@ -17,16 +17,16 @@ import {
   api,
   dayOptions,
   describeError,
-  formatCardNo,
-  formatExpiry,
   hourOptions,
   LONG_CONFIRM_WORD,
   MASTER_MAX_DAYS,
   MASTER_MAX_HOURS,
   type AdminCardRequest,
+  type CardSnapshot,
   type IssuedCard,
   type Room,
 } from '../api'
+import { CardSnapshotView } from '../components/CardSnapshotView'
 
 const { Text } = Typography
 
@@ -88,6 +88,9 @@ export default function AdminCards({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<IssuedCard | null>(null)
+  /** 发卡后自动读回的卡快照（用读卡页同一套字段模板展示） */
+  const [snapshot, setSnapshot] = useState<CardSnapshot | null>(null)
+  const [reading, setReading] = useState(false)
 
   useEffect(() => {
     api
@@ -144,13 +147,29 @@ export default function AdminCards({
     setPending(request)
   }
 
+  /** 发卡后读回一次卡（手动「重新读卡」也走它）。读不到只降级展示，不报发卡失败。 */
+  const readBack = async () => {
+    setReading(true)
+    try {
+      const r = await api.readCard()
+      setSnapshot(r.card)
+    } catch {
+      setSnapshot(null)
+    } finally {
+      setReading(false)
+    }
+  }
+
   const confirmIssue = async () => {
     if (!pending) return
     setLoading(true)
     setError(null)
+    setSnapshot(null)
     try {
       setResult(await api.issueAdminCard(pending, true))
       onChanged?.()
+      // 发卡成功后自动读回一次，用读卡页同一套字段模板展示
+      await readBack()
     } catch (e) {
       setError(describeError(e))
       setResult(null)
@@ -281,25 +300,33 @@ export default function AdminCards({
         {error ? <Alert type="error" showIcon message="发卡失败" description={error} /> : null}
 
         {result ? (
-          <Card type="inner" title="发卡结果" extra={<Tag color="green">成功</Tag>}>
-            <Descriptions
-              column={2}
-              size="small"
-              items={[
-                { key: 'kind', label: '卡型', children: result.card.kindLabel },
-                {
-                  key: 'room',
-                  label: '房号',
-                  children: result.room ? result.room.roomNo : '—（不适用）',
-                },
-                { key: 'cardNo', label: '卡号', children: formatCardNo(result.card.cardNo) },
-                {
-                  key: 'expiry',
-                  label: '到期',
-                  children: formatExpiry(result.expiresAt) ?? '—（无时长）',
-                },
-              ]}
-            />
+          <Card
+            type="inner"
+            title="发卡结果"
+            extra={
+              <Space>
+                <Tag color="green">成功</Tag>
+                <Button size="small" loading={reading} onClick={() => void readBack()}>
+                  重新读卡
+                </Button>
+              </Space>
+            }
+          >
+            {reading ? (
+              <Space>
+                <Spin size="small" />
+                <Text type="secondary">正在读回卡片…</Text>
+              </Space>
+            ) : snapshot ? (
+              <CardSnapshotView card={snapshot} expiresAt={result.expiresAt} />
+            ) : (
+              <Alert
+                type="warning"
+                showIcon
+                message="卡片已发好，但读回失败"
+                description="把卡重新放正后点右上角「重新读卡」即可；这不影响发卡本身是否成功。"
+              />
+            )}
             <div style={{ marginTop: 12 }}>
               <Text type="secondary">原始数据：</Text>{' '}
               <Text className="ocw-hex" copyable>
