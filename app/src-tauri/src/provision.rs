@@ -57,7 +57,7 @@ fn candidate_sources(app: &tauri::AppHandle) -> Vec<(String, PathBuf)> {
 }
 
 /// 确保运行时副本存在且与来源一致。失败不 panic——退化为模拟设备，界面会明确提示。
-pub fn ensure_runtime(app: &tauri::AppHandle, start_card_no: &str) -> RuntimeInfo {
+pub fn ensure_runtime(app: &tauri::AppHandle) -> RuntimeInfo {
     let dir = data_root().join("runtime");
     let dev = cfg!(debug_assertions);
     let unavailable = || RuntimeInfo {
@@ -89,12 +89,8 @@ pub fn ensure_runtime(app: &tauri::AppHandle, start_card_no: &str) -> RuntimeInf
         }
     }
 
-    let ini = dir.join("LockCard.ini");
-    if ini.is_file() {
-        if let Err(e) = apply_start_card_no(&ini, start_card_no) {
-            eprintln!("[ocw] 写入起始卡号失败: {e}");
-        }
-    }
+    // 不写 CardNo.state：它是现场数据，升级/首启都不应覆盖。
+    // 新装环境由发卡时的时间戳卡号从当前时刻开始生成。
 
     let driver_sha256 = manifest_driver_sha(&dir).or_else(|| manifest_driver_sha(&src));
 
@@ -141,71 +137,4 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// 把 `LockCard.ini` 的 `StartCardNo` 改成用户确认过的起始卡号。
-///
-/// 这是"起始卡号保护"的落地点：安装包不带 `CardNo.state`，
-/// 首次发卡的水位由这里决定，避免把别人的现场水位带进来。
-fn apply_start_card_no(ini: &Path, value_hex: &str) -> std::io::Result<()> {
-    let value = value_hex.trim().trim_start_matches("0x").trim_start_matches("0X").to_uppercase();
-    if value.is_empty() || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("起始卡号不是合法的十六进制: {value_hex}"),
-        ));
-    }
-
-    let text = std::fs::read_to_string(ini)?;
-    let mut replaced = false;
-    let mut out: Vec<String> = Vec::new();
-    for line in text.lines() {
-        let t = line.trim_start();
-        if t.to_ascii_lowercase().starts_with("startcardno") && t.contains('=') {
-            out.push(format!("StartCardNo={value}"));
-            replaced = true;
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    if !replaced {
-        out.push(format!("StartCardNo={value}"));
-    }
-
-    let new_text = out.join("\r\n") + "\r\n";
-    if new_text != text {
-        std::fs::write(ini, new_text)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn start_card_no_is_rewritten_in_place() {
-        let dir = std::env::temp_dir().join(format!("ocw-ini-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ini = dir.join("LockCard.ini");
-        std::fs::write(&ini, "[Card]\r\n; 注释\r\nStartCardNo=2403\r\n").unwrap();
-
-        apply_start_card_no(&ini, "0x2B90").unwrap();
-        let text = std::fs::read_to_string(&ini).unwrap();
-        assert!(text.contains("StartCardNo=2B90"));
-        assert!(!text.contains("2403"));
-        assert!(text.contains("; 注释"), "注释必须保留");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_start_card_no_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("ocw-ini-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ini = dir.join("LockCard.ini");
-        std::fs::write(&ini, "StartCardNo=2403\r\n").unwrap();
-        assert!(apply_start_card_no(&ini, "zz").is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

@@ -1139,7 +1139,11 @@ function BackupPanel({ onChanged }: { onChanged?: () => void }) {
       const name = target.name
       setTarget(null)
       setMsg(
-        `已从 ${name} 恢复：房间 ${r.rooms} · 发卡记录 ${r.issuances} · 账号 ${r.operators}。` +
+        `已从 ${name} 恢复：房间 ${r.rooms} · 发卡记录 ${r.issuances} · 预定 ${r.reservations} · 账号 ${r.operators}。` +
+          `账号处理：保留 ${r.operatorsPreserved} · 导入停用 ${r.operatorsImportedDisabled} · 补回 ${r.operatorsReinserted} · 失败 ${r.operatorFailures}。` +
+          (r.operatorFailures > 0
+            ? `有 ${r.operatorFailures} 个账号处理失败，可用恢复前副本回滚。`
+            : '') +
           `恢复前的数据另存为 ${r.before}。请退出登录后重新进入，确认数据无误。`,
       )
       await load()

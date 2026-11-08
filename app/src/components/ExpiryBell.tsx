@@ -1,5 +1,5 @@
 import { Badge, Button, Empty, List, Popover, Space, Tag, Typography } from 'antd'
-import { formatCardNo, formatExpiry, type ExpiringCard } from '../api'
+import { formatExpiry, type ExpiringCard } from '../api'
 import { relative } from '../utils/reminder'
 
 const { Text } = Typography
@@ -28,7 +28,6 @@ export default function ExpiryBell({ items }: { items: ExpiringCard[] }) {
                 <Space size="small" wrap>
                   <Text strong>{c.roomNo ?? '未知房号'}</Text>
                   <Tag color="blue">{c.kind}</Tag>
-                  <Text type="secondary">卡号 {formatCardNo(c.cardNo)}</Text>
                   <Tag color={r.expired ? 'red' : 'orange'}>{r.text}</Tag>
                 </Space>
                 <Text type="secondary" style={{ fontSize: 12 }}>

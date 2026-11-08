@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Descriptions, Empty, Modal, Space, Tag, Typography } from 'antd'
+import { Button, Descriptions, Empty, Modal, Select, Space, Tag, Typography } from 'antd'
 import { LeftOutlined, RightOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
-import { api, describeError, type Reservation, type Room, type RoomStatus } from '../api'
+import {
+  api,
+  describeError,
+  type Reservation,
+  type Room,
+  type RoomStatus,
+  type RoomType,
+} from '../api'
 
 const { Text, Title } = Typography
 
@@ -34,7 +41,6 @@ type GuestSpan = {
   start: string
   end: string
   guestName: string | null
-  cardNo: number | null
   kind: string
   days: number
   hours: number
@@ -67,12 +73,15 @@ const truncMask = (endPos: number, totalDays: number): React.CSSProperties =>
  */
 export default function RoomCalendar({
   rooms,
+  roomTypes,
   statuses,
   onReserve,
   onEdit,
 }: {
-  /** 跟随房间页的房型 / 房态筛选 */
+  /** 全量在用房间；日历用自己的房型筛选，不跟随房间页（TD-204） */
   rooms: Room[]
+  /** 房型定义：日历头部的独立筛选 */
+  roomTypes: RoomType[]
   /** 房态定义（label / 颜色），房号列直接显示当前房态 tag */
   statuses: RoomStatus[]
   /** 空白格点击：预定该房该天 */
@@ -81,6 +90,18 @@ export default function RoomCalendar({
   onEdit: (r: Reservation) => void
 }) {
   const [month, setMonth] = useState<Dayjs>(() => dayjs().startOf('month'))
+  /** 日历自己的房型筛选（TD-204）：与房间页的筛选互不影响 */
+  const [typeFilter, setTypeFilter] = useState<number | 'all' | 'none'>('all')
+  const untypedCount = rooms.filter((r) => r.roomTypeId === null).length
+  const rows = useMemo(
+    () =>
+      rooms.filter(
+        (r) =>
+          typeFilter === 'all' ||
+          (typeFilter === 'none' ? r.roomTypeId === null : r.roomTypeId === typeFilter),
+      ),
+    [rooms, typeFilter],
+  )
   const [list, setList] = useState<Reservation[]>([])
   const [err, setErr] = useState<string | null>(null)
   const [reloadToken, setReloadToken] = useState(0)
@@ -174,7 +195,6 @@ export default function RoomCalendar({
           if (
             !r.roomNo ||
             r.result !== 'ok' ||
-            r.cardNo === null ||
             r.checkedOutAt !== null ||
             !r.expiresAt ||
             Date.parse(r.expiresAt) <= now
@@ -187,7 +207,6 @@ export default function RoomCalendar({
               start: ownedDay(r.createdAt),
               end: localDay(r.expiresAt),
               guestName: r.guestName,
-              cardNo: r.cardNo,
               kind: r.kind,
               days: r.days,
               hours: r.hours,
@@ -283,6 +302,19 @@ export default function RoomCalendar({
           下月
         </Button>
         <Button onClick={() => setMonth(dayjs().startOf('month'))}>回到今天</Button>
+        <Select
+          value={typeFilter === 'all' ? 'all' : typeFilter === 'none' ? 'none' : String(typeFilter)}
+          onChange={(v) => setTypeFilter(v === 'all' || v === 'none' ? v : Number(v))}
+          style={{ width: 150 }}
+          options={[
+            { value: 'all', label: `全部房型 ${rooms.length}` },
+            ...roomTypes.map((t) => ({
+              value: String(t.id),
+              label: `${t.name} ${rooms.filter((r) => r.roomTypeId === t.id).length}`,
+            })),
+            ...(untypedCount > 0 ? [{ value: 'none', label: `未分类 ${untypedCount}` }] : []),
+          ]}
+        />
         <Text type="secondary">
           {list.length > 0 ? `本月 ${list.length} 条预定` : '本月暂无预定'} · 点空白格预定，
           点色块改期 / 取消
@@ -291,8 +323,8 @@ export default function RoomCalendar({
 
       {err ? <Text type="danger">{err}</Text> : null}
 
-      {rooms.length === 0 ? (
-        <Empty description="还没有可显示的房间" />
+      {rows.length === 0 ? (
+        <Empty description={rooms.length === 0 ? '还没有可显示的房间' : '该房型下没有房间'} />
       ) : (
         <div style={{ overflow: 'auto', maxHeight: '78vh', border: '1px solid #f0f0f0' }}>
           <div style={{ minWidth: ROOM_COL_W + gridWidth, position: 'relative' }}>
@@ -362,7 +394,7 @@ export default function RoomCalendar({
               })}
             </div>
 
-            {rooms.map((room) => {
+            {rows.map((room) => {
               // 房态定义来自 RoomManager 传入的 statuses（与房间格子同一份数据）
               const st = statuses.find((s) => s.key === room.status)
               const stColor = st?.color
@@ -636,11 +668,6 @@ export default function RoomCalendar({
             </Descriptions.Item>
             <Descriptions.Item label="房号">{stayDetail.roomNo}</Descriptions.Item>
             <Descriptions.Item label="卡型">{stayDetail.span.kind}</Descriptions.Item>
-            <Descriptions.Item label="卡号">
-              {stayDetail.span.cardNo === null
-                ? '—'
-                : `0x${stayDetail.span.cardNo.toString(16).toUpperCase().padStart(4, '0')}`}
-            </Descriptions.Item>
             <Descriptions.Item label="入住 → 到期">
               {stayDetail.span.start} → {stayDetail.span.end}
             </Descriptions.Item>

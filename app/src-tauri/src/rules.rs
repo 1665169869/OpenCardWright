@@ -46,14 +46,6 @@ impl CardTier {
     }
 }
 
-/// 是否属于长有效期卡（天数进入 `0xC0` 月码段）。
-///
-/// 2026-11-08：**确认词机制已移除**（用户要求「水位功能整体移除」），
-/// 这里只保留判定，供 UI 做「长卡会长期占用该房间卡号」的提示，不再拦截发卡。
-pub fn needs_long_confirm(tier: CardTier, days: u16) -> bool {
-    days > tier.max_simple_days()
-}
-
 fn tiers_text() -> String {
     LONG_DAY_TIERS
         .iter()
@@ -139,12 +131,4 @@ mod tests {
         assert!(e.contains("62"), "应说明客卡上限");
         assert!(e.contains("90"), "应列出固定档位");
     }
-    #[test]
-    fn long_tier_detected_only_beyond_simple_limit() {
-        assert!(!needs_long_confirm(CardTier::Guest, 62));
-        assert!(needs_long_confirm(CardTier::Guest, 90));
-        assert!(!needs_long_confirm(CardTier::Master, 63));
-        assert!(needs_long_confirm(CardTier::Master, 90));
-    }
-
 }

@@ -4,7 +4,6 @@ import {
   api,
   dayOptions,
   describeError,
-  formatCardNo,
   formatExpiry,
   formatTime,
   GENDERS,
@@ -332,7 +331,6 @@ export default function IssueForm({
                   label: '到期',
                   children: formatExpiry(result.expiresAt) ?? '—（无时长）',
                 },
-                { key: 'cardNo', label: '卡号', children: formatCardNo(result.card.cardNo) },
                 { key: 'room', label: '房号', children: room.roomNo },
               ]}
             />

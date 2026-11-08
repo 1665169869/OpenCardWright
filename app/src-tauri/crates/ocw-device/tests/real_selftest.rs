@@ -1,7 +1,7 @@
 //! 对着**真实**的 `PMSLockCard.exe selftest` 输出跑一遍解析器。
 //!
 //! 这是唯一不需要读卡器就能端到端验证"设备通道契约"的测试：
-//! 它同时证明（a）产物真的能跑，（b）40 条自检项全绿（27 字节向量 + 7 卡号编码 + 6 时长码），
+//! 它同时证明（a）产物真的能跑，（b）46 条自检项全绿（33 字节向量 + 7 卡号编码 + 6 时长码），
 //! （c）我们把它的输出读对了。
 //!
 //! 没构建 SDK 时自动跳过（比如只做 `cargo test -p ocw-device` 的裸环境）。
@@ -35,7 +35,7 @@ fn real_selftest_is_all_green_and_parses() {
     let parsed = ocw_device::parse_selftest(&stdout)
         .unwrap_or_else(|e| panic!("无法解析 selftest 输出: {e}\n--- 原文 ---\n{stdout}"));
 
-    assert_eq!(parsed.passed, 40, "应跑满 40 项自检（27 字节向量 + 7 卡号编码 + 6 时长码）\n{stdout}");
+    assert_eq!(parsed.passed, 46, "应跑满 46 项自检（33 字节向量 + 7 卡号编码 + 6 时长码）\n{stdout}");
     assert_eq!(parsed.failed, 0, "不允许有失败向量\n{stdout}");
     assert!(parsed.is_ok());
     assert!(output.status.success(), "selftest 退出码非 0");

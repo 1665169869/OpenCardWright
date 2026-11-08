@@ -75,7 +75,13 @@ internal static class CardBuild
             // 只有含卡号的卡型才推进计数器
             bool needsCardNo = type != "install" && type != "raw";
             int cardNo = -1;
-            if (needsCardNo) cardNo = serial >= 0 ? serial : new CardNoStore(state, start).Next();
+            // CLI/构包器不再自增：卡号必须由调用方用 --serial 给（卡号由 app 侧算）
+            if (needsCardNo && serial < 0)
+            {
+                Console.Error.WriteLine("× 需要 --serial 指定卡号（构包器不再自增）");
+                return 1;
+            }
+            if (needsCardNo) cardNo = serial;
 
             byte[] p1, p2;
             switch (type)

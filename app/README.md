@@ -19,10 +19,10 @@
 |---|---|
 | M0 地基（工程骨架、构建脚本、CI、SQLite schema） | ✅ **已验证**：SDK 构建 + 40/40 门禁、前端 tsc/vite 通过、`cargo test` 26 项通过 |
 | M1 设备通道 + 读卡页 | ✅ 解析器与真机 `selftest` 集成测试通过；读卡页含四态提示 |
-| M2 发卡主流程 | ✅ 代码就位（发卡/落库/幂等/水位闸门），**未上真机** |
+| M2 发卡主流程 | ✅ 代码就位（发卡/落库/幂等/记录 id 退房），**未上真机** |
 | M3 管理卡与权限 | ✅ 6 类管理卡 + 原始直写、二次确认、审计落库；⬜ 角色鉴权未做 |
 | M4 房号生命周期 | ✅ 新增房间（二级表单）自动分配序号 + 制作安装卡、改房名、逻辑删除；⬜ 初始 ini/CSV 导入 |
-| M5 运维 | ✅ 数据库备份 / 恢复 / 自动备份（设置 → 备份）；⬜ 诊断包、发卡记录页与 CSV、文件日志轮转 |
+| M5 运维 | ✅ 数据库备份 / 恢复 / 自动备份（设置 → 备份）；恢复整库时按 login 保留当前账号密码 / 角色 / 启用状态，备份新增账号默认停用；⬜ 诊断包、发卡记录页与 CSV、文件日志轮转 |
 | M6 打包发布 | ✅ **NSIS 安装包 1.96 MiB**，静默安装 + 启动 + 40/40 自检全通过；⬜ 代码签名、正式文档 |
 
 已实测通过的命令：
@@ -31,7 +31,7 @@
 pnpm build:sdk     # 编译 sdk/ → resources/sdk，跑 40 项自检
 pnpm exec tsc --noEmit      # 前端类型检查
 pnpm exec vite build        # 前端产物
-- `cargo test --workspace` — **120 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 43、命令层 44）
+- `cargo test --workspace` — **130 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 51、命令层 46）
 ```
 
 功能规划、验收标准、风险登记见 `../plan/开源门锁发卡软件-建设方案-v0.2.md`；
@@ -72,8 +72,8 @@ pnpm exec vite build        # 前端产物
 - 发卡：只在房间卡片右键菜单里进入（抽屉不放发卡），会显示**预计退房时间**，如
   `2026-11-05 21:28 - 2026-11-06 12:00`（日租默认中午退房；按发卡时间估算）
 - 房间参数：每个房间可设**最大发卡数**（同时有效的客卡上限，留空=不限），到上限后拒绝发卡并提示
-- 卡号治理：**全局统一水位**（所有房间共用一个卡号计数器）；警戒线可在「设置 → 水位」调整，
-  到线后顶栏告警提示"给全部门锁刷一遍复位卡"，刷完再在设置里把水位重置到低位
+- 卡号治理：**水位/预警线已移除**。卡号仍由内部按「日 + 时 + 本小时序号」生成并写入卡，
+  但产品不保存、不展示卡号；数据库 `issuance.card_no` 列保留但停止读写。
 - 到期提醒：按发卡时间估算客卡到期，可设**提前 N 分钟**提醒（默认 30），带**提示声**与顶栏铃铛
 - 设备（设置 → 设备，二级页签第一项）：探测串口、切换 COM、跑 40 项自检、看驱动指纹——**dev 模式同样可用**
 - 身份证读卡（TD-135）：开卡表单的「读取身份证」按钮连本机华视读卡服务的 WebSocket
@@ -248,7 +248,7 @@ fixtures/               CLI 输出样本（解析器测试用）
    实测产物 `OpenCardWright_0.1.0_x64-setup.exe` 1.96 MiB，静默安装后 `resources/sdk` 完整携带驱动。
 2. **图标是占位**：`src-tauri/icons/icon.ico` 是脚本生成的纯色图，发布前应换成正式图标。
 3. **未实现**：诊断包、发卡记录页与 CSV 导出、首启向导、初始房间导入、文件日志轮转（逐条见 `../plan/待办清单.md`）。
-4. **前端包 1.07 MB**：antd 占大头，尚未做代码分割。桌面端可接受，后续按路由拆。
+4. **前端代码分割**：页面已用 `React.lazy` 按页签拆分（TD-902）；主包约 918 KB（gzip 293 KB），antd 仍占大头。
 5. **驱动与应用同包**：若未来出现权利主张，构建时加 `-BundleDriver:$false` 改为首启导入。
 6. **总控卡页1 有变体**：SDK 只把 `5B EC F0 FF` 认作总控卡，但真机上见过 `5B EC F1 FF`
    （低 4 位为 1，和钟点卡低4位 0/1 的未解规律同源）。产品侧按 `B3 = 0xFF` 纠正回总控卡，
@@ -297,8 +297,8 @@ fixtures/               CLI 输出样本（解析器测试用）
 | 级别 | 数量 | 命令 |
 |---|---|---|
 | 公开（无需登录） | 6 | `app_info` `auth_status` `initialize_admin` `login` `logout` `log_frontend` |
-| 登录即可（前台日常 + 只读） | 29 | `read_card` `list_rooms` `run_selftest` `probe_ports` `card_no_status` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `get_checkout_hour` `expiring_cards` `list_issuances` `list_audits` `card_history` `get_onboarding_status` `list_reservations` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
-| 管理员 | 36 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `set_water_warn_at` `reset_water_mark` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `set_checkout_hour` `get_backup_settings` `set_backup_settings` `import_backup_file` `export_diagnostics` `export_issuances_csv` `import_rooms` `complete_onboarding` |
+| 登录即可（前台日常 + 只读） | 28 | `read_card` `list_rooms` `run_selftest` `probe_ports` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `get_checkout_hour` `expiring_cards` `list_issuances` `list_audits` `get_onboarding_status` `list_reservations` `list_reservation_records` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
+| 管理员 | 35 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `set_max_cards_default` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `set_checkout_hour` `get_backup_settings` `set_backup_settings` `import_backup_file` `export_diagnostics` `export_issuances_csv` `import_rooms` `complete_onboarding` |
 
 约定：
 - 错误码 **401 = 未登录**、**403 = 权限不足**，前端按 `code` 区分提示，不要只匹配文案。

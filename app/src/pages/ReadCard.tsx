@@ -72,7 +72,7 @@ function RecordBanner({ lookup }: { lookup: RecordLookup }) {
         <Alert
           type="success"
           showIcon
-          message={`已找到发卡记录（该卡号共 ${lookup.count} 条）`}
+          message={`已找到发卡记录（该卡共 ${lookup.count} 条记录）`}
           description={
             <>
               <Space size="large" wrap>

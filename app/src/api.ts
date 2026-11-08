@@ -169,12 +169,24 @@ export interface Reservation {
   checkOut: string
   guestName: string | null
   note: string | null
-  /** booked = 有效；cancelled = 已取消（保留记录） */
+  /** booked = 有效；checked_in = 已入住；cancelled = 已取消（保留记录） */
   status: string
   operatorName: string | null
   createdAt: string
   updatedAt: string
   cancelledAt: string | null
+}
+
+/** 记录页预定查询条件（TD-167）：包含已取消 / 已入住；日期为入住日 YYYY-MM-DD */
+export interface ReservationFilter {
+  roomNo?: string | null
+  guestName?: string | null
+  /** booked / checked_in / cancelled；空 = 全部 */
+  status?: string | null
+  from?: string | null
+  to?: string | null
+  page?: number
+  pageSize?: number
 }
 
 /**
@@ -188,8 +200,6 @@ export interface RoomMovePreview {
   cards: number
   activeUntil: string | null
   latest: IssuanceRecord | null
-  /** 源房当前所有有效客卡的卡号：换房前读卡核对"是不是本房原卡"用 */
-  activeCardNos: number[]
 }
 
 /** 发卡记录行（记录页用，比读卡用的 IssuanceRecord 宽）。 */
@@ -200,7 +210,6 @@ export interface IssuanceRow {
   kind: string
   days: number
   hours: number
-  cardNo: number | null
   guestName: string | null
   guestGender: string | null
   guestIdType: string | null
@@ -248,7 +257,6 @@ export interface CsvResult {
 /** 记录页的筛选参数（时间为 ISO UTC 字符串） */
 export interface LogFilter {
   roomNo?: string | null
-  cardNo?: number | null
   kind?: string | null
   from?: string | null
   to?: string | null
@@ -310,7 +318,16 @@ export interface RestoreResult {
   schemaVersion: number
   rooms: number
   issuances: number
+  reservations: number
   operators: number
+  /** 当前已有、备份也有：保留当前密码 / 角色 / 启用状态 */
+  operatorsPreserved: number
+  /** 备份有、当前没有：导入但停用 */
+  operatorsImportedDisabled: number
+  /** 当前有、备份没有：补回当前账号 */
+  operatorsReinserted: number
+  /** 账号合并单条失败数 */
+  operatorFailures: number
 }
 
 export interface CheckoutCardResult {
@@ -412,20 +429,6 @@ export interface PortProbe {
   readerId: string | null
 }
 
-export type WaterLevel = 'normal' | 'warn' | 'blocked'
-
-export interface CardNoStatus {
-  current: number | null
-  stateFile: number | null
-  maxIssued: number | null
-  level: WaterLevel
-  /** 警戒线（设置里可改） */
-  warnAt: number
-  /** 硬阻断线，到这条线只能发管理卡 */
-  blockAt: number
-  statePath: string
-}
-
 /** 管理卡请求，与 Rust 端 `AdminCardRequest` 的 serde 表示一一对应。 */
 export type AdminCardRequest =
   | { kind: 'master'; days?: number | null; hours?: number | null }
@@ -433,7 +436,7 @@ export type AdminCardRequest =
   | { kind: 'clear' }
   | { kind: 'install'; roomNo: string }
   | { kind: 'checkout'; hour: number }
-  | { kind: 'timeSync'; hour?: number | null; minute?: number | null }
+  | { kind: 'timeSync'; hour?: number | null; minute?: number | null; at?: string | null }
   | { kind: 'blank' }
   | { kind: 'raw'; p1: string; p2: string }
 
@@ -495,6 +498,17 @@ export const api = {
   /** 列出与 [from, to) 相交的有效预定（YYYY-MM-DD） */
   listReservations: (from: string, to: string, roomNo?: string | null) =>
     invoke<Reservation[]>('list_reservations', { from, to, roomNo: roomNo ?? null }),
+  /** 记录页预定查询（TD-167）：含已取消 / 已入住，支持筛选与分页 */
+  listReservationRecords: (f: ReservationFilter) =>
+    invoke<Page<Reservation>>('list_reservation_records', {
+      roomNo: f.roomNo ?? null,
+      guestName: f.guestName ?? null,
+      status: f.status ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+      page: f.page ?? 1,
+      pageSize: f.pageSize ?? 20,
+    }),
   /** 新建预定；checkOut 是退房日（不含）。重叠 / 日期非法由后端拒绝 */
   createReservation: (input: {
     roomNo: string
@@ -541,10 +555,9 @@ export const api = {
   /**
    * 换房第二步：把源房全部有效客卡登记退房（+ 房态转退房态 + 审计）。
    * 卡里的房间序号是写死的，旧卡仍能开源房的门；新房必须重新写一张卡。
-   * `cardNo` 是换房前读到的卡号，只用于审计留痕（非原卡经二次确认后同样带上）。
    */
-  moveRoomOut: (roomNo: string, toRoomNo: string, cardNo?: number | null) =>
-    invoke<CheckoutResult>('room_move_out', { roomNo, toRoomNo, cardNo: cardNo ?? null }),
+  moveRoomOut: (roomNo: string, toRoomNo: string) =>
+    invoke<CheckoutResult>('room_move_out', { roomNo, toRoomNo }),
 
   /** 立即备份数据库（管理员）；`dir` 留空则写到库同级的 backups\ 目录 */
   backupDatabase: (dir?: string | null) =>
@@ -567,7 +580,6 @@ export const api = {
   listIssuances: (f: LogFilter) =>
     invoke<Page<IssuanceRow>>('list_issuances', {
       roomNo: f.roomNo ?? null,
-      cardNo: f.cardNo ?? null,
       kind: f.kind ?? null,
       from: f.from ?? null,
       to: f.to ?? null,
@@ -585,15 +597,15 @@ export const api = {
       pageSize: f.pageSize ?? 50,
     }),
   /** 同一卡号的全部写入记录 */
-  cardHistory: (cardNo: number) => invoke<IssuanceRow[]>('card_history', { cardNo }),
   /** 导出当前筛选为 CSV（管理员）：后端落盘并返回路径 */
-  exportIssuancesCsv: (f: LogFilter) =>
+  /** 导出 CSV；`guestOnly=true` 时只导出填了身份信息的发卡（入住记录，TD-165） */
+  exportIssuancesCsv: (f: LogFilter, guestOnly = false) =>
     invoke<CsvResult>('export_issuances_csv', {
       roomNo: f.roomNo ?? null,
-      cardNo: f.cardNo ?? null,
       kind: f.kind ?? null,
       from: f.from ?? null,
       to: f.to ?? null,
+      guestOnly,
     }),
 
   /** 自动备份设置（管理员） */
@@ -604,14 +616,25 @@ export const api = {
   importBackupFile: (name: string, bytes: number[]) =>
     invoke<BackupEntry>('import_backup_file', { name, bytes }),
   /** 读卡退房 / 持卡退房：按卡号关闭这一张卡 */
-  checkoutCard: (cardNo: number, noDevice?: boolean) =>
-    invoke<CheckoutCardResult>('checkout_card', { cardNo, noDevice }),
+  /**
+   * 退房：持卡退房传 `cardNo`（后端按时间戳匹配记录）；无卡退房传 `issuanceId`。
+   */
+  checkoutCard: (input: {
+    cardNo?: number | null
+    issuanceId?: number | null
+    noDevice?: boolean
+  }) =>
+    invoke<CheckoutCardResult>('checkout_card', {
+      cardNo: input.cardNo ?? null,
+      issuanceId: input.issuanceId ?? null,
+      noDevice: input.noDevice ?? false,
+    }),
   /**
    * 强制退房：卡不是本系统发的，本地没有发卡记录，按前端从卡片里读出的房号
    * 直接写入退房数据（关闭该房全部有效卡 + 改房态）。调用前必须让用户二次确认。
    */
-  forceCheckoutCard: (roomNo: string, cardNo: number) =>
-    invoke<CheckoutResult>('force_checkout_card', { roomNo, cardNo }),
+  forceCheckoutCard: (roomNo: string) =>
+    invoke<CheckoutResult>('force_checkout_card', { roomNo }),
   /** 退房后要转成的房态 key（设置项） */
   getCheckoutStatus: () => invoke<string>('get_checkout_status'),
   setCheckoutStatus: (status: string) => invoke<void>('set_checkout_status', { status }),
@@ -686,9 +709,6 @@ export const api = {
       request,
       confirm,
     }),
-  cardNoStatus: () => invoke<CardNoStatus>('card_no_status'),
-  setWaterWarnAt: (hex: string) => invoke<CardNoStatus>('set_water_warn_at', { hex }),
-  resetWaterMark: (startAt: string) => invoke<CardNoStatus>('reset_water_mark', { startAt }),
   setPort: (port: number) => invoke<AppInfo>('set_port', { port }),
   runSelfTest: () => invoke<SelfTestDto>('run_selftest'),
   probePorts: () => invoke<PortProbe[]>('probe_ports'),

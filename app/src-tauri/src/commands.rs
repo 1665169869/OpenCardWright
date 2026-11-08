@@ -6,6 +6,10 @@
 //! * 卡片数据（A 区）不受记录查询结果影响，永远返回。
 
 use std::path::Path;
+
+use chrono::{Datelike, Local, Timelike};
+
+use crate::cardno;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -144,6 +148,19 @@ fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLook
         }
     };
 
+    // 只有客卡与总控卡写时间戳卡号，才需要匹配发卡记录；
+    // 复位 / 清除 / 退房钟点 / 校时 / 安装卡只需识别卡型。
+    let (room_no, kind) = match card.kind {
+        CardKind::GuestDay => (card.room.clone(), "日租客卡"),
+        CardKind::GuestHour => (card.room.clone(), "钟点客卡"),
+        CardKind::Master => (None, "总控卡"),
+        _ => {
+            return RecordLookup::NotApplicable {
+                reason: "该卡型只需识别卡型，不匹配发卡记录".into(),
+            }
+        }
+    };
+
     let conn = match db.lock() {
         Ok(c) => c,
         Err(_) => {
@@ -153,12 +170,17 @@ fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLook
         }
     };
 
-    match ocw_store::latest_issuance_for_card(&conn, card_no) {
-        Ok(Some(latest)) => {
-            let count = ocw_store::count_issuance_for_card(&conn, card_no).unwrap_or(1);
-            RecordLookup::Found { latest, count }
-        }
-        Ok(None) => RecordLookup::NotFound,
+    let (day, hour, seq) = crate::cardno::decode(card_no);
+    match ocw_store::find_issuance_by_stamp(
+        &conn,
+        room_no.as_deref(),
+        kind,
+        day,
+        hour,
+        seq,
+    ) {
+        Ok(Some(latest)) if latest.result == "ok" => RecordLookup::Found { latest, count: 1 },
+        Ok(_) => RecordLookup::NotFound,
         Err(e) => RecordLookup::Failed {
             message: e.to_string(),
         },
@@ -418,7 +440,6 @@ pub async fn issue_install_card(
                     kind: "安装卡",
                     days: 0,
                     hours: 0,
-                    card_no: None,
                     raw_hex: Some(card.raw_hex.as_str()),
                     operator_id: Some(me.operator_id),
                     reader_id: None,
@@ -501,7 +522,13 @@ pub enum AdminCardRequest {
     Clear,
     Install { room_no: String },
     Checkout { hour: u8 },
-    TimeSync { hour: Option<u8>, minute: Option<u8> },
+    TimeSync {
+        hour: Option<u8>,
+        minute: Option<u8>,
+        /// 指定时刻 `YYYY-MM-DD HH:mm`：校时卡的「年+月」写在 `页2[3]`、时/分在 `页1`；
+        /// `None` = 用当前时间（2026-11-08 实测：页1 与日期无关）
+        at: Option<String>,
+    },
     Raw { p1: String, p2: String },
     /// 空白卡（TD-136）：把卡 8 字节全部写 0。字节与持卡退房的擦卡相同，但走管理卡通道、留独立记录。
     Blank,
@@ -564,10 +591,15 @@ impl AdminCardRequest {
                 a.push("--hour".into());
                 a.push(hour.to_string());
             }
-            Self::TimeSync { hour, minute } => {
+            Self::TimeSync { hour, minute, at } => {
                 a.push("--type".into());
                 a.push("timesync".into());
-                if let (Some(h), Some(m)) = (hour, minute) {
+                if let Some(at) = at {
+                    // 指定年月日+时分：CLI 的 `--at` 会同时驱动 `CardBuilder.Now`（页2[3] 年月）
+                    // 与卡号（时间戳编码），两者同源
+                    a.push("--at".into());
+                    a.push(at.clone());
+                } else if let (Some(h), Some(m)) = (hour, minute) {
                     if *h > 23 || *m > 59 {
                         return Err(CommandError::new(1, "时间不合法", "小时 0–23，分钟 0–59"));
                     }
@@ -621,12 +653,25 @@ pub async fn issue_admin_card(
     let label = request.label().to_string();
     let device = state.device();
     let db = state.db.clone();
+    let runtime_dir = state.runtime_dir.clone();
 
     // 写卡前统一先读卡
     pre_read_card(&device)?;
 
     blocking(move || {
-        let args = request.to_args()?;
+        let mut args = request.to_args()?;
+        // 总控卡写时间戳卡号（日/时/序号），读卡时才能按卡号反查发卡记录。
+        // 其他管理卡仍只按卡型识别，不消耗卡号。
+        if matches!(&request, AdminCardRequest::Master { .. }) {
+            let at = chrono::Local::now();
+            let card_no =
+                cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_at(at);
+            args.push("--serial".into());
+            args.push(format!("{card_no:04X}"));
+            // 让页2[3] 的年月与卡号使用同一个发卡时刻
+            args.push("--at".into());
+            args.push(at.format("%Y-%m-%d %H:%M").to_string());
+        }
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
         // 安装卡需要房间；其它卡带房号反而会干扰 CLI
@@ -670,7 +715,6 @@ pub async fn issue_admin_card(
                         kind: &label,
                         days: card.days as i64,
                         hours: card.hours as i64,
-                        card_no: card.card_no,
                         raw_hex: Some(card.raw_hex.as_str()),
                         operator_id: Some(me.operator_id),
                         reader_id: None,
@@ -715,197 +759,12 @@ pub async fn issue_admin_card(
     .await
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum WaterLevel {
-    /// 正常
-    Normal,
-    /// >= 警戒线（默认 0xE000，可配置）：提示给全部门锁刷复位卡
-    Warn,
-    /// >= 0xFF00：阻断客卡，只能发管理卡（去刷复位卡）
-    Blocked,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CardNoStatus {
-    /// 水位 = SDK 的 `CardNo.state`（缺失时退回本地已发最大号）
-    pub current: Option<u16>,
-    /// 来自运行副本里的 CardNo.state
-    pub state_file: Option<u16>,
-    /// 来自本地发卡流水
-    pub max_issued: Option<u16>,
-    pub level: WaterLevel,
-    /// 警戒线（设置里可改，默认 0xE000）
-    pub warn_at: u16,
-    /// 硬阻断线：到这条线只能发管理卡，必须刷复位卡
-    pub block_at: u16,
-    pub state_path: String,
-}
-
-/// 读 `CardNo.state`（内容是 4 位十六进制文本）。
-fn read_state_file(path: &Path) -> Option<u16> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let t = text.trim();
-    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
-    u32::from_str_radix(t, 16).ok().filter(|v| *v <= 0xFFFF).map(|v| v as u16)
-}
-
-/// 原子写 `CardNo.state`（先写 tmp 再改名，避免断电留下半个文件）。
-fn write_state_file(path: &Path, value: u16) -> std::io::Result<()> {
-    let tmp = path.with_extension("state.tmp");
-    std::fs::write(&tmp, format!("{value:04X}"))?;
-    std::fs::rename(&tmp, path)
-}
-
-/// 解析用户输入的十六进制卡号（允许带 0x 前缀）。
-fn parse_hex_u16(input: &str) -> Result<u16, CommandError> {
-    let t = input.trim();
-    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
-    u32::from_str_radix(t, 16)
-        .ok()
-        .filter(|v| *v <= 0xFFFF)
-        .map(|v| v as u16)
-        .ok_or_else(|| CommandError::new(1, "请输入 16 位十六进制数（如 E000）", "范围 0000–FFFF"))
-}
-
-const DEFAULT_WARN_AT: u16 = 0xE000;
-const BLOCK_AT: u16 = 0xFF00;
-
-/// 读警戒线设置；没设置或非法就用默认值。
-fn water_warn_at(conn: &Connection) -> u16 {
-    ocw_store::get_setting(conn, "waterWarnAt")
-        .ok()
-        .flatten()
-        .and_then(|v| parse_hex_u16(&v).ok())
-        .filter(|v| *v < BLOCK_AT)
-        .unwrap_or(DEFAULT_WARN_AT)
-}
-
-fn compute_status(db: &Arc<Mutex<Connection>>, state_path: &Path) -> Result<CardNoStatus, CommandError> {
-    let (max_issued, warn_at) = {
-        let conn = lock_db(db)?;
-        (ocw_store::max_issued_card_no(&conn)?, water_warn_at(&conn))
-    };
-    let state_file = read_state_file(state_path);
-
-    // 水位以 SDK 的计数器文件为准：每发一张卡它就前进一格，和"刚发出的卡号"天然对得上。
-    // 数据库里的最大号只作为**历史参考**（可能被导入/手写的异常大号污染），不再参与水位计算。
-    let current = state_file.or(max_issued);
-
-    let level = match current {
-        Some(v) if v >= BLOCK_AT => WaterLevel::Blocked,
-        Some(v) if v >= warn_at => WaterLevel::Warn,
-        _ => WaterLevel::Normal,
-    };
-
-    Ok(CardNoStatus {
-        current,
-        state_file,
-        max_issued,
-        level,
-        warn_at,
-        block_at: BLOCK_AT,
-        state_path: state_path.display().to_string(),
-    })
-}
-
-/// 设置警戒线（管理员）。到这条线开始提示"给全部门锁刷复位卡"。
-#[tauri::command]
-pub async fn set_water_warn_at(
-    state: State<'_, AppState>,
-    hex: String,
-) -> Result<CardNoStatus, CommandError> {
-    let me = require_admin(&state)?;
-    let value = parse_hex_u16(&hex)?;
-    if value >= BLOCK_AT {
-        return Err(CommandError::new(
-            1,
-            format!("警戒线必须低于 {BLOCK_AT:04X}"),
-            "到了 FF00 就只能发管理卡了",
-        ));
-    }
-    if value < 0x100 {
-        return Err(CommandError::new(1, "警戒线太低", "至少要高于 0x0100"));
-    }
-    let db = state.db.clone();
-    let path = state.runtime_dir.join("CardNo.state");
-    blocking(move || {
-        {
-            let conn = lock_db(&db)?;
-            ocw_store::set_setting(&conn, "waterWarnAt", &format!("{value:04X}"))?;
-            let _ = ocw_store::record_audit(
-                &conn,
-                "set_water_warn_at",
-                Some(&format!("{value:04X}")),
-                None,
-                "ok",
-                Some(me.operator_id),
-            );
-        }
-        compute_status(&db, &path)
-    })
-    .await
-}
-
-/// 重置水位：把卡号计数器拨回一个较低的值。
-///
-/// **前提**：已经给全部门锁刷过复位卡 —— 锁里的高水位是每房独立的，
-/// 没刷复位就拨低，新卡会被那些锁当成"更旧的卡"拒开。
-#[tauri::command]
-pub async fn reset_water_mark(
-    state: State<'_, AppState>,
-    start_at: String,
-) -> Result<CardNoStatus, CommandError> {
-    let me = require_admin(&state)?;
-    let value = parse_hex_u16(&start_at)?;
-    let db = state.db.clone();
-    let path = state.runtime_dir.join("CardNo.state");
-    blocking(move || {
-        let warn_at = {
-            let conn = lock_db(&db)?;
-            water_warn_at(&conn)
-        };
-        if value >= warn_at {
-            return Err(CommandError::new(
-                1,
-                format!("重置值 {value:04X} 不能高于警戒线 {warn_at:04X}"),
-                "先调低警戒线，或把重置值调到更低",
-            ));
-        }
-        write_state_file(&path, value)
-            .map_err(|e| CommandError::new(2, format!("写 CardNo.state 失败：{e}"), "检查运行目录权限"))?;
-        {
-            let conn = lock_db(&db)?;
-            ocw_store::set_setting(&conn, "startCardNo", &format!("{value:04X}"))?;
-            let _ = ocw_store::record_audit(
-                &conn,
-                "reset_water_mark",
-                Some(&format!("{value:04X}")),
-                Some(&format!("warnAt={warn_at:04X}")),
-                "ok",
-                Some(me.operator_id),
-            );
-        }
-        eprintln!("[water] 水位已重置为 {value:04X}（原水位见审计），请确认全部门锁已刷复位卡");
-        compute_status(&db, &path)
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn card_no_status(state: State<'_, AppState>) -> Result<CardNoStatus, CommandError> {
-    require_login(&state)?;
-    let db = state.db.clone();
-    let path = state.runtime_dir.join("CardNo.state");
-    blocking(move || compute_status(&db, &path)).await
-}
-
 // ---------------------------------------------------------------- 发客卡
 
 fn snapshot_from_record(rec: &IssuanceRecord, room: &Room) -> CardSnapshot {
     let raw_hex = rec.raw_hex.clone().unwrap_or_default();
-    let card_no = rec.card_no.and_then(|v| u16::try_from(v).ok());
+    // 发卡记录不再保存卡号；回放快照没有卡号，也无法从记录还原发卡日/时/序号。
+    let card_no: Option<u16> = None;
     // 页1[2] 低 4 位 = 挂失（TD-150）；与 ocw_device::parse 的解码口径一致
     let is_lost = raw_hex.len() >= 6
         && u8::from_str_radix(&raw_hex[4..6], 16)
@@ -917,15 +776,7 @@ fn snapshot_from_record(rec: &IssuanceRecord, room: &Room) -> CardSnapshot {
     } else {
         0
     };
-    // 卡号 = 日(5) + 时(5) + 小时内序号(6)
-    let (issue_day, issue_hour, issue_seq) = match card_no {
-        Some(n) => (
-            ((n >> 11) & 0x1F) as i32,
-            ((n >> 6) & 0x1F) as i32,
-            (n & 0x3F) as i32,
-        ),
-        None => (-1, -1, -1),
-    };
+    let (issue_day, issue_hour, issue_seq) = (-1, -1, -1);
     CardSnapshot {
         kind: CardKind::from_label(&rec.kind),
         kind_label: rec.kind.clone(),
@@ -1083,6 +934,8 @@ pub async fn issue_guest(
     let g_id_authority = clip(&g.id_authority, 100);
     let g_device_model = clip(&g.device_model, 64);
     let g_device_serial = clip(&g.device_serial, 64);
+    // 卡号计数器归产品侧维护（SDK/CLI 不再碰 CardNo.state）
+    let runtime_dir = state.runtime_dir.clone();
 
     blocking(move || {
         // 1) 幂等回放：同一个键已经发过，直接把上次结果还回去
@@ -1146,17 +999,41 @@ pub async fn issue_guest(
         let started = Instant::now();
         let amount_text = amount.to_string();
         let flag = if use_days { "--days" } else { "--hours" };
-        let mut args: Vec<&str> = vec!["--room", room_no.as_str(), flag, amount_text.as_str()];
+        // 卡号由产品侧递推（CLI 不再自增）：同小时 seq+1，满 63 进位
+        let now = Local::now();
+        let card_no = cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_at(now);
+        let (cd, ch, cseq) = cardno::decode(card_no);
+        let at = format!(
+            "{}-{:02}-{:02} {:02}:{:02}",
+            now.year(),
+            now.month(),
+            cd,
+            ch,
+            now.minute()
+        );
+        let idx_str = room.room_index.to_string();
+        let seq_str = cseq.to_string();
+
+        let mut args: Vec<&str> = vec![
+            "--room-index",
+            idx_str.as_str(),
+            "--seq",
+            seq_str.as_str(),
+            "--datetime",
+            at.as_str(),
+            flag,
+            amount_text.as_str(),
+        ];
         if lost.unwrap_or(false) {
             args.push("--lost");
         }
-        // 模拟设备会离线构包并推进 CardNo.state；真机返回 None，继续走 CLI
+        // 模拟设备会离线构包；真机返回 None，继续走 CLI
         let card = match device.sim_issue_guest(
             room.room_index,
             &room_no,
             if use_days { amount } else { 0 },
             if use_days { 0 } else { amount },
-            None,
+            Some(card_no),
             lost.unwrap_or(false),
         ) {
             Some(res) => res?,
@@ -1173,7 +1050,6 @@ pub async fn issue_guest(
                     kind: &card.kind_label,
                     days: card.days as i64,
                     hours: card.hours as i64,
-                    card_no: card.card_no,
                     raw_hex: Some(card.raw_hex.as_str()),
                     operator_id: Some(me.operator_id),
                     reader_id: None,
@@ -1586,6 +1462,37 @@ pub async fn list_reservations(
     .await
 }
 
+/// 记录页预定查询（TD-167）：包含已取消 / 已入住，支持筛选与分页。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn list_reservation_records(
+    state: State<'_, AppState>,
+    room_no: Option<String>,
+    guest_name: Option<String>,
+    status: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<ocw_store::Page<ocw_store::Reservation>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let filter = ocw_store::ReservationFilter {
+            room_no,
+            guest_name,
+            status,
+            from,
+            to,
+            page: page.unwrap_or(1),
+            page_size: page_size.unwrap_or(20),
+        };
+        Ok(ocw_store::search_reservations(&conn, &filter)?)
+    })
+    .await
+}
+
 /// 新建预定。`check_out` 是退房日（不含）。
 #[tauri::command]
 pub async fn create_reservation(
@@ -1719,8 +1626,6 @@ pub struct RoomMovePreview {
     pub active_until: Option<String>,
     /// 源房最近一张有效客卡记录：用来把客人信息、时长带到新房
     pub latest: Option<ocw_store::IssuanceRecord>,
-    /// 源房当前所有有效客卡的卡号（去重）。换房前要读卡核对"是不是本房原卡"。
-    pub active_card_nos: Vec<u16>,
 }
 
 /// 换房第一步：查源房"能带走什么"，**不改任何数据**。
@@ -1740,13 +1645,11 @@ pub async fn room_move_preview(
             CommandError::new(1, format!("房号不存在：{room_no}"), "刷新房间列表后重试")
         })?;
         let latest = ocw_store::latest_active_guest_card(&conn, &room_no)?;
-        let active_card_nos = ocw_store::active_guest_card_nos(&conn, &room_no)?;
         Ok(RoomMovePreview {
             room_no,
             cards: room.active_cards,
             active_until: room.active_until,
             latest,
-            active_card_nos,
         })
     })
     .await
@@ -1757,14 +1660,12 @@ pub async fn room_move_preview(
 /// 只做业务登记 —— 卡内的房间序号是写死在卡里的，旧卡仍能开**源房**的门，
 /// 直到它自己过期；新房必须重新写一张卡（前端接着打开目标房的发卡表单）。
 ///
-/// `card_no` 是换房前读到的卡号，只用于审计留痕（证明当时核对的是哪张卡）；
-/// 不是本房原卡时前端会二次确认，确认后仍带上实际读到的卡号。
+/// 卡号不再落库/审计；换房核对由读卡记录（时间戳匹配）在前端完成。
 #[tauri::command]
 pub async fn room_move_out(
     state: State<'_, AppState>,
     room_no: String,
     to_room_no: String,
-    card_no: Option<u16>,
 ) -> Result<CheckoutResult, CommandError> {
     let me = require_login(&state)?;
     let db = state.db.clone();
@@ -1790,13 +1691,7 @@ pub async fn room_move_out(
             &conn,
             "move_room",
             Some(&room_no),
-            Some(&format!(
-                "to={to_room_no} cardsClosed={closed} readCard={}",
-                match card_no {
-                    Some(n) => format!("0x{n:04X}"),
-                    None => "未读卡".to_string(),
-                }
-            )),
+            Some(&format!("to={to_room_no} cardsClosed={closed}")),
             "ok",
             Some(me.operator_id),
         );
@@ -1840,7 +1735,16 @@ pub struct RestoreResult {
     pub schema_version: i64,
     pub rooms: i64,
     pub issuances: i64,
+    pub reservations: i64,
     pub operators: i64,
+    /// 当前已有、备份也有：保留当前密码 / 角色 / 启用状态的账号数
+    pub operators_preserved: i64,
+    /// 备份有、当前没有：导入但停用的账号数
+    pub operators_imported_disabled: i64,
+    /// 当前有、备份没有：补回的当前账号数
+    pub operators_reinserted: i64,
+    /// 账号合并单条失败数
+    pub operator_failures: i64,
 }
 
 /// 备份文件放哪：与数据库同级的 `backups\` 目录（实现放在 backup_job，自动备份也用同一处）。
@@ -2028,6 +1932,8 @@ pub async fn restore_database(
         }
 
         let mut conn = lock_db(&db)?;
+        // 恢复前的当前账号快照：恢复后按 login 合并回来，密码 / 角色 / 启用状态优先保留。
+        let current_operators = ocw_store::snapshot_operators(&conn)?;
 
         // 2) 先把 WAL 落盘，再给当前库留一份安全副本
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -2041,18 +1947,38 @@ pub async fn restore_database(
         // 3) 覆盖 + 迁移（备份可能来自老 schema）
         ocw_store::restore_from(&mut conn, &src)?;
         ocw_store::migrate(&conn)?;
+        // 4) 账号优先保留当前值：已有账号的密码/角色/启用状态不被备份覆盖
+        let merge = ocw_store::merge_operators_after_restore(&conn, &current_operators)?;
 
         let after = ocw_store::inspect_backup(&src)?;
+        // 业务记录数直接查恢复后的当前库，而不是信任备份文件里的计数
+        let rooms: i64 = conn
+            .query_row("SELECT COUNT(*) FROM room", [], |r| r.get(0))
+            .map_err(|e| CommandError::internal(format!("统计房间失败：{e}")))?;
+        let issuances: i64 = conn
+            .query_row("SELECT COUNT(*) FROM issuance", [], |r| r.get(0))
+            .map_err(|e| CommandError::internal(format!("统计发卡记录失败：{e}")))?;
+        let reservations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reservation", [], |r| r.get(0))
+            .map_err(|e| CommandError::internal(format!("统计预定记录失败：{e}")))?;
+        let operators = ocw_store::count_operators(&conn)?;
         let _ = ocw_store::record_audit(
             &conn,
             "restore_database",
             None,
             Some(&format!(
-                "from={} before={} rooms={} issuances={}",
+                "from={} before={} rooms={} issuances={} reservations={} operators={} \
+                 preserved={} importedDisabled={} reinserted={} failed={}",
                 src.display(),
                 before.display(),
-                after.rooms,
-                after.issuances
+                rooms,
+                issuances,
+                reservations,
+                operators,
+                merge.preserved,
+                merge.imported_disabled,
+                merge.reinserted,
+                merge.failed
             )),
             "ok",
             Some(me.operator_id),
@@ -2061,9 +1987,14 @@ pub async fn restore_database(
         Ok(RestoreResult {
             before: before.display().to_string(),
             schema_version: after.schema_version,
-            rooms: after.rooms,
-            issuances: after.issuances,
-            operators: after.operators,
+            rooms,
+            issuances,
+            reservations,
+            operators,
+            operators_preserved: merge.preserved,
+            operators_imported_disabled: merge.imported_disabled,
+            operators_reinserted: merge.reinserted,
+            operator_failures: merge.failed,
         })
     })
     .await
@@ -2108,47 +2039,56 @@ pub struct CheckoutCardResult {
     pub remaining: i64,
 }
 
-/// 读卡退房 / 持卡退房：按卡号关闭这一张卡。
+/// 读卡退房 / 持卡退房：按读卡得到的时间戳匹配发卡记录，再按记录 id 关闭。
+///
+/// - 持卡退房：传 `card_no`（读卡器上读到的），后端核对客卡/卡号、擦卡后用时间戳反查记录；
+/// - 无卡退房：`no_device = true` + `issuance_id`，跳过读卡器，只按选中的记录 id 关闭。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn checkout_card(
     state: State<'_, AppState>,
-    card_no: u16,
-    // 无卡退房（TD-121 的选卡弹窗）：true = 用户手上没有卡，跳过读卡器（不读卡、不擦卡），
-    // 只做数据库标记；缺省 = 持卡退房（TD-124：先擦卡后改库）。
+    card_no: Option<u16>,
+    issuance_id: Option<i64>,
     no_device: Option<bool>,
 ) -> Result<CheckoutCardResult, CommandError> {
     let me = require_login(&state)?;
     let skip_device = no_device.unwrap_or(false);
     let device = state.device();
 
-    // 持卡退房（TD-124）：先擦卡、后改库 —— 卡要在读卡器上、擦卡成功才登记退房。
-    // 模拟设备没有真实读写闭环：只做「尽力擦卡」，跳过读卡确认与读回校验。
+    // (房号, 卡型, 日, 时, 序号)：持卡退房时用于按时间戳反查记录
+    let mut stamp: Option<(String, &'static str, u16, u16, u16)> = None;
     if !skip_device {
-        if device.is_sim() {
-            let _ = device.erase_card();
-        } else {
-            let on_card = device.read_card()?;
-            // 读卡退房**只处理客卡**（日租 / 钟点）；管理卡（总控/复位/清除/安装/校时）不走退房流程，
-            // 否则会把卡擦成空白，破坏仍需在场的开门工具。
-            if !matches!(on_card.kind, CardKind::GuestDay | CardKind::GuestHour) {
+        let card_no = card_no.ok_or_else(|| CommandError::new(1, "没有读到卡号", "重新读卡"))?;
+        let on_card = device.read_card()?;
+        // 读卡退房**只处理客卡**（日租 / 钟点）；管理卡不走退房流程。
+        let kind = match on_card.kind {
+            CardKind::GuestDay => "日租客卡",
+            CardKind::GuestHour => "钟点客卡",
+            _ => {
                 return Err(CommandError::new(
                     1,
                     format!("这张卡是「{}」，不能用读卡退房", on_card.kind_label),
                     "读卡退房只处理日租/钟点客卡；管理卡请用对应的作废或重写流程",
-                ));
+                ))
             }
-            if on_card.card_no != Some(card_no) {
-                let on_card_text = on_card
-                    .card_no
-                    .map(|n| format!("0x{n:04X}"))
-                    .unwrap_or_else(|| "空白 / 无法识别".into());
-                return Err(CommandError::new(
-                    1,
-                    format!("读卡器上的卡号与要退的不一致（卡上 {on_card_text}，要退 0x{card_no:04X}）"),
-                    "请确认放在读卡器上的是这张卡；手上没卡请改用无卡退房",
-                ));
-            }
-            // 写零擦卡 → 读回确认已是空白卡
+        };
+        if on_card.card_no != Some(card_no) {
+            return Err(CommandError::new(
+                1,
+                "读卡器上的卡与要退的卡不一致",
+                "请确认放在读卡器上的是这张卡；手上没卡请改用无卡退房",
+            ));
+        }
+        let room_no = on_card.room.clone().ok_or_else(|| {
+            CommandError::new(1, "卡片没有房号", "确认卡是本系统发的；手上没卡请改用无卡退房")
+        })?;
+        let (day, hour, seq) = cardno::decode(card_no);
+        stamp = Some((room_no, kind, day, hour, seq));
+
+        // 持卡退房（TD-124）：先擦卡、后改库；模拟设备没有真实读写闭环，只做尽力擦卡。
+        if device.is_sim() {
+            let _ = device.erase_card();
+        } else {
             device.erase_card()?;
             let after = device.read_card()?;
             if !after.kind.is_blank() {
@@ -2165,12 +2105,27 @@ pub async fn checkout_card(
     blocking(move || {
         let conn = lock_db(&db)?;
         let dirty = ocw_store::checkout_status(&conn)?;
-        let hit = ocw_store::checkout_card(&conn, card_no, &dirty)?;
-        let Some((room_no, remaining)) = hit else {
+        let id = if let Some(id) = issuance_id {
+            id
+        } else {
+            let (room_no, kind, day, hour, seq) = stamp.ok_or_else(|| {
+                CommandError::new(1, "没有可退的记录", "重新读卡或改用无卡退房")
+            })?;
+            ocw_store::find_issuance_by_stamp(&conn, Some(&room_no), kind, day, hour, seq)?
+                .ok_or_else(|| {
+                    CommandError::new(
+                        1,
+                        "没有找到这张卡的发卡记录",
+                        "可能不是本系统发的卡，改用无卡退房",
+                    )
+                })?
+                .id
+        };
+        let Some((room_no, remaining)) = ocw_store::checkout_issuance(&conn, id, &dirty)? else {
             return Err(CommandError::new(
                 1,
-                format!("卡号 0x{card_no:04X} 没有发卡记录"),
-                "这张卡可能不是本系统发的，只能用无卡退房按房间处理",
+                "这条记录已退房或不是有效客卡",
+                "刷新后重试",
             ));
         };
         let _ = ocw_store::record_audit(
@@ -2178,7 +2133,7 @@ pub async fn checkout_card(
             "checkout_card",
             Some(&room_no),
             Some(&format!(
-                "cardNo={card_no} remaining={remaining} erased={}",
+                "remaining={remaining} erased={}",
                 if skip_device { 0 } else { 1 }
             )),
             "ok",
@@ -2189,16 +2144,14 @@ pub async fn checkout_card(
     .await
 }
 
-/// 强制退房：卡不是本系统发的（本地没有发卡记录），按卡号找不到房间，
-/// 只能按前端从卡片数据里读出的房号，**直接写入退房数据**。
+/// 强制退房：卡不是本系统发的（本地没有发卡记录），按前端读到的房号**直接写入退房数据**。
 ///
-/// 语义等同该房间的「无卡退房」：关闭该房全部有效卡 + 房态置为退房默认态，
-/// 并在审计里记下是强制退房、来自哪个卡号。调用方必须先让用户二次确认。
+/// 语义等同该房间的「无卡退房」：关闭该房全部有效卡 + 房态置为退房默认态。
+/// 调用方必须先让用户二次确认。
 #[tauri::command]
 pub async fn force_checkout_card(
     state: State<'_, AppState>,
     room_no: String,
-    card_no: u16,
 ) -> Result<CheckoutResult, CommandError> {
     let me = require_login(&state)?;
     let db = state.db.clone();
@@ -2218,7 +2171,7 @@ pub async fn force_checkout_card(
             &conn,
             "force_checkout_card",
             Some(&room_no),
-            Some(&format!("cardNo={card_no} cardsClosed={closed} foreignCard=true")),
+            Some(&format!("cardsClosed={closed} foreignCard=true")),
             "ok",
             Some(me.operator_id),
         );
@@ -3084,7 +3037,6 @@ type AuditPage = ocw_store::Page<ocw_store::AuditRow>;
 pub async fn list_issuances(
     state: State<'_, AppState>,
     room_no: Option<String>,
-    card_no: Option<u16>,
     kind: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -3099,7 +3051,6 @@ pub async fn list_issuances(
         let conn = lock_db(&db)?;
         let filter = ocw_store::IssuanceFilter {
             room_no,
-            card_no,
             kind,
             from,
             to,
@@ -3137,20 +3088,6 @@ pub async fn list_audits(
     .await
 }
 
-#[tauri::command]
-pub async fn card_history(
-    state: State<'_, AppState>,
-    card_no: u16,
-) -> Result<Vec<ocw_store::IssuanceRow>, CommandError> {
-    require_login(&state)?;
-    let db = state.db.clone();
-    blocking(move || {
-        let conn = lock_db(&db)?;
-        Ok(ocw_store::card_history(&conn, card_no, 200)?)
-    })
-    .await
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsvResult {
@@ -3179,7 +3116,7 @@ fn csv_cell(value: &str) -> String {
 /// 导出 CSV 文本（纯函数，便于单测）：UTF-8 BOM + CRLF，Excel 双击不乱码。
 pub fn issuances_to_csv(rows: &[ocw_store::IssuanceRow]) -> String {
     let mut out = String::from("\u{feff}");
-    out.push_str("记录ID,发卡时间,房号,卡型,天数,小时,卡号,客人,证件类型,证件号码,操作员,结果,到期时间,退房时间,耗时ms,原始数据\r\n");
+    out.push_str("记录ID,发卡时间,房号,卡型,天数,小时,客人姓名,性别,证件类型,证件号码,民族,住址,出生日期,备注,证件有效期起,证件有效期止,签发机关,读卡设备型号,读卡设备序列,操作员,结果,到期时间,退房时间,耗时ms,原始数据\r\n");
     for r in rows {
         let cells = [
             r.id.to_string(),
@@ -3188,10 +3125,19 @@ pub fn issuances_to_csv(rows: &[ocw_store::IssuanceRow]) -> String {
             r.kind.clone(),
             r.days.to_string(),
             r.hours.to_string(),
-            r.card_no.map(|n| format!("0x{n:04X}")).unwrap_or_default(),
             r.guest_name.clone().unwrap_or_default(),
+            r.guest_gender.clone().unwrap_or_default(),
             r.guest_id_type.clone().unwrap_or_default(),
             r.guest_id_number.clone().unwrap_or_default(),
+            r.guest_nation.clone().unwrap_or_default(),
+            r.guest_address.clone().unwrap_or_default(),
+            r.guest_birth_date.clone().unwrap_or_default(),
+            r.guest_note.clone().unwrap_or_default(),
+            r.id_valid_from.clone().unwrap_or_default(),
+            r.id_valid_to.clone().unwrap_or_default(),
+            r.id_authority.clone().unwrap_or_default(),
+            r.id_device_model.clone().unwrap_or_default(),
+            r.id_device_serial.clone().unwrap_or_default(),
             r.operator_name.clone().unwrap_or_default(),
             r.result.clone(),
             r.expires_at.clone().unwrap_or_default(),
@@ -3206,26 +3152,37 @@ pub fn issuances_to_csv(rows: &[ocw_store::IssuanceRow]) -> String {
     out
 }
 
-/// 导出目录：桌面 → OneDrive 桌面 → 下载 → 数据目录 exports（取第一个存在的）。
+/// 导出目录：系统「桌面」→ 系统「下载」→ 数据目录 `exports`。
+///
+/// **不能用 `%USERPROFILE%\Desktop` 硬拼**：Windows 允许把桌面重定向到 D 盘
+/// 或其他目录（甚至 OneDrive）。重定向后旧的 `C:\Users\<用户>\Desktop` 仍可能
+/// 作为空目录存在，`is_dir()` 判真就会把 CSV 写回 C 盘旧位置。
+/// `dirs::desktop_dir()` 走 `SHGetKnownFolderPath(FOLDERID_Desktop)`，返回系统
+/// 当前真实的桌面位置；`download_dir()` 同理。
 fn export_dir() -> std::path::PathBuf {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    if !home.is_empty() {
-        let desktop = std::path::PathBuf::from(&home).join("Desktop");
-        if desktop.is_dir() {
-            return desktop;
-        }
-        if let Ok(one) = std::env::var("OneDrive") {
-            let d = std::path::PathBuf::from(one).join("Desktop");
-            if d.is_dir() {
-                return d;
-            }
-        }
-        let downloads = std::path::PathBuf::from(&home).join("Downloads");
-        if downloads.is_dir() {
-            return downloads;
-        }
-    }
-    crate::provision::data_root().join("exports")
+    pick_export_dir(
+        dirs::desktop_dir(),
+        dirs::download_dir(),
+        crate::provision::data_root().join("exports"),
+    )
+}
+
+/// CSV 文件名：入住记录与发卡记录分开，避免入住记录也显示成「发卡记录-…csv」。
+fn csv_export_name(guest_only: bool, stamp: &str) -> String {
+    let prefix = if guest_only { "入住记录" } else { "发卡记录" };
+    format!("{prefix}-{stamp}.csv")
+}
+
+/// 按优先级选一个存在的导出目录；桌面 / 下载都由 Known Folder 解析。
+fn pick_export_dir(
+    desktop: Option<std::path::PathBuf>,
+    downloads: Option<std::path::PathBuf>,
+    fallback: std::path::PathBuf,
+) -> std::path::PathBuf {
+    desktop
+        .filter(|d| d.is_dir())
+        .or_else(|| downloads.filter(|d| d.is_dir()))
+        .unwrap_or(fallback)
 }
 
 /// 导出当前筛选结果为 CSV（管理员）。上限 5 万行：超了让用户缩范围，不静默截断。
@@ -3234,24 +3191,25 @@ fn export_dir() -> std::path::PathBuf {
 pub async fn export_issuances_csv(
     state: State<'_, AppState>,
     room_no: Option<String>,
-    card_no: Option<u16>,
     kind: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    // 入住记录导出（TD-165）：true 时只导出填了身份信息的发卡
+    guest_only: Option<bool>,
 ) -> Result<CsvResult, CommandError> {
     let me = require_admin(&state)?;
     let db = state.db.clone();
     blocking(move || {
         let conn = lock_db(&db)?;
+        let guest_only = guest_only.unwrap_or(false);
         let filter = ocw_store::IssuanceFilter {
             room_no,
-            card_no,
             kind,
             from,
             to,
             page: 1,
             page_size: 50_000,
-            guest_only: false,
+            guest_only,
         };
         let page = ocw_store::list_issuances(&conn, &filter)?;
         if page.rows.len() >= 50_000 {
@@ -3265,7 +3223,7 @@ pub async fn export_issuances_csv(
         let dir = export_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| CommandError::internal(format!("创建导出目录失败：{e}")))?;
-        let name = format!("发卡记录-{}.csv", local_stamp(&conn));
+        let name = csv_export_name(guest_only, &local_stamp(&conn));
         let path = dir.join(name);
         std::fs::write(&path, csv.as_bytes())
             .map_err(|e| CommandError::internal(format!("写 CSV 失败：{e}")))?;
@@ -3397,6 +3355,54 @@ mod tests {
     }
 
     #[test]
+    fn pick_export_dir_prefers_desktop_then_downloads_then_fallback() {
+        let root = std::env::temp_dir().join(format!("ocw-export-dir-{}", std::process::id()));
+        let desktop = root.join("Desktop");
+        let downloads = root.join("Downloads");
+        let fallback = root.join("exports");
+        std::fs::create_dir_all(&desktop).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+
+        assert_eq!(
+            pick_export_dir(
+                Some(desktop.clone()),
+                Some(downloads.clone()),
+                fallback.clone()
+            ),
+            desktop,
+            "桌面存在时优先桌面"
+        );
+        assert_eq!(
+            pick_export_dir(
+                Some(root.join("MissingDesktop")),
+                Some(downloads.clone()),
+                fallback.clone()
+            ),
+            downloads,
+            "桌面不存在时用下载"
+        );
+        assert_eq!(
+            pick_export_dir(None, None, fallback.clone()),
+            fallback,
+            "都不可用时回退数据目录"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn csv_export_name_distinguishes_guest_records() {
+        assert_eq!(
+            csv_export_name(false, "20261108-222850"),
+            "发卡记录-20261108-222850.csv"
+        );
+        assert_eq!(
+            csv_export_name(true, "20261108-222850"),
+            "入住记录-20261108-222850.csv"
+        );
+    }
+
+    #[test]
     fn master_defaults_to_one_day() {
         let a = args(AdminCardRequest::Master {
             days: None,
@@ -3427,6 +3433,7 @@ mod tests {
         let a = args(AdminCardRequest::TimeSync {
             hour: None,
             minute: None,
+            at: None,
         });
         assert_eq!(a, vec!["--type", "timesync"]);
     }
@@ -3436,6 +3443,7 @@ mod tests {
         let a = args(AdminCardRequest::TimeSync {
             hour: Some(9),
             minute: Some(5),
+            at: None,
         });
         assert_eq!(a, vec!["--type", "timesync", "--room", "09:05"]);
     }
@@ -3516,7 +3524,7 @@ mod tests {
     }
 
     /// 全量对照表。**新增命令必须在这里登记**，否则矩阵测试会报「未登记」。
-    /// 三档数量：35 / 29 / 6（改动数量时同步改 `auth_matrix_counts`）。
+    /// 三档数量：35 / 29 / 7（改动数量时同步改 `auth_matrix_counts`）。
     const MATRIX: &[(&str, Level)] = &[
         // 公开（启动即调用 / 认证入口）
         ("app_info", Level::Public),
@@ -3530,7 +3538,6 @@ mod tests {
         ("list_rooms", Level::Login),
         ("run_selftest", Level::Login),
         ("probe_ports", Level::Public),
-        ("card_no_status", Level::Login),
         ("issue_guest", Level::Login),
         ("list_room_types", Level::Login),
         ("list_room_statuses", Level::Login),
@@ -3548,9 +3555,9 @@ mod tests {
         ("expiring_cards", Level::Login),
         ("list_issuances", Level::Login),
         ("list_audits", Level::Login),
-        ("card_history", Level::Login),
         ("get_onboarding_status", Level::Login),
         ("list_reservations", Level::Login),
+        ("list_reservation_records", Level::Login),
         ("create_reservation", Level::Login),
         ("update_reservation", Level::Login),
         ("cancel_reservation", Level::Login),
@@ -3563,8 +3570,6 @@ mod tests {
         ("rename_room", Level::Admin),
         ("issue_install_card", Level::Admin),
         ("issue_admin_card", Level::Admin),
-        ("set_water_warn_at", Level::Admin),
-        ("reset_water_mark", Level::Admin),
         ("list_departments", Level::Admin),
         ("create_department", Level::Admin),
         ("rename_department", Level::Admin),
@@ -3628,7 +3633,6 @@ mod tests {
     /// 这条测试的价值在于「删掉某个 require_admin 会立刻变红」——
     /// 比人工逐条 review 可靠，也让新加的命令无处可逃。
     #[test]
-    #[test]
     fn backup_name_filter_covers_all_sources() {
         // TD-133：导入的 imported-*、自动的 auto-* 之前被过滤掉，列表里看不到、也就无法恢复
         assert!(is_backup_name("ocw-20261107-211000.db"), "手动备份");
@@ -3644,6 +3648,7 @@ mod tests {
         assert!(!is_backup_name("notes.txt"), "无关文件不算备份");
     }
 
+    #[test]
     fn auth_matrix_matches_every_command() {
         let bodies = command_bodies();
         assert!(!bodies.is_empty(), "没切出任何命令，正则/切片逻辑坏了");
@@ -3686,8 +3691,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (37, 29, 7));
-        assert_eq!(command_bodies().len(), 73, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (35, 28, 7));
+        assert_eq!(command_bodies().len(), 70, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {
@@ -3754,7 +3759,6 @@ mod tests {
             kind: "日租客卡".into(),
             days: 1,
             hours: 0,
-            card_no: Some(0x2404),
             guest_name: Some("张三,李四".into()),
             guest_gender: None,
             guest_id_type: Some("身份证".into()),
@@ -3782,7 +3786,6 @@ mod tests {
         assert!(csv.contains("\"张三,李四\""), "逗号字段要加引号");
         assert!(csv.contains("'=1+1"), "公式注入要前置单引号");
         assert!(csv.contains("\"值班\"\"甲\""), "内部引号要翻倍");
-        assert!(csv.contains("0x2404"));
     }
 
 }

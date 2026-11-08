@@ -73,7 +73,6 @@ pub struct IssuanceRecord {
     pub kind: String,
     pub days: i64,
     pub hours: i64,
-    pub card_no: Option<i64>,
     pub raw_hex: Option<String>,
     pub operator_id: Option<i64>,
     pub result: String,
@@ -477,7 +476,7 @@ const ROOM_SELECT: &str = "SELECT r.room_no, r.room_index, r.building, r.floor, 
                                   t.name, r.max_cards, r.status, r.active, r.install_card_at, r.created_at, \
                                   (SELECT COUNT(*) FROM issuance i \
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
-                                      AND i.card_no IS NOT NULL AND i.expires_at IS NOT NULL \
+                                      AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
                                       AND i.kind IN ('日租客卡','钟点客卡') \
                                       AND i.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), \
@@ -553,7 +552,6 @@ pub fn count_active_cards(conn: &Connection, room_no: &str) -> Result<i64> {
            FROM issuance
           WHERE room_no = ?1
             AND result = 'ok'
-            AND card_no IS NOT NULL
             AND expires_at IS NOT NULL
             AND checked_out_at IS NULL
             AND kind IN ('日租客卡','钟点客卡')
@@ -587,46 +585,23 @@ pub fn latest_active_guest_card(
         .optional()?)
 }
 
-/// 该房间当前所有**有效客卡的卡号**（去重）。
-///
-/// 换房要先读卡核对"这张卡是不是本房的原卡"，判据就是读到的卡号在不在这个集合里。
-/// 口径与 [`count_active_cards`] / [`latest_active_guest_card`] 完全一致。
-pub fn active_guest_card_nos(conn: &Connection, room_no: &str) -> Result<Vec<u16>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT card_no FROM issuance
-          WHERE room_no = ?1
-            AND result = 'ok'
-            AND card_no IS NOT NULL
-            AND checked_out_at IS NULL
-            AND expires_at IS NOT NULL
-            AND kind IN ('日租客卡','钟点客卡')
-            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-          ORDER BY card_no",
-    )?;
-    let rows = stmt.query_map(params![room_no], |r| r.get::<_, i64>(0))?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r? as u16);
-    }
-    Ok(out)
-}
-
 // ---------------------------------------------------------------- 房态
 
-/// 按卡号退房：只关闭这一张卡；若该房已没有别的有效卡，再把房态置为 `dirty_status`。
+/// 按发卡记录 id 退房：只关闭这一条记录；若该房已没有别的有效卡，再把房态置为 `dirty_status`。
 ///
-/// 返回房号与剩余有效卡数（卡号查不到记录时返回 `None`）。
-pub fn checkout_card(
+/// 返回房号与剩余有效卡数（记录不存在 / 不是客卡 / 已退房时返回 `None`）。
+pub fn checkout_issuance(
     conn: &Connection,
-    card_no: u16,
+    id: i64,
     dirty_status: &str,
 ) -> Result<Option<(String, i64)>> {
     let room_no: Option<String> = conn
         .query_row(
             "SELECT room_no FROM issuance
-              WHERE card_no = ?1 AND result = 'ok' AND room_no IS NOT NULL
-              ORDER BY created_at DESC, id DESC LIMIT 1",
-            params![card_no as i64],
+              WHERE id = ?1 AND result = 'ok' AND room_no IS NOT NULL
+                AND checked_out_at IS NULL AND expires_at IS NOT NULL
+                AND kind IN ('日租客卡','钟点客卡')",
+            params![id],
             |r| r.get(0),
         )
         .optional()?;
@@ -635,17 +610,15 @@ pub fn checkout_card(
         return Ok(None);
     };
 
-    conn.execute(
+    let n = conn.execute(
         "UPDATE issuance
             SET checked_out_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-          WHERE card_no = ?1
-            AND result = 'ok'
-            AND checked_out_at IS NULL
-            AND expires_at IS NOT NULL
-            AND kind IN ('日租客卡','钟点客卡')
-            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
-        params![card_no as i64],
+          WHERE id = ?1 AND checked_out_at IS NULL",
+        params![id],
     )?;
+    if n == 0 {
+        return Ok(None);
+    }
 
     let remaining = count_active_cards(conn, &room_no)?;
     if remaining == 0 {
@@ -988,6 +961,96 @@ pub fn list_reservations(
     Ok(out)
 }
 
+/// 记录页的预定查询条件（TD-167）。与日历用的 `list_reservations` 不同：
+/// **包含已取消 / 已入住**，日期按 `check_in` 过滤，且分页。
+#[derive(Debug, Clone, Default)]
+pub struct ReservationFilter {
+    pub room_no: Option<String>,
+    pub guest_name: Option<String>,
+    /// booked / checked_in / cancelled；None = 全部
+    pub status: Option<String>,
+    /// check_in >= from（YYYY-MM-DD）
+    pub from: Option<String>,
+    /// check_in < to（YYYY-MM-DD）
+    pub to: Option<String>,
+    pub page: i64,
+    pub page_size: i64,
+}
+
+/// 记录页预定查询：房号前缀 / 客人姓名模糊 / 状态 / 入住日区间 + 分页，按入住日倒序。
+pub fn search_reservations(
+    conn: &Connection,
+    f: &ReservationFilter,
+) -> Result<Page<Reservation>> {
+    use rusqlite::types::Value;
+
+    let from = f.from.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let to = f.to.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if let Some(d) = from {
+        if !is_valid_date(d) {
+            return Err(StoreError::Invalid("起始日期不合法".into()));
+        }
+    }
+    if let Some(d) = to {
+        if !is_valid_date(d) {
+            return Err(StoreError::Invalid("截止日期不合法".into()));
+        }
+    }
+    if let (Some(a), Some(b)) = (from, to) {
+        if b <= a {
+            return Err(StoreError::Invalid("查询日期区间不合法".into()));
+        }
+    }
+
+    let mut where_sql = String::from(" WHERE 1 = 1");
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(room) = f.room_no.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND r.room_no LIKE ? || '%'");
+        vals.push(Value::Text(room.to_string()));
+    }
+    if let Some(name) = f.guest_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        where_sql.push_str(" AND r.guest_name LIKE '%' || ? || '%'");
+        vals.push(Value::Text(name.to_string()));
+    }
+    if let Some(status) = f.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !matches!(status, "booked" | "checked_in" | "cancelled") {
+            return Err(StoreError::Invalid("预定状态不合法".into()));
+        }
+        where_sql.push_str(" AND r.status = ?");
+        vals.push(Value::Text(status.to_string()));
+    }
+    if let Some(d) = from {
+        where_sql.push_str(" AND r.check_in >= ?");
+        vals.push(Value::Text(d.to_string()));
+    }
+    if let Some(d) = to {
+        where_sql.push_str(" AND r.check_in < ?");
+        vals.push(Value::Text(d.to_string()));
+    }
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM reservation r{where_sql}"),
+        rusqlite::params_from_iter(vals.iter()),
+        |r| r.get(0),
+    )?;
+
+    let (size, offset) = limit_offset(f.page, f.page_size);
+    let sql = format!(
+        "{RESERVATION_SELECT}{where_sql} ORDER BY r.check_in DESC, r.id DESC LIMIT ? OFFSET ?"
+    );
+    let mut all = vals;
+    all.push(Value::Integer(size));
+    all.push(Value::Integer(offset));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(all.iter()), row_to_reservation)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(Page { rows: out, total })
+}
+
 pub fn create_reservation(
     conn: &Connection,
     input: &ReservationInput,
@@ -1248,25 +1311,24 @@ fn row_to_issuance(r: &Row<'_>) -> rusqlite::Result<IssuanceRecord> {
         kind: r.get(3)?,
         days: r.get(4)?,
         hours: r.get(5)?,
-        card_no: r.get(6)?,
-        raw_hex: r.get(7)?,
-        operator_id: r.get(8)?,
-        result: r.get(9)?,
-        error_code: r.get(10)?,
-        created_at: r.get(11)?,
-        guest_name: r.get(12)?,
-        guest_gender: r.get(13)?,
-        guest_id_type: r.get(14)?,
-        guest_id_number: r.get(15)?,
-        guest_nation: r.get(16)?,
-        guest_address: r.get(17)?,
-        guest_birth_date: r.get(18)?,
-        guest_note: r.get(19)?,
-        expires_at: r.get(20)?,
+        raw_hex: r.get(6)?,
+        operator_id: r.get(7)?,
+        result: r.get(8)?,
+        error_code: r.get(9)?,
+        created_at: r.get(10)?,
+        guest_name: r.get(11)?,
+        guest_gender: r.get(12)?,
+        guest_id_type: r.get(13)?,
+        guest_id_number: r.get(14)?,
+        guest_nation: r.get(15)?,
+        guest_address: r.get(16)?,
+        guest_birth_date: r.get(17)?,
+        guest_note: r.get(18)?,
+        expires_at: r.get(19)?,
     })
 }
 
-const ISSUANCE_COLUMNS: &str = "id, uuid, room_no, kind, days, hours, card_no, raw_hex, \
+const ISSUANCE_COLUMNS: &str = "id, uuid, room_no, kind, days, hours, raw_hex, \
                                 operator_id, result, error_code, created_at, \
                                 guest_name, guest_gender, guest_id_type, guest_id_number, \
                                 guest_nation, guest_address, guest_birth_date, guest_note, \
@@ -1277,7 +1339,6 @@ pub struct NewIssuance<'a> {
     pub kind: &'a str,
     pub days: i64,
     pub hours: i64,
-    pub card_no: Option<u16>,
     pub raw_hex: Option<&'a str>,
     pub operator_id: Option<i64>,
     pub reader_id: Option<&'a str>,
@@ -1365,16 +1426,15 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
     let uuid = uuid::Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO issuance
-           (uuid, room_no, kind, days, hours, card_no, raw_hex, operator_id, reader_id,
+           (uuid, room_no, kind, days, hours, raw_hex, operator_id, reader_id,
             result, error_code, idempotency_key, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             uuid,
             new.room_no,
             new.kind,
             new.days,
             new.hours,
-            new.card_no.map(|v| v as i64),
             new.raw_hex,
             new.operator_id,
             new.reader_id,
@@ -1514,13 +1574,48 @@ pub fn expiring_cards(conn: &Connection, within_minutes: i64) -> Result<Vec<Expi
     Ok(out)
 }
 
-/// 按卡号查最近一条记录。读卡页的"有没有发卡记录"就靠它。
-pub fn latest_issuance_for_card(conn: &Connection, card_no: u16) -> Result<Option<IssuanceRecord>> {
-    let sql = format!(
-        "SELECT {ISSUANCE_COLUMNS} FROM issuance WHERE card_no = ?1 ORDER BY created_at DESC, id DESC LIMIT 1"
+/// 按卡号里的时间戳（日 / 时 / 小时内序号）反查发卡记录。
+///
+/// - 客卡：`room_no = Some(...)`，同时按房号过滤；
+/// - 总控卡：`room_no = None`，只按卡型 + 时间戳匹配。
+///
+/// `created_at` 存的是 UTC，这里用 SQLite 的 `localtime` 取本地日/时；
+/// 同一小时内第 `seq` 张（0-based）对应按写入顺序的第 `seq + 1` 条。
+/// 失败记录也占序号，所以不过滤 `result`，由调用方判断取到的记录是否可用。
+pub fn find_issuance_by_stamp(
+    conn: &Connection,
+    room_no: Option<&str>,
+    kind: &str,
+    day: u16,
+    hour: u16,
+    seq: u16,
+) -> Result<Option<IssuanceRecord>> {
+    use rusqlite::types::Value;
+
+    let mut where_sql = String::from(
+        " WHERE kind = ?1 \
+          AND CAST(strftime('%d', created_at, 'localtime') AS INTEGER) = ?2 \
+          AND CAST(strftime('%H', created_at, 'localtime') AS INTEGER) = ?3",
     );
+    let mut vals: Vec<Value> = vec![
+        Value::Text(kind.to_string()),
+        Value::Integer(day as i64),
+        Value::Integer(hour as i64),
+    ];
+    if let Some(room) = room_no {
+        where_sql.push_str(" AND room_no = ?");
+        vals.push(Value::Text(room.to_string()));
+    }
+    let sql = format!(
+        "SELECT {ISSUANCE_COLUMNS} FROM issuance{where_sql} \n         ORDER BY created_at, id LIMIT 1 OFFSET ?"
+    );
+    vals.push(Value::Integer(seq as i64));
     Ok(conn
-        .query_row(&sql, params![card_no as i64], row_to_issuance)
+        .query_row(
+            &sql,
+            rusqlite::params_from_iter(vals.iter()),
+            row_to_issuance,
+        )
         .optional()?)
 }
 
@@ -1530,15 +1625,6 @@ pub fn find_issuance(conn: &Connection, id: i64) -> Result<Option<IssuanceRecord
     Ok(conn
         .query_row(&sql, params![id], row_to_issuance)
         .optional()?)
-}
-
-pub fn count_issuance_for_card(conn: &Connection, card_no: u16) -> Result<u32> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM issuance WHERE card_no = ?1",
-        params![card_no as i64],
-        |r| r.get(0),
-    )?;
-    Ok(n.max(0) as u32)
 }
 
 /// 按幂等键取既有记录。UI 连点两次时用它做"只发一张"的回放。
@@ -1552,22 +1638,6 @@ pub fn find_issuance_by_idempotency(
     Ok(conn
         .query_row(&sql, params![key], row_to_issuance)
         .optional()?)
-}
-
-/// 已发出过的最大卡号（启动时与 `CardNo.state` 比对用）。
-pub fn max_issued_card_no(conn: &Connection) -> Result<Option<u16>> {
-    // MAX() 在空表上返回一行 NULL，所以外层是 Option<Option<i64>>：
-    // 外层 = "查询有没有成行"，内层 = "值是不是 NULL"。
-    let raw: Option<Option<i64>> = conn
-        .query_row("SELECT MAX(card_no) FROM issuance", [], |r| {
-            r.get::<_, Option<i64>>(0)
-        })
-        .optional()?;
-
-    Ok(raw
-        .flatten()
-        .filter(|x| (0..=0xFFFF).contains(x))
-        .map(|x| x as u16))
 }
 
 // ---------------------------------------------------------------- 操作员
@@ -1605,6 +1675,96 @@ const OPERATOR_SELECT: &str =
 pub fn count_operators(conn: &Connection) -> Result<i64> {
     let n: i64 = conn.query_row("SELECT COUNT(*) FROM operator", [], |r| r.get(0))?;
     Ok(n)
+}
+
+/// 恢复备份前保存当前账号全字段（含密码哈希，仅供恢复流程内部使用）。
+///
+/// 恢复后按 `login` 与备份账号合并：当前库已有的账号保留密码 / 角色 / 启用状态。
+pub fn snapshot_operators(conn: &Connection) -> Result<Vec<Operator>> {
+    let sql = format!("{OPERATOR_SELECT} ORDER BY o.id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_operator)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// 恢复备份后账号合并的计数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperatorMergeReport {
+    /// 当前已有、备份也有：保留当前密码 / 角色 / 启用状态
+    pub preserved: i64,
+    /// 备份有、当前没有：导入但停用
+    pub imported_disabled: i64,
+    /// 当前有、备份没有：补回当前账号（部门置空）
+    pub reinserted: i64,
+    /// 单条更新 / 插入失败数
+    pub failed: i64,
+}
+
+/// 恢复整库后，把恢复前的当前账号按 `login` 合并回来。
+///
+/// - 当前有、备份也有：只覆盖备份行的 `pwd_hash` / `role` / `active`，
+///   显示名 / 部门 / `created_at` 用备份值，`operator.id` 沿用备份行（历史外键不变）；
+/// - 当前有、备份没有：插入当前账号（新 id，`department_id = NULL`）；
+/// - 备份有、当前没有：导入备份账号但 `active = 0`，由管理员手动启用。
+///
+/// 单条失败只累计 `failed`，不中断整次恢复。
+pub fn merge_operators_after_restore(
+    conn: &Connection,
+    current: &[Operator],
+) -> Result<OperatorMergeReport> {
+    let after = snapshot_operators(conn)?;
+    let mut report = OperatorMergeReport::default();
+
+    for cur in current {
+        if after.iter().any(|o| o.login == cur.login) {
+            match conn.execute(
+                "UPDATE operator SET pwd_hash = ?2, role = ?3, active = ?4 WHERE login = ?1",
+                params![
+                    cur.login,
+                    cur.pwd_hash,
+                    cur.role,
+                    if cur.active { 1 } else { 0 }
+                ],
+            ) {
+                Ok(n) if n > 0 => report.preserved += 1,
+                _ => report.failed += 1,
+            }
+        } else {
+            match conn.execute(
+                "INSERT INTO operator
+                   (login, display_name, role, pwd_hash, active, department_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![
+                    cur.login,
+                    cur.display_name,
+                    cur.role,
+                    cur.pwd_hash,
+                    if cur.active { 1 } else { 0 }
+                ],
+            ) {
+                Ok(_) => report.reinserted += 1,
+                Err(_) => report.failed += 1,
+            }
+        }
+    }
+
+    for acc in &after {
+        if !current.iter().any(|c| c.login == acc.login) {
+            match conn.execute(
+                "UPDATE operator SET active = 0 WHERE login = ?1",
+                params![acc.login],
+            ) {
+                Ok(n) if n > 0 => report.imported_disabled += 1,
+                _ => report.failed += 1,
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 pub fn find_operator(conn: &Connection, login: &str) -> Result<Option<Operator>> {
@@ -2044,7 +2204,6 @@ pub fn effective_max_cards(room_value: Option<i64>, global_default: i64) -> Opti
 #[derive(Debug, Clone, Default)]
 pub struct IssuanceFilter {
     pub room_no: Option<String>,
-    pub card_no: Option<u16>,
     pub kind: Option<String>,
     /// ISO8601 UTC 下界（含）
     pub from: Option<String>,
@@ -2068,7 +2227,6 @@ pub struct IssuanceRow {
     pub kind: String,
     pub days: i64,
     pub hours: i64,
-    pub card_no: Option<u16>,
     pub guest_name: Option<String>,
     pub guest_gender: Option<String>,
     pub guest_id_type: Option<String>,
@@ -2134,10 +2292,6 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
         where_sql.push_str(" AND room_no LIKE ? || '%'");
         vals.push(Value::Text(room.to_string()));
     }
-    if let Some(card) = f.card_no {
-        where_sql.push_str(" AND card_no = ?");
-        vals.push(Value::Integer(card as i64));
-    }
     if let Some(kind) = f.kind.as_ref().filter(|s| !s.is_empty()) {
         where_sql.push_str(" AND kind = ?");
         vals.push(Value::Text(kind.to_string()));
@@ -2163,7 +2317,7 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
 
     let (size, offset) = limit_offset(f.page, f.page_size);
     let sql = format!(
-        "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
+        "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours,
                 i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
                 i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
                 o.display_name,
@@ -2188,26 +2342,25 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
             kind: r.get(3)?,
             days: r.get(4)?,
             hours: r.get(5)?,
-            card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
-            guest_name: r.get(7)?,
-            guest_gender: r.get(8)?,
-            guest_id_type: r.get(9)?,
-            guest_id_number: r.get(10)?,
-            guest_nation: r.get(11)?,
-            guest_address: r.get(12)?,
-            guest_birth_date: r.get(13)?,
-            guest_note: r.get(14)?,
-            operator_name: r.get(15)?,
-            result: r.get(16)?,
-            expires_at: r.get(17)?,
-            checked_out_at: r.get(18)?,
-            duration_ms: r.get(19)?,
-            raw_hex: r.get(20)?,
-            id_valid_from: r.get(21)?,
-            id_valid_to: r.get(22)?,
-            id_authority: r.get(23)?,
-            id_device_model: r.get(24)?,
-            id_device_serial: r.get(25)?,
+            guest_name: r.get(6)?,
+            guest_gender: r.get(7)?,
+            guest_id_type: r.get(8)?,
+            guest_id_number: r.get(9)?,
+            guest_nation: r.get(10)?,
+            guest_address: r.get(11)?,
+            guest_birth_date: r.get(12)?,
+            guest_note: r.get(13)?,
+            operator_name: r.get(14)?,
+            result: r.get(15)?,
+            expires_at: r.get(16)?,
+            checked_out_at: r.get(17)?,
+            duration_ms: r.get(18)?,
+            raw_hex: r.get(19)?,
+            id_valid_from: r.get(20)?,
+            id_valid_to: r.get(21)?,
+            id_authority: r.get(22)?,
+            id_device_model: r.get(23)?,
+            id_device_serial: r.get(24)?,
         })
     })?;
     let mut out = Vec::new();
@@ -2275,57 +2428,6 @@ pub fn list_audits(
         out.push(r?);
     }
     Ok(Page { rows: out, total })
-}
-
-/// 同一张卡号的全部写入记录（按时间正序）——用来解释"这张卡被改写过几次"。
-pub fn card_history(conn: &Connection, card_no: u16, limit: i64) -> Result<Vec<IssuanceRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT i.id, i.created_at, i.room_no, i.kind, i.days, i.hours, i.card_no,
-                i.guest_name, i.guest_gender, i.guest_id_type, i.guest_id_number,
-                i.guest_nation, i.guest_address, i.guest_birth_date, i.guest_note,
-                o.display_name,
-                i.result, i.expires_at, i.checked_out_at, i.duration_ms, i.raw_hex,
-                i.id_valid_from, i.id_valid_to, i.id_authority, i.id_device_model, i.id_device_serial
-           FROM issuance i LEFT JOIN operator o ON o.id = i.operator_id
-          WHERE i.card_no = ?1
-          ORDER BY i.created_at ASC, i.id ASC
-          LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![card_no as i64, limit.clamp(1, 500)], |r| {
-        Ok(IssuanceRow {
-            id: r.get(0)?,
-            created_at: r.get(1)?,
-            room_no: r.get(2)?,
-            kind: r.get(3)?,
-            days: r.get(4)?,
-            hours: r.get(5)?,
-            card_no: r.get::<_, Option<i64>>(6)?.map(|v| v as u16),
-            guest_name: r.get(7)?,
-            guest_gender: r.get(8)?,
-            guest_id_type: r.get(9)?,
-            guest_id_number: r.get(10)?,
-            guest_nation: r.get(11)?,
-            guest_address: r.get(12)?,
-            guest_birth_date: r.get(13)?,
-            guest_note: r.get(14)?,
-            operator_name: r.get(15)?,
-            result: r.get(16)?,
-            expires_at: r.get(17)?,
-            checked_out_at: r.get(18)?,
-            duration_ms: r.get(19)?,
-            raw_hex: r.get(20)?,
-            id_valid_from: r.get(21)?,
-            id_valid_to: r.get(22)?,
-            id_authority: r.get(23)?,
-            id_device_model: r.get(24)?,
-            id_device_serial: r.get(25)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -2474,49 +2576,90 @@ mod tests {
     }
 
     #[test]
-    fn issuance_lookup_by_card_no() {
+    fn find_issuance_by_stamp_uses_local_day_hour_and_seq() {
         let (conn, path) = temp_db();
-        let id = record_issuance(
-            &conn,
-            &NewIssuance {
-                room_no: Some("220"),
-                kind: "日租客卡",
-                days: 1,
-                hours: 0,
-                card_no: Some(0x2404),
-                raw_hex: Some("5BECF100810424AB"),
-                operator_id: None,
-                reader_id: Some("4E57"),
-                result: "ok",
-                error_code: None,
-                idempotency_key: Some("k1"),
-                duration_ms: Some(1200),
-            },
+        let mk = |room: &str, _seq: u16| {
+            record_issuance(
+                &conn,
+                &NewIssuance {
+                    room_no: Some(room),
+                    kind: "日租客卡",
+                    days: 1,
+                    hours: 0,
+                    raw_hex: None,
+                    operator_id: None,
+                    reader_id: None,
+                    result: "ok",
+                    error_code: None,
+                    idempotency_key: None,
+                    duration_ms: None,
+                },
+            )
+            .unwrap()
+        };
+        let a = mk("801", 0);
+        let b = mk("801", 1);
+        let c = mk("802", 2);
+        // 统一到同一小时，避免测试跨小时边界时 seq 偏移错位
+        conn.execute(
+            "UPDATE issuance SET created_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')",
+            [],
         )
         .unwrap();
-        assert!(id > 0);
+        let (day, hour): (i64, i64) = conn
+            .query_row(
+                "SELECT CAST(strftime('%d','now','localtime') AS INTEGER), \
+                        CAST(strftime('%H','now','localtime') AS INTEGER)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
 
-        let rec = latest_issuance_for_card(&conn, 0x2404).unwrap().unwrap();
-        assert_eq!(rec.room_no.as_deref(), Some("220"));
-        assert_eq!(count_issuance_for_card(&conn, 0x2404).unwrap(), 1);
-        assert_eq!(max_issued_card_no(&conn).unwrap(), Some(0x2404));
+        let hit = find_issuance_by_stamp(&conn, Some("801"), "日租客卡", day as u16, hour as u16, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, b, "同房同小时第 2 张应命中 b");
+        assert_eq!(hit.room_no.as_deref(), Some("801"));
 
-        // 没有记录的卡号必须返回 None，而不是报错——读卡页据此显示"未查到"
-        assert!(latest_issuance_for_card(&conn, 0x1111).unwrap().is_none());
-        assert_eq!(count_issuance_for_card(&conn, 0x1111).unwrap(), 0);
+        // 房号过滤：801 只有 2 条，seq=2 必须为空
+        assert!(find_issuance_by_stamp(
+            &conn,
+            Some("801"),
+            "日租客卡",
+            day as u16,
+            hour as u16,
+            2
+        )
+        .unwrap()
+        .is_none());
+        // 总控卡没有记录
+        assert!(find_issuance_by_stamp(&conn, None, "总控卡", day as u16, hour as u16, 0)
+            .unwrap()
+            .is_none());
+        // 不同小时不命中
+        assert!(find_issuance_by_stamp(
+            &conn,
+            Some("801"),
+            "日租客卡",
+            day as u16,
+            ((hour + 1) % 24) as u16,
+            0
+        )
+        .unwrap()
+        .is_none());
 
+        let _ = (a, c);
         cleanup(conn, path);
     }
 
     #[test]
     fn idempotency_key_is_enforced() {
         let (conn, path) = temp_db();
-        let mut a = NewIssuance {
+        let a = NewIssuance {
             room_no: Some("220"),
             kind: "日租客卡",
             days: 1,
             hours: 0,
-            card_no: Some(1),
             raw_hex: None,
             operator_id: None,
             reader_id: None,
@@ -2526,7 +2669,6 @@ mod tests {
             duration_ms: None,
         };
         record_issuance(&conn, &a).unwrap();
-        a.card_no = Some(2);
         assert!(matches!(
             record_issuance(&conn, &a).unwrap_err(),
             StoreError::Invalid(_)
@@ -2542,7 +2684,6 @@ mod tests {
             kind: "日租客卡",
             days: 1,
             hours: 0,
-            card_no: Some(0x2404),
             raw_hex: Some("5BECF100810424AB"),
             operator_id: None,
             reader_id: None,
@@ -2554,7 +2695,7 @@ mod tests {
         record_issuance(&conn, &new).unwrap();
 
         let hit = find_issuance_by_idempotency(&conn, "click-1").unwrap();
-        assert_eq!(hit.unwrap().card_no, Some(0x2404));
+        assert_eq!(hit.unwrap().room_no.as_deref(), Some("220"));
         assert!(find_issuance_by_idempotency(&conn, "click-2").unwrap().is_none());
 
         cleanup(conn, path);
@@ -2583,7 +2724,6 @@ mod tests {
             kind,
             days,
             hours,
-            card_no: Some(1),
             raw_hex: None,
             operator_id: None,
             reader_id: None,
@@ -2649,6 +2789,126 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires, expected, "总控卡到期 = 发卡时间 + 天数");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn search_reservations_includes_all_statuses_and_paginates() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "801", None, None, None, None).unwrap();
+        insert_room(&conn, "802", None, None, None, None).unwrap();
+        let day = |offset: &str| -> String {
+            conn.query_row(
+                "SELECT date('now','localtime', ?1)",
+                params![offset],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mk = |room: &str, ci: &str, co: &str, name: &str| {
+            create_reservation(
+                &conn,
+                &ReservationInput {
+                    room_no: room.into(),
+                    check_in: ci.into(),
+                    check_out: co.into(),
+                    guest_name: Some(name.into()),
+                    note: None,
+                },
+                None,
+            )
+            .unwrap()
+        };
+        let a = mk("801", &day("+1 day"), &day("+3 days"), "张三");
+        let b = mk("802", &day("+5 days"), &day("+7 days"), "李四");
+        let c = mk("801", &day("+10 days"), &day("+12 days"), "张三");
+        cancel_reservation(&conn, b.id).unwrap();
+
+        let all = search_reservations(
+            &conn,
+            &ReservationFilter {
+                page: 1,
+                page_size: 50,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(all.total, 3, "已取消的预定也要能查到");
+        assert_eq!(all.rows[0].id, c.id, "按入住日倒序");
+
+        let cancelled = search_reservations(
+            &conn,
+            &ReservationFilter {
+                status: Some("cancelled".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((cancelled.total, cancelled.rows[0].id), (1, b.id));
+
+        let filtered = search_reservations(
+            &conn,
+            &ReservationFilter {
+                room_no: Some("80".into()),
+                guest_name: Some("张".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.total, 2);
+        assert!(filtered.rows.iter().all(|r| r.room_no == "801"));
+
+        let by_date = search_reservations(
+            &conn,
+            &ReservationFilter {
+                from: Some(b.check_in.clone()),
+                to: Some(c.check_in.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((by_date.total, by_date.rows[0].id), (1, b.id));
+
+        let p1 = search_reservations(
+            &conn,
+            &ReservationFilter {
+                page: 1,
+                page_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let p2 = search_reservations(
+            &conn,
+            &ReservationFilter {
+                page: 2,
+                page_size: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((p1.total, p1.rows.len(), p2.rows.len()), (3, 2, 1));
+
+        assert!(search_reservations(
+            &conn,
+            &ReservationFilter {
+                status: Some("bogus".into()),
+                ..Default::default()
+            }
+        )
+        .is_err());
+        assert!(search_reservations(
+            &conn,
+            &ReservationFilter {
+                from: Some(day("+3 days")),
+                to: Some(day("+1 day")),
+                ..Default::default()
+            }
+        )
+        .is_err());
+
+        // 未使用的变量仅用于确保三条记录的 id 稳定
+        let _ = a;
         cleanup(conn, path);
     }
 
@@ -2909,10 +3169,7 @@ mod tests {
         assert_eq!(latest.guest_name.as_deref(), Some("张三"));
         assert_eq!(latest.kind, "日租客卡");
 
-        // 换房核对用的卡号集合：只含有效客卡（过期卡 801 与总控卡都不能进来）
-        let nos = active_guest_card_nos(&conn, "501").unwrap();
-        assert_eq!(nos, vec![1], "只应有那张有效客卡（sample_issuance 的卡号是 1）");
-
+        // 卡号不再落库：换房核对改按时间戳匹配，active_guest_card_nos 在后续步骤删除。
         cleanup(conn, path);
     }
 
@@ -3155,6 +3412,136 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_operators_keeps_password_and_flags() {
+        let (conn, path) = temp_db();
+        let admin = insert_operator(&conn, "admin", "管理员", "admin", "h1", None).unwrap();
+        insert_operator(&conn, "front", "前台", "frontdesk", "h2", None).unwrap();
+        set_operator_active(&conn, admin.id, false).unwrap();
+
+        let snap = snapshot_operators(&conn).unwrap();
+        assert_eq!(snap.len(), 2);
+        let admin = snap.iter().find(|o| o.login == "admin").unwrap();
+        assert_eq!(admin.pwd_hash, "h1");
+        assert_eq!(admin.role, "admin");
+        assert!(!admin.active);
+        let front = snap.iter().find(|o| o.login == "front").unwrap();
+        assert_eq!(front.pwd_hash, "h2");
+        assert!(front.active);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn merge_operators_after_restore_preserves_current_accounts() {
+        let (conn, path) = temp_db();
+        // 模拟恢复后的备份库
+        insert_operator(&conn, "admin", "备份管理员", "frontdesk", "backup-admin", None).unwrap();
+        insert_operator(&conn, "new", "备份新增", "frontdesk", "backup-new", None).unwrap();
+
+        let current = vec![
+            Operator {
+                id: 10,
+                login: "admin".into(),
+                display_name: "当前管理员".into(),
+                role: "admin".into(),
+                pwd_hash: "current-admin".into(),
+                active: true,
+                department_id: None,
+                department_name: None,
+            },
+            Operator {
+                id: 11,
+                login: "only-current".into(),
+                display_name: "当前独有".into(),
+                role: "admin".into(),
+                pwd_hash: "current-only".into(),
+                active: true,
+                department_id: Some(7),
+                department_name: None,
+            },
+        ];
+        let report = merge_operators_after_restore(&conn, &current).unwrap();
+        assert_eq!(report.preserved, 1);
+        assert_eq!(report.imported_disabled, 1);
+        assert_eq!(report.reinserted, 1);
+        assert_eq!(report.failed, 0);
+
+        let admin = find_operator(&conn, "admin").unwrap().unwrap();
+        assert_eq!(admin.pwd_hash, "current-admin", "密码优先保留当前");
+        assert_eq!(admin.role, "admin", "角色优先保留当前");
+        assert!(admin.active, "启用状态优先保留当前");
+        assert_eq!(admin.display_name, "备份管理员", "显示名用备份值");
+
+        let new = find_operator(&conn, "new").unwrap().unwrap();
+        assert!(!new.active, "备份新增账号导入停用");
+
+        let only = find_operator(&conn, "only-current").unwrap().unwrap();
+        assert_eq!(only.pwd_hash, "current-only");
+        assert!(only.active);
+        assert_eq!(only.department_id, None, "补回账号部门置空");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn merge_operators_after_restore_counts_failures() {
+        let (conn, path) = temp_db();
+        insert_operator(&conn, "admin", "备份管理员", "admin", "backup-admin", None).unwrap();
+        // 非法角色触发 CHECK，验证失败计数且不中断
+        let current = vec![Operator {
+            id: 1,
+            login: "admin".into(),
+            display_name: "当前".into(),
+            role: "bad-role".into(),
+            pwd_hash: "h".into(),
+            active: true,
+            department_id: None,
+            department_name: None,
+        }];
+        let report = merge_operators_after_restore(&conn, &current).unwrap();
+        assert_eq!(report.preserved, 0);
+        assert_eq!(report.failed, 1);
+        let admin = find_operator(&conn, "admin").unwrap().unwrap();
+        assert_eq!(admin.pwd_hash, "backup-admin", "失败时备份账号保持原值");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn restore_backup_preserves_current_operators() {
+        let (mut conn, path) = temp_db();
+        insert_operator(&conn, "admin", "当前管理员", "admin", "current-hash", None).unwrap();
+        insert_room(&conn, "701", None, None, None, None).unwrap();
+        let current = snapshot_operators(&conn).unwrap();
+
+        // 制作一份「备份库」：admin 密码不同，另有新增账号与另一间房
+        let (backup, bpath) = temp_db();
+        insert_operator(&backup, "admin", "备份管理员", "frontdesk", "backup-hash", None).unwrap();
+        insert_operator(&backup, "new", "备份新增", "frontdesk", "new-hash", None).unwrap();
+        insert_room(&backup, "702", None, None, None, None).unwrap();
+        let file = std::env::temp_dir().join(format!("ocw-restore-{}.db", uuid::Uuid::new_v4()));
+        backup_to(&backup, &file).unwrap();
+
+        restore_from(&mut conn, &file).unwrap();
+        migrate(&conn).unwrap();
+        let report = merge_operators_after_restore(&conn, &current).unwrap();
+
+        assert_eq!(report.preserved, 1);
+        assert_eq!(report.imported_disabled, 1);
+        assert_eq!(report.failed, 0);
+        let admin = find_operator(&conn, "admin").unwrap().unwrap();
+        assert_eq!(admin.pwd_hash, "current-hash", "恢复后当前密码不被备份覆盖");
+        assert_eq!(admin.role, "admin");
+        assert!(admin.active);
+        let new = find_operator(&conn, "new").unwrap().unwrap();
+        assert!(!new.active, "备份新增账号默认停用");
+        // 业务数据按备份覆盖
+        assert!(find_room(&conn, "701").unwrap().is_none());
+        assert!(find_room(&conn, "702").unwrap().is_some());
+
+        let _ = std::fs::remove_file(&file);
+        cleanup(conn, path);
+        cleanup(backup, bpath);
+    }
+
+    #[test]
     fn room_max_cards_set_and_validate() {
         let (conn, path) = temp_db();
         insert_room(&conn, "220", None, None, None, None).unwrap();
@@ -3191,28 +3578,6 @@ mod tests {
         mk(1, "+3 days"); // 同号多张（TD-127 复用卡号）：按「张」计数，不再按卡号去重
 
         assert_eq!(count_active_cards(&conn, "220").unwrap(), 3);
-        cleanup(conn, path);
-    }
-
-    #[test]
-    fn same_card_no_two_records_checkout_together() {
-        let (conn, path) = temp_db();
-        insert_room(&conn, "221", None, None, None, None).unwrap();
-        // 同房同号两张（TD-127：复用首卡号发给第二位客人）
-        for offset in ["+1 day", "+2 days"] {
-            conn.execute(
-                "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
-                 VALUES (?1, '221', '日租客卡', 1, 0, 9, 'ok',
-                         strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
-                params![uuid::Uuid::new_v4().to_string(), offset],
-            )
-            .unwrap();
-        }
-        assert_eq!(count_active_cards(&conn, "221").unwrap(), 2, "同号按张计数");
-        let dirty = checkout_status(&conn).unwrap();
-        let (room, remaining) = checkout_card(&conn, 9, &dirty).unwrap().unwrap();
-        assert_eq!(room, "221");
-        assert_eq!(remaining, 0, "同号两张一起关，剩余 0");
         cleanup(conn, path);
     }
 
@@ -3286,38 +3651,28 @@ mod tests {
     }
 
     #[test]
-    fn checkout_card_closes_only_that_card() {
+    fn checkout_issuance_closes_only_that_record() {
         let (conn, path) = temp_db();
         insert_room(&conn, "205", None, None, None, None).unwrap();
-
-        let mk = |card: i64, offset: &str| {
-            conn.execute(
-                "INSERT INTO issuance (uuid, room_no, kind, days, hours, card_no, result, expires_at)
-                 VALUES (?1, '205', '日租客卡', 1, 0, ?2, 'ok',
-                         strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?3))",
-                params![uuid::Uuid::new_v4().to_string(), card, offset],
-            )
-            .unwrap();
-        };
-        mk(0x2BCE, "+1 day");
-        mk(0x2405, "+1 day");
+        let id1 = record_issuance(&conn, &sample_issuance(Some("205"), "日租客卡", 1, 0)).unwrap();
+        let id2 = record_issuance(&conn, &sample_issuance(Some("205"), "日租客卡", 2, 0)).unwrap();
 
         assert_eq!(count_active_cards(&conn, "205").unwrap(), 2);
 
-        // 退掉其中一张：房间还剩 1 张，房态不应变脏
-        let (room, remaining) = checkout_card(&conn, 0x2BCE, "vacant_dirty").unwrap().unwrap();
+        // 退掉其中一条：房间还剩 1 张，房态不应变脏
+        let (room, remaining) = checkout_issuance(&conn, id1, "vacant_dirty").unwrap().unwrap();
         assert_eq!(room, "205");
         assert_eq!(remaining, 1);
         assert_eq!(count_active_cards(&conn, "205").unwrap(), 1);
         assert_eq!(find_room(&conn, "205").unwrap().unwrap().status, "vacant_clean");
 
-        // 再退最后一张：房态转空脏
-        let (_, remaining) = checkout_card(&conn, 0x2405, "vacant_dirty").unwrap().unwrap();
+        // 再退最后一条：房态转空脏
+        let (_, remaining) = checkout_issuance(&conn, id2, "vacant_dirty").unwrap().unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(find_room(&conn, "205").unwrap().unwrap().status, "vacant_dirty");
 
-        // 没有发卡记录的卡号
-        assert!(checkout_card(&conn, 0x9999, "vacant_dirty").unwrap().is_none());
+        // 不存在的记录
+        assert!(checkout_issuance(&conn, 99999, "vacant_dirty").unwrap().is_none());
 
         cleanup(conn, path);
     }

@@ -500,8 +500,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2453,9 +2455,11 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opencardwright"
-version = "2026.11.6+0056"
+version = "2026.11.9+0057"
 dependencies = [
  "argon2",
+ "chrono",
+ "dirs",
  "ocw-device",
  "ocw-store",
  "rand_core",

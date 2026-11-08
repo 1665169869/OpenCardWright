@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
+import dayjs from 'dayjs'
 import {
   Alert,
   Button,
   Card,
+  DatePicker,
   Input,
   InputNumber,
   Modal,
@@ -53,7 +55,7 @@ const WARNING: Record<Kind, string> = {
   install:
     '安装卡只含房间序号，不含房号也不含卡号。拿到锁上刷一次即完成绑定；刷错房间会让锁绑定到错误的房间。',
   checkout: '退房钟点卡只改变锁内记录的退房时间，不改变已发出的卡。',
-  timeSync: '校时卡只含当日时/分，不含日期。锁用它建立时间基准。',
+  timeSync: '校时卡写入完整的年月日时分：年+月在页2[3]、日在卡号、时/分在页1（IDA 已解出位域）。锁用它建立时间基准。',
   blank:
     '空白卡把卡内 8 字节全部写 0，相当于擦成空白卡：锁会当成无效卡拒开。用于回收旧卡、或在现场把废卡彻底清掉。写完后建议在读卡页读一次确认是「空白卡」。',
   raw: '原始直写会把这 8 个字节原样写进卡里，可能把卡写成任何卡型或废卡。除非你在做逆向验证，否则不要用。',
@@ -82,6 +84,8 @@ export default function AdminCards({
       .catch(() => {})
   }, [])
   const [minute, setMinute] = useState<number>(0)
+  /** 校时卡的「年月日」：年+月进页2[3]、日进卡号；不选则用当天 */
+  const [atDate, setAtDate] = useState<dayjs.Dayjs | null>(null)
   const [now, setNow] = useState(true)
   const [p1, setP1] = useState('')
   const [p2, setP2] = useState('')
@@ -119,7 +123,13 @@ export default function AdminCards({
       case 'checkout':
         return { kind: 'checkout', hour: checkoutHour }
       case 'timeSync':
-        return now ? { kind: 'timeSync' } : { kind: 'timeSync', hour, minute }
+        if (now) return { kind: 'timeSync' }
+        return {
+          kind: 'timeSync',
+          hour,
+          minute,
+          at: `${(atDate ?? dayjs()).format('YYYY-MM-DD')} ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+        }
       case 'blank':
         return { kind: 'blank' }
       case 'raw':
@@ -278,7 +288,12 @@ export default function AdminCards({
                 ]}
               />
               {!now ? (
-                <Space>
+                <Space wrap>
+                  <DatePicker
+                    value={atDate}
+                    onChange={(d) => setAtDate(d)}
+                    placeholder="选日期（年月进页2[3]、日进卡号）"
+                  />
                   <InputNumber min={0} max={23} value={hour} onChange={(v) => setHour(typeof v === 'number' ? v : 0)} />
                   <Text>:</Text>
                   <InputNumber min={0} max={59} value={minute} onChange={(v) => setMinute(typeof v === 'number' ? v : 0)} />

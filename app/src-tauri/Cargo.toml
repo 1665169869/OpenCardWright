@@ -1,6 +1,6 @@
 [package]
 name = "opencardwright"
-version = "2026.11.6+0056"
+version = "2026.11.9+0057"
 edition = "2021"
 rust-version = "1.77"
 license = "AGPL-3.0-or-later"
@@ -18,8 +18,12 @@ tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
+# 卡号递推要按本地时间算「日/时」（cardno.rs）
+chrono = { version = "0.4", features = ["clock"] }
 # argon2 的 SaltString::generate 需要一个带 getrandom 的 OsRng
 rand_core = { version = "0.6", features = ["getrandom"] }
+# CSV 导出目录：走 Windows Known Folder（桌面可能被重定向到 D 盘 / OneDrive）
+dirs = "7"
 ocw-device = { path = "crates/ocw-device" }
 ocw-store = { path = "crates/ocw-store" }
 

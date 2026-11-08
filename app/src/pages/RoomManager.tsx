@@ -35,7 +35,6 @@ import {
 import {
   api,
   describeError,
-  formatCardNo,
   formatExpiry,
   formatTime,
   type CardReadDto,
@@ -220,10 +219,10 @@ export default function RoomManager({
   const [moveForceOpen, setMoveForceOpen] = useState(false)
   const [moveForceConfirmed, setMoveForceConfirmed] = useState(false)
 
-  /** 读到的卡是不是源房当前的有效卡（判据：卡号在源房有效卡集合里）。 */
-  const readCardNo = moveRead?.card.cardNo ?? null
+  /** 读到的卡是不是源房当前的有效卡（读卡记录按房号+卡型+时间戳匹配）。 */
   const moveCardIsOriginal =
-    readCardNo !== null && (movePreview?.activeCardNos ?? []).includes(readCardNo)
+    moveRead?.lookup.status === 'found' &&
+    moveRead.lookup.latest.roomNo === moveFrom?.roomNo
   // 删除房间 = 逻辑删除（active=0）。二次确认用受控 Modal：antd 命令式弹窗在 React 19 下静默失效
   const [deleteTarget, setDeleteTarget] = useState<Room | null>(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
@@ -430,18 +429,17 @@ export default function RoomManager({
     try {
       const p = await api.listIssuances({ roomNo, page: 1, pageSize: 200 })
       const now = Date.now()
-      // 有效客卡按「张」逐条（TD-127）：同号多张（复用首卡号给第二位客人）各占一行，不再按卡号去重
+      // 有效客卡按「张」逐条：同房多张各占一行，按发卡时间排序
       const valid = p.rows.filter(
         (r) =>
           r.result === 'ok' &&
-          r.cardNo !== null &&
           r.checkedOutAt === null &&
           !!r.expiresAt &&
           Date.parse(r.expiresAt) > now &&
           (r.kind === '日租客卡' || r.kind === '钟点客卡'),
       )
       setDrawerCards(
-        valid.sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0) || a.id - b.id),
+        valid.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id - b.id),
       )
     } catch {
       // 拉取失败：区块显示空态，不阻断抽屉其它操作
@@ -755,7 +753,7 @@ export default function RoomManager({
     setMoveBusy(true)
     setMoveError(null)
     try {
-      const res = await api.moveRoomOut(from.roomNo, target.roomNo, readCardNo)
+      const res = await api.moveRoomOut(from.roomNo, target.roomNo)
       setMoveFrom(null)
       setMoveRead(null)
       setMoveForceConfirmed(false)
@@ -916,7 +914,8 @@ export default function RoomManager({
 
           {viewMode === 'calendar' ? (
             <RoomCalendar
-              rooms={visible}
+              rooms={liveRooms}
+              roomTypes={roomTypes}
               statuses={statuses}
               onReserve={(room, date) => openReserve(room, date)}
               onEdit={openEditReserve}
@@ -1277,8 +1276,7 @@ export default function RoomManager({
                 >
                   {drawerCards.map((c) => (
                     <Text key={c.id} style={{ fontSize: 12 }}>
-                      {c.cardNo === null ? '—' : formatCardNo(c.cardNo)} · {c.kind} ·{' '}
-                      {c.days > 0 ? `${c.days} 天` : `${c.hours} 小时`} · 到期{' '}
+                      {c.kind} · {c.days > 0 ? `${c.days} 天` : `${c.hours} 小时`} · 到期{' '}
                       {c.expiresAt ? formatTime(c.expiresAt) : '—'}
                       {c.guestName ? ` · ${c.guestName}` : ''}
                     </Text>
@@ -1611,7 +1609,7 @@ export default function RoomManager({
                 <Alert
                   type="success"
                   showIcon
-                  message={`核对通过：卡号 ${formatCardNo(readCardNo)} 是 ${moveFrom?.roomNo ?? ''} 房当前有效卡`}
+                  message={`核对通过：是 ${moveFrom?.roomNo ?? ''} 房当前有效卡`}
                 />
               ) : null}
               {moveRead && !moveCardIsOriginal ? (
@@ -1692,10 +1690,10 @@ export default function RoomManager({
           <Alert
             type="warning"
             showIcon
-            message={`读到的卡号 ${formatCardNo(readCardNo)} 不在 ${moveFrom?.roomNo ?? ''} 房的有效卡里`}
+            message={`读到的卡不在 ${moveFrom?.roomNo ?? ''} 房的有效卡里`}
             description={
-              movePreview?.activeCardNos.length
-                ? `${moveFrom?.roomNo} 房当前有效卡：${movePreview.activeCardNos.map((n) => formatCardNo(n)).join('、')}`
+              movePreview?.cards
+                ? `${moveFrom?.roomNo} 房当前有 ${movePreview.cards} 张有效卡，请核对客人手中的卡。`
                 : `${moveFrom?.roomNo ?? '该房'} 当前没有有效客卡，读到的任何卡都不可能是原卡。`
             }
           />

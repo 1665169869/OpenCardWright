@@ -1,10 +1,10 @@
 import { Alert, Card, Descriptions, Divider, Tag, Typography } from 'antd'
-import { formatCardNoText, formatExpiry, type CardSnapshot } from '../api'
+import { formatExpiry, type CardSnapshot } from '../api'
 
 const { Text, Paragraph } = Typography
 
 /**
- * 卡片数据展示（卡型 / 房号 / 有效期 / 卡号 + 28 字节原文）。
+ * 卡片数据展示（卡型 / 房号 / 有效期 + 28 字节原文；不再展示十六进制卡号，TD-166）。
  *
  * 读卡页与「读卡退房」弹窗共用：两处看到的字段、排序、异常提示必须一致，
  * 否则前台在弹窗里核对过的卡，到读卡页又对不上。
@@ -86,7 +86,6 @@ export function CardSnapshotView({
             label: '入住时间',
             children: formatExpiry(createdAt) ?? cardCheckInText ?? '—',
           },
-          { key: 'cardNo', label: '卡号', children: formatCardNoText(card) },
           {
             key: 'lost',
             label: '挂失',

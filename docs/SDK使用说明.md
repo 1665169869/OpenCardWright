@@ -30,6 +30,7 @@
    Port=6            ; 6 = COM7
    Password=12000206
    [Card]
+   ; 【已废弃 2026-11-08】SDK 不再读 StartCardNo，卡号由产品侧维护
    StartCardNo=2403
    ```
 4. 关闭门锁软件（它独占串口），然后：
@@ -122,11 +123,12 @@ end;
 
 ```bat
 PMSLockCard.exe read --json
-PMSLockCard.exe issue --room 220 --days 1
-PMSLockCard.exe issue --room 220 --hours 3
-PMSLockCard.exe issue --type master
-PMSLockCard.exe issue --type install --room 220
-PMSLockCard.exe issue --type checkout --hour 12
+; CLI 不再自增卡号：--room-index（房间序号）+ --seq（小时内序号）+ --datetime（年月日时分）
+PMSLockCard.exe issue --type guest --room-index 15 --seq 3 --datetime "2026-11-08 14:30" --days 1
+PMSLockCard.exe issue --type guest --room-index 15 --seq 4 --datetime "2026-11-08 14:30" --hours 3
+PMSLockCard.exe issue --type master --seq 1 --datetime "2026-11-08 14:30" --days 30
+PMSLockCard.exe issue --type install --room-index 15
+PMSLockCard.exe issue --type checkout --hour 12 --seq 1 --datetime "2026-11-08 14:30"
 PMSLockCard.exe issue --raw --p1 5BEC492B --p2 13BF22AB
 PMSLockCard.exe selftest
 PMSLockCard.exe ports
@@ -161,7 +163,7 @@ JSON 输出：
 | `Open` 返回 5（无卡） | 卡没放正 / 卡不是 125kHz TEMIC / 读卡器未插 |
 | 写卡成功但锁不开 | ① 卡号比锁内已见的最大值小（见技术规格第 6 节）；② 房门/安装卡没配好 |
 | 回读校验失败 | 卡被别的系统用其它密码锁住了，或卡型不对 |
-| 房号找不到 | `RoomIndex.ini` 里没有该房号，用 `--room` 传序号数字，或补表 |
+| 房号找不到 | `--room-index` 传的是房间序号（1–254），不是房号；用 `PMSLockCard.exe read` 看卡上序号，或补 `RoomIndex.ini` |
 
 ---
 

@@ -56,6 +56,8 @@ static class Program
         public string At;
         public int Seq = -1;
         public bool Lost;
+        /// <summary>房间序号 1–254（CLI 不再用房号发卡，`--room-index`）</summary>
+        public int RoomIndex = -1;
     }
 
     static Opt ParseArgs(string[] a, int start)
@@ -66,6 +68,8 @@ static class Program
             switch (a[i])
             {
                 case "--room": o.Room = a[++i]; break;
+                case "--room-index": o.RoomIndex = int.Parse(a[++i]); break;
+                case "--datetime": o.At = a[++i]; break;
                 case "--days": o.Days = int.Parse(a[++i]); break;
                 case "--hours": o.Hours = int.Parse(a[++i]); break;
                 case "--type": o.Type = a[++i].ToLowerInvariant(); break;
@@ -153,13 +157,33 @@ static class Program
                     Console.Error.WriteLine("× --at 时间格式不正确，例：\"2026-11-08 14\" 或 \"2026-11-08 14:30\"");
                     return 1;
                 }
-                r.CardNos.ForcedAt = at;
-                // 页2[3] 是「年+月」，由 CardBuilder.Now 决定——必须与卡号用同一个时间源，
-                // 否则 --at 造出的卡会出现「卡号 2027 年、页2[3] 却还是当前年月」的打架。
+                // 页2[3] 是「年+月」，由 CardBuilder.Now 决定（CLI 不再维护卡号状态）
                 CardBuilder.Now = at;
             }
-            if (o.Seq >= 0)
-                r.CardNos.ForcedSeq = o.Seq;
+
+            // 序号 → 房号（CLI 不再传房号；用 RoomIndex.ini 反查，只为兼容 SDK 的 string room 重载）
+            string room = o.Room;
+            if (o.RoomIndex > 0)
+            {
+                room = r.Rooms.RoomOf(o.RoomIndex);
+                if (room == null)
+                {
+                    Console.Error.WriteLine("× --room-index " + o.RoomIndex + " 在 RoomIndex.ini 里找不到对应房号");
+                    return 1;
+                }
+            }
+            // 卡号 = 日<<11 | 时<<6 | seq（日期时间 + 小时内序号，CLI 内部算，不再自增）
+            int cardNo = o.Serial;
+            if (o.RoomIndex > 0 && o.Seq >= 0 && !string.IsNullOrEmpty(o.At))
+            {
+                DateTime at0;
+                if (!DateTime.TryParse(o.At, out at0))
+                {
+                    Console.Error.WriteLine("× --datetime 格式不正确，例：\"2026-11-08 14:30\"");
+                    return 1;
+                }
+                cardNo = CardBuilder.TimestampCardNo(at0, o.Seq);
+            }
 
             CardInfo info = null;
             switch (o.Type)
@@ -167,29 +191,31 @@ static class Program
                 case "guest":
                 case "day":
                     if (o.Hours > 0)
-                        rc = r.IssueGuestHour(o.Room, o.Hours, policy, o.Serial, o.Lost, out info);
+                        rc = r.IssueGuestHour(room, o.Hours, policy, cardNo, o.Lost, out info);
                     else
-                        rc = r.IssueGuestDay(o.Room, o.Days <= 0 ? 1 : o.Days, policy, o.Serial, o.Lost, out info);
+                        rc = r.IssueGuestDay(room, o.Days <= 0 ? 1 : o.Days, policy, cardNo, o.Lost, out info);
                     break;
                 case "hour":
-                    rc = r.IssueGuestHour(o.Room, o.Hours <= 0 ? 1 : o.Hours, policy, o.Serial, out info);
+                    rc = r.IssueGuestHour(room, o.Hours <= 0 ? 1 : o.Hours, policy, cardNo, out info);
                     break;
-                case "master": rc = r.IssueMaster(policy, o.Serial, out info); break;
-                case "reset": rc = r.IssueReset(policy, o.Serial, out info); break;
-                case "clear": rc = r.IssueClear(policy, o.Serial, out info); break;
-                case "install": rc = r.IssueInstall(o.Room, out info); break;
-                case "checkout": rc = r.IssueCheckoutHour(o.Hour, policy, o.Serial, out info); break;
+                case "master": rc = r.IssueMaster(policy, cardNo, out info); break;
+                case "reset": rc = r.IssueReset(policy, cardNo, out info); break;
+                case "clear": rc = r.IssueClear(policy, cardNo, out info); break;
+                case "install": rc = r.IssueInstall(room, out info); break;
+                case "checkout": rc = r.IssueCheckoutHour(o.Hour, policy, cardNo, out info); break;
                 case "timesync":
                     {
                         int hh = 0, mm = 0;
-                        var now = DateTime.Now;
+                        // 校时卡写「年+月」（页2[3]）+ 当日时分（页1）；`--at` 指定时取它，
+                        // 否则取当前时间。（2026-11-08 实测：页1 与日期无关，年月只在页2[3]）
+                        var now = CardBuilder.Now;
                         hh = now.Hour; mm = now.Minute;
                         if (o.Room != null && o.Room.Contains(":"))
                         {
                             var parts = o.Room.Split(':');
                             hh = int.Parse(parts[0]); mm = int.Parse(parts[1]);
                         }
-                        rc = r.IssueTimeSync(hh, mm, out info);
+                        rc = r.IssueTimeSync(hh, mm, cardNo, out info);
                         break;
                     }
                 case "raw":
@@ -247,7 +273,7 @@ static class Program
 
     sealed class Vector
     {
-        public string Name; public CardKind Kind; public int RoomIndex, Days, Hours, Hour, CardNo;
+        public string Name; public CardKind Kind; public int RoomIndex, Days, Hours, Hour, Minute, CardNo;
         public string P1, P2;
     }
 
@@ -271,6 +297,16 @@ static class Program
         new Vector{ Name="总控2天",    Kind=CardKind.Master,   Days=2, CardNo=0x2BC4, P1="5BECF0FF", P2="82C42BAB" },
         new Vector{ Name="总控63天",   Kind=CardKind.Master,   Days=63, CardNo=0x2BC7, P1="5BECF0FF", P2="BFC72BAB" },
         new Vector{ Name="总控90天",   Kind=CardKind.Master,   Days=90, CardNo=0x2BC8, P1="5BECF0FF", P2="C3C82BAB" },
+        // 校时卡（2026-11-08 IDA 解出位域，7 组实测样本验证）：
+        //   页1[2] = 16*(分 & 0xF) + 9；页1[3] = (分 >> 4) + ((4*时) & 0x7C)
+        // 注意 P2[3] 是运行时「年+月」（SelfTest 固定 Now=2026-11-08 → 0xAB），
+        // 所以下面把实测样本的 P2[3]（8B/BB）统一按 0xAB 写，只验证卡号与页1。
+        new Vector{ Name="校时08:30", Kind=CardKind.TimeSync, Hour=8,  Minute=30, CardNo=0x4200, P1="5BECE921", P2="060042AB" },
+        new Vector{ Name="校时12:00", Kind=CardKind.TimeSync, Hour=12, Minute=0,  CardNo=0x4300, P1="5BEC0930", P2="060043AB" },
+        new Vector{ Name="校时19:47", Kind=CardKind.TimeSync, Hour=19, Minute=47, CardNo=0x44C0, P1="5BECF94E", P2="06C044AB" },
+        new Vector{ Name="校时22:00", Kind=CardKind.TimeSync, Hour=22, Minute=0,  CardNo=0x4580, P1="5BEC0958", P2="068045AB" },
+        new Vector{ Name="校时11日19:47", Kind=CardKind.TimeSync, Hour=19, Minute=47, CardNo=0x5CC0, P1="5BECF94E", P2="06C05CAB" },
+        new Vector{ Name="校时16:35", Kind=CardKind.TimeSync, Hour=16, Minute=35, CardNo=0x4C01, P1="5BEC3942", P2="06014CAB" },
         new Vector{ Name="总控120天",  Kind=CardKind.Master,   Days=120, CardNo=0x2BC9, P1="5BECF0FF", P2="C4C92BAB" },
         new Vector{ Name="总控360天",  Kind=CardKind.Master,   Days=360, CardNo=0x2BCB, P1="5BECF0FF", P2="CCCB2BAB" },
         new Vector{ Name="总控1095天", Kind=CardKind.Master,   Days=1095, CardNo=0x2BCD, P1="5BECF0FF", P2="E4CD2BAB" },
@@ -300,6 +336,7 @@ static class Program
                 case CardKind.Clear: CardBuilder.BuildClear(v.CardNo, out p1, out p2); break;
                 case CardKind.Install: CardBuilder.BuildInstall(v.RoomIndex, out p1, out p2); break;
                 case CardKind.CheckoutHour: CardBuilder.BuildCheckoutHour(v.Hour, v.CardNo, out p1, out p2); break;
+                case CardKind.TimeSync: CardBuilder.BuildTimeSync(v.Hour, v.Minute, v.CardNo, out p1, out p2); break;
                 default: throw new InvalidOperationException();
             }
             string g1 = HexOf(p1), g2 = HexOf(p2);

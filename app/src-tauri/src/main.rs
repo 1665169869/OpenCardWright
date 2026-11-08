@@ -3,6 +3,7 @@
 
 mod auth;
 mod backup_job;
+mod cardno;
 mod commands;
 mod diagnostics;
 mod logging;
@@ -82,13 +83,11 @@ fn main() {
                 ),
             );
 
-            let start_card_no = ocw_store::get_setting(&conn, "startCardNo")?
-                .unwrap_or_else(|| "2403".to_string());
             let port: u8 = ocw_store::get_setting(&conn, "port")?
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(6);
 
-            let runtime = provision::ensure_runtime(app.handle(), &start_card_no);
+            let runtime = provision::ensure_runtime(app.handle());
 
             let device = build_device(&runtime.dir, port);
             if device.is_sim() {
@@ -187,9 +186,6 @@ fn main() {
             commands::issue_install_card,
             commands::issue_guest,
             commands::issue_admin_card,
-            commands::card_no_status,
-            commands::set_water_warn_at,
-            commands::reset_water_mark,
             commands::list_departments,
             commands::create_department,
             commands::rename_department,
@@ -207,6 +203,7 @@ fn main() {
             commands::get_max_cards_default,
             commands::set_max_cards_default,
             commands::list_reservations,
+            commands::list_reservation_records,
             commands::create_reservation,
             commands::update_reservation,
             commands::cancel_reservation,
@@ -224,7 +221,6 @@ fn main() {
             commands::export_diagnostics,
             commands::list_issuances,
             commands::list_audits,
-            commands::card_history,
             commands::export_issuances_csv,
             commands::import_rooms,
             commands::get_onboarding_status,

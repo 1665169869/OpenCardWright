@@ -4,7 +4,6 @@ import type { ColumnsType } from 'antd/es/table'
 import {
   api,
   describeError,
-  formatCardNo,
   formatTime,
   type IssuanceRow,
   type Room,
@@ -49,13 +48,12 @@ export default function NoCardCheckoutModal({
       const valid = p.rows.filter(
         (r) =>
           r.result === 'ok' &&
-          r.cardNo !== null &&
           r.checkedOutAt === null &&
           !!r.expiresAt &&
           Date.parse(r.expiresAt) > now &&
           (r.kind === '日租客卡' || r.kind === '钟点客卡'),
       )
-      setRows(valid.sort((a, b) => (a.cardNo ?? 0) - (b.cardNo ?? 0) || a.id - b.id))
+      setRows(valid.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id - b.id))
     } catch (e) {
       setErr(describeError(e))
     } finally {
@@ -75,60 +73,40 @@ export default function NoCardCheckoutModal({
     if (!room || selected.length === 0) return
     setBusy(true)
     setErr(null)
-    // 选中行 → 卡号去重：同号多张是同一张逻辑卡，只调一次 checkout_card（后端一次关同号全部）
+    // 选中行按发卡记录 id 逐条退房；每张卡一条记录，不再按卡号去重。
     const selectedRows = rows.filter((r) => selected.includes(r.id))
-    const cardNos = [
-      ...new Set(
-        selectedRows.map((r) => r.cardNo).filter((n): n is number => n !== null),
-      ),
-    ]
     const done: number[] = []
     const failed: string[] = []
     let remaining: number | null = null
-    for (const cardNo of cardNos) {
+    for (const [i, row] of selectedRows.entries()) {
       try {
         // 无卡退房：用户手上没有卡，跳过读卡器（不读卡、不擦卡），只做数据库标记
-        const res = await api.checkoutCard(cardNo, true)
-        done.push(cardNo)
+        const res = await api.checkoutCard({ issuanceId: row.id, noDevice: true })
+        done.push(row.id)
         remaining = res.remaining
       } catch (e) {
-        failed.push(`${formatCardNo(cardNo)}：${describeError(e)}`)
+        failed.push(`第 ${i + 1} 张：${describeError(e)}`)
       }
     }
     setBusy(false)
 
     if (failed.length === 0) {
-      const merged = selectedRows.length - cardNos.length
-      onDone(
-        `${room.roomNo} 已退 ${selectedRows.length} 张有效卡` +
-          (merged > 0 ? `（同号合并 ${merged} 次）` : '') +
-          `，剩余 ${remaining ?? 0} 张`,
-      )
+      onDone(`${room.roomNo} 已退 ${selectedRows.length} 张有效卡，剩余 ${remaining ?? 0} 张`)
       onClose()
       return
     }
-    // 部分失败：留在弹窗，重拉列表并清掉已退卡对应的**所有选中行**（同号两行一起清），失败原因列出
+    // 部分失败：留在弹窗，重拉列表并清掉已退记录，失败原因列出
     setErr(
       `退房部分失败（成功 ${done.length} 张卡、失败 ${failed.length} 张卡）：${failed.join('；')}`,
     )
     setSelected((prev) => {
-      const gone = new Set(
-        rows
-          .filter((r) => r.cardNo !== null && done.includes(r.cardNo))
-          .map((r) => r.id),
-      )
+      const gone = new Set(done)
       return prev.filter((id) => !gone.has(id))
     })
     await load()
   }
 
   const columns: ColumnsType<IssuanceRow> = [
-    {
-      title: '卡号',
-      dataIndex: 'cardNo',
-      width: 110,
-      render: (v: number | null) => (v === null ? '—' : formatCardNo(v)),
-    },
     { title: '卡型', dataIndex: 'kind', width: 120 },
     {
       title: '时长',

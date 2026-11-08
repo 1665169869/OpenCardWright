@@ -4,7 +4,6 @@ import { Alert, Button, Modal, Space, Typography } from 'antd'
 import {
   api,
   describeError,
-  formatCardNo,
   formatExpiry,
   formatTime,
   type CardReadDto,
@@ -129,9 +128,9 @@ export function CheckoutCardModal({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.checkoutCard(cardNo)
+      const res = await api.checkoutCard({ cardNo })
       onDone(
-        `${res.roomNo} 房：卡号 ${formatCardNo(cardNo)} 已退房，剩余有效卡 ${res.remaining} 张` +
+        `${res.roomNo} 房：已退房，剩余有效卡 ${res.remaining} 张` +
           (res.remaining === 0 ? '（房态已按设置转换）' : ''),
       )
       onClose()
@@ -148,10 +147,10 @@ export function CheckoutCardModal({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.forceCheckoutCard(roomNo, cardNo)
+      const res = await api.forceCheckoutCard(roomNo)
       setForceOpen(false)
       onDone(
-        `${res.roomNo} 房：卡号 ${formatCardNo(cardNo)} 非本系统卡，已强制退房（关闭 ${res.cardsClosed} 张有效卡，房态已按设置转换）`,
+        `${res.roomNo} 房：非本系统卡，已强制退房（关闭 ${res.cardsClosed} 张有效卡，房态已按设置转换）`,
       )
       onClose()
     } catch (e) {
@@ -227,7 +226,7 @@ export function CheckoutCardModal({
                   message="这张卡不是本系统发出的，不能按卡号退房"
                   description={
                     <>
-                      卡号 {formatCardNo(cardNo!)} 在本地没有发卡记录。点「强制退房」会先弹二次确认，
+                      这张卡在本地没有发卡记录。点「强制退房」会先弹二次确认，
                       确认后<b>直接写入退房数据</b>：关闭 {roomNo} 房当前全部有效卡，并把房态改为退房后房态。
                     </>
                   }
@@ -264,7 +263,7 @@ export function CheckoutCardModal({
             type="warning"
             showIcon
             message="这张卡不是本系统发出的"
-            description={`卡号 ${cardNo === null ? '—' : formatCardNo(cardNo)} 在本地没有发卡记录，无法按卡号退房。`}
+            description="这张卡在本地没有发卡记录，无法按卡号退房。"
           />
           <div>
             继续将<b>直接写入退房数据</b>：

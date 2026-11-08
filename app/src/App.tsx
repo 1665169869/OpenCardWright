@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   App as AntdApp,
@@ -34,12 +34,6 @@ import {
   type ReminderSettings,
 } from './api'
 import AuthGate from './pages/AuthGate'
-import ReadCard from './pages/ReadCard'
-import Logs from './pages/Logs'
-import FirstRunWizard from './components/FirstRunWizard'
-import RoomManager from './pages/RoomManager'
-import AdminCards from './pages/AdminCards'
-import Settings from './pages/Settings'
 import ExpiryBell from './components/ExpiryBell'
 import { playAlert, speak, unlockSound } from './utils/sound'
 import { expirySpeech } from './utils/reminder'
@@ -47,6 +41,14 @@ import { listen } from '@tauri-apps/api/event'
 
 const { Header, Content } = Layout
 const { Title, Text } = Typography
+
+// 一级页面按需加载（TD-902）：首屏只加载当前页签，切到其它页时再拉对应 chunk。
+const ReadCard = lazy(() => import('./pages/ReadCard'))
+const Logs = lazy(() => import('./pages/Logs'))
+const FirstRunWizard = lazy(() => import('./components/FirstRunWizard'))
+const RoomManager = lazy(() => import('./pages/RoomManager'))
+const AdminCards = lazy(() => import('./pages/AdminCards'))
+const Settings = lazy(() => import('./pages/Settings'))
 
 /** 到期提醒轮询间隔：30 秒。 */
 const REMINDER_POLL_MS = 30_000
@@ -384,8 +386,10 @@ export default function App() {
 
         {/* destroyOnHidden：切走即卸载、切回重新挂载 —— 每个页面进入时都会拉一次最新数据。
             记录页的生命周期状态（未到期/已到期/已退房）、房间页的有效卡数都不能是切页前的旧值。 */}
-        <Tabs defaultActiveKey="rooms" items={tabs} destroyOnHidden />
-        <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
+        <Suspense fallback={<div style={{ padding: 24, textAlign: 'center' }}><Spin /></div>}>
+          <Tabs defaultActiveKey="rooms" items={tabs} destroyOnHidden />
+          <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
+        </Suspense>
 
         {/* 关窗确认（TD-109）：默认「缩小到托盘」，后台继续跑到期提醒与自动备份 */}
         <Modal
