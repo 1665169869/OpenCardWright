@@ -101,7 +101,10 @@ namespace PmsLockSdk
         public int CheckoutHour = -1;   // 退房钟点卡的钟点
         public int CardNo = -1;         // 16 位卡号（-1 = 无）
         public bool IsBlank;            // 空白/已退房
-        public int LowNibble;           // 页1 低 4 位
+        public bool IsLost;             // 挂失卡（页1[2] 低 4 位 = 1；TD-150 实测）
+        public int IssueDay;            // 发卡日（从卡号解码；TD-150）
+        public int IssueHour;           // 发卡小时
+        public int IssueSeq;            // 小时内序号（0–62）
         public bool IsMonthEncoded;     // 时长字段是 0xC_ 段（月数编码，天数近似）
 
         public string RawHex { get { return Raw28 == null ? "" : Hex.ToHex(Raw28, Raw28.Length); } }
@@ -116,7 +119,14 @@ namespace PmsLockSdk
             if (Kind == CardKind.GuestDay) sb.Append(" 天数=").Append(Days);
             if (Kind == CardKind.GuestHour) sb.Append(" 小时=").Append(Hours);
             if (Kind == CardKind.CheckoutHour) sb.Append(" 退房钟点=").Append(CheckoutHour);
-            if (CardNo >= 0) sb.Append(" 卡号=0x").Append(CardNo.ToString("X4"));
+            if (CardNo >= 0)
+            {
+                sb.Append(" 卡号=0x").Append(CardNo.ToString("X4"));
+                if (IssueDay > 0)
+                    sb.Append(" 发卡=").Append(IssueDay).Append("日")
+                      .Append(IssueHour).Append("点").Append(IssueSeq).Append("序");
+            }
+            if (IsLost) sb.Append(" 【挂失】");
             return sb.ToString();
         }
 
@@ -168,21 +178,95 @@ namespace PmsLockSdk
     {
         public const byte Prefix0 = 0x5B;
         public const byte Prefix1 = 0xEC;
-        public const byte Suffix = 0xAB;
+        /// <summary>
+        /// 卡内「时间基准」。默认取本机当前时间；测试 / 离线构包可注入固定值，
+        /// 这样 selftest 的黄金向量不会随真实日期漂移（TD-155）。
+        /// </summary>
+        public static DateTime Now = DateTime.Now;
 
-        static byte LowNibble(int days, int hours)
+        /// <summary>
+        /// 页2[3]：**年（高 4 位）+ 月（低 4 位）**。2026 年 11 月 = `0xAB`。
+        /// 读卡侧的还原规则（原厂 `sub_1000260C`）：
+        /// `年 = 2000 + 16 × ⌊(当前年 − 2000) / 16⌋ + 高4位`，16 年一循环。
+        /// </summary>
+        public static byte Suffix
         {
-            return (byte)(hours > 0 ? 1 : (((days & 3) == 1) ? 1 : 0));
+            get
+            {
+                int y = (Now.Year - 2000) & 0x0F;
+                int m = Now.Month & 0x0F;
+                return (byte)((y << 4) | m);
+            }
         }
 
         /// <summary>
-        /// 天数 → 时长码。1~63 天用 0x80|天数；超过 63 天用 0xC0|月数（1 月≈31 天，实测）。
+        /// 按发卡时刻生成卡号（TD-150，2026-11-08 实测破译）。
+        /// 16 位 = 日(5) | 时(5) | 小时内序号(6)，与原厂「作业流水号 = 年月日时 + 小时内序号」对应。
+        /// 例：11 日 12 点、该小时第 52 张 → (11&lt;&lt;11) | (12&lt;&lt;6) | 52 = <c>0x5B34</c>
+        /// （卡内按小端存：N_L=0x34、N_H=0x5B）。
+        /// </summary>
+        public static int TimestampCardNo(DateTime at, int seq)
+        {
+            if (seq < 0 || seq > 62)
+                throw new ArgumentOutOfRangeException("seq", "小时内序号必须在 0–62");
+            return ((at.Day & 0x1F) << 11) | ((at.Hour & 0x1F) << 6) | (seq & 0x3F);
+        }
+
+        /// <summary>从卡号还原发卡日期/小时/序号（读卡显示用）。</summary>
+        public static void DecodeTimestampCardNo(int cardNo, out int day, out int hour, out int seq)
+        {
+            day = (cardNo >> 11) & 0x1F;
+            hour = (cardNo >> 6) & 0x1F;
+            seq = cardNo & 0x3F;
+        }
+
+        /// <summary>
+        /// 按原厂规则推进「发卡时刻 + 小时内序号」：
+        /// 同一小时内序号 +1；满 63 次（序号超过 62）则时刻进位 1 小时、序号归 0；
+        /// 当前时刻已经跨小时则直接用当前时刻、序号从 0 开始。
+        /// 文档原文：「发卡序号为当前写卡时间的小时内的第几次写卡，超过 63 次则 fksj 小时 +1，序号复位为 0」。
+        /// </summary>
+        /// <summary>
+        /// 按原厂规则推进「发卡时刻 + 本小时第 n 张」。
+        /// - 同一小时：n = 上次 + 1；满 63 张后进位到下一小时、n 归 1
+        /// - **进位产生的「未来小时」是下一次的基准**，不会退回当前小时（2026-11-08 修正）
+        /// - 跨小时/跨日：以当前时刻为基准，n 从 1 开始
+        /// <paramref name="nth"/> 取 **1–63**（卡内序号 = nth - 1）。
+        /// </summary>
+        public static void NextStamp(int currentCardNo, DateTime now, out DateTime at, out int nth)
+        {
+            int day, hour, lastSeq;
+            DecodeTimestampCardNo(currentCardNo, out day, out hour, out lastSeq);
+
+            // 同一「日」且卡号小时 >= 当前小时：沿用卡号的小时作为基准
+            // （hour > now.Hour 说明上次已进位到未来小时，这里必须接着往后走，不能回退）
+            if (day == now.Day && hour >= now.Hour)
+            {
+                at = new DateTime(now.Year, now.Month, now.Day, hour, 0, 0);
+                nth = lastSeq + 2;              // 上次是 lastSeq+1，本次再 +1
+                if (nth > 63)
+                {
+                    nth = 1;
+                    at = at.AddHours(1);        // 满 63 张 → 小时 +1，n 复位
+                }
+                return;
+            }
+
+            // 跨小时 / 跨日：从当前时刻重新计数
+            at = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
+            nth = 1;
+        }
+
+        /// <summary>
+        /// 天数 → 时长码。1~63 天用 0x80|天数；超过 63 天用 0xC0|月数。
+        /// **月按 30 天算**（2026-11-08 实测：锁按日历月执行，90 天→3 月、1095 天→36 月；
+        /// 原来用 31 天会算出 35 月，实际少约一个月——见 TD-145）。
         /// </summary>
         public static byte DurationDays(int days)
         {
             if (days < 1) days = 1;
             if (days <= 63) return (byte)(0x80 | (days & 0x3F));
-            int months = (int)Math.Round(days / 31.0);
+            int months = (int)Math.Round(days / 30.0);
             if (months < 1) months = 1;
             if (months > 63) months = 63;
             return (byte)(0xC0 | (months & 0x3F));
@@ -202,17 +286,29 @@ namespace PmsLockSdk
         /// <summary>日租客卡页1/页2</summary>
         public static void BuildGuestDay(int roomIndex, int days, int cardNo, out byte[] p1, out byte[] p2)
         {
-            if (roomIndex < 0 || roomIndex > 0xFF) throw new ArgumentOutOfRangeException("roomIndex");
-            if (days < 1 || days > 1095) throw new ArgumentOutOfRangeException("days");
-            BuildGuest(roomIndex, LowNibble(days, 0), DurationDays(days), cardNo, out p1, out p2);
+            BuildGuestDay(roomIndex, days, cardNo, false, out p1, out p2);
         }
 
-        /// <summary>钟点客卡页1/页2</summary>
+        /// <summary>日租客卡；lost = 挂失卡（页1[2] 低 4 位 = 1，让该房间在用卡失效）。</summary>
+        public static void BuildGuestDay(int roomIndex, int days, int cardNo, bool lost, out byte[] p1, out byte[] p2)
+        {
+            if (roomIndex < 0 || roomIndex > 0xFF) throw new ArgumentOutOfRangeException("roomIndex");
+            if (days < 1 || days > 1095) throw new ArgumentOutOfRangeException("days");
+            BuildGuest(roomIndex, (byte)(lost ? 1 : 0), DurationDays(days), cardNo, out p1, out p2);
+        }
+
+        /// <summary>钟点客卡</summary>
         public static void BuildGuestHour(int roomIndex, int hours, int cardNo, out byte[] p1, out byte[] p2)
+        {
+            BuildGuestHour(roomIndex, hours, cardNo, false, out p1, out p2);
+        }
+
+        /// <summary>钟点客卡；lost = 挂失卡。</summary>
+        public static void BuildGuestHour(int roomIndex, int hours, int cardNo, bool lost, out byte[] p1, out byte[] p2)
         {
             if (roomIndex < 0 || roomIndex > 0xFF) throw new ArgumentOutOfRangeException("roomIndex");
             if (hours < 1 || hours > 62) throw new ArgumentOutOfRangeException("hours");
-            BuildGuest(roomIndex, LowNibble(0, hours), DurationHours(hours, true), cardNo, out p1, out p2);
+            BuildGuest(roomIndex, (byte)(lost ? 1 : 0), DurationHours(hours, true), cardNo, out p1, out p2);
         }
 
         /// <summary>允许手动指定低 4 位（用于对标未解规律）</summary>
@@ -282,12 +378,13 @@ namespace PmsLockSdk
         }
 
         /// <summary>
-        /// 校时卡。值 = 16 × 当日分钟数 + 953，只含当日时/分，不含日期。
-        /// p2 首字节实测为 0x14（7 月样本为 0x13），含义未定，默认照抄。
+        /// 校时卡。值 = 16 × 当日分钟数 + 953（只含当日时/分）。
+        /// 页2[3] 由 <see cref="Suffix"/> 按年月生成；页2 首字节是**明文 `0x06`**
+        ///（IDA: `LOBYTE(v14[2]) = 6`，RWCardDemo 实测一致；早期照抄的 `0x14` 是加扰残留，见 TD-154）。
         /// </summary>
         public static void BuildTimeSync(int hour, int minute, int cardNo, out byte[] p1, out byte[] p2)
         {
-            BuildTimeSync(hour, minute, cardNo, 0x14, out p1, out p2);
+            BuildTimeSync(hour, minute, cardNo, 0x06, out p1, out p2);
         }
 
         public static void BuildTimeSync(int hour, int minute, int cardNo, int p2Head, out byte[] p1, out byte[] p2)
@@ -333,7 +430,7 @@ namespace PmsLockSdk
             if (p2[0] == 0x12 && p2[1] == 0x12 && p2[2] == 0x12 && p2[3] == 0x12)
             { info.Kind = CardKind.Blank; info.IsBlank = true; return info; }
 
-            info.LowNibble = p1[2] & 0x0F;
+            info.IsLost = (p1[2] & 0x0F) != 0;   // 页1[2] 低 4 位：1 = 挂失卡（TD-150）
             int roomIndex = ((p1[2] >> 4) & 0x0F) | (p1[3] << 4);
 
             if (p1[2] == 0x0A && p1[3] == 0x00) info.Kind = CardKind.Reset;
@@ -341,13 +438,13 @@ namespace PmsLockSdk
             else if (p1[2] == 0xF0 && p1[3] == 0xFF) info.Kind = CardKind.Master;
             else if (p2[0] == 0x46 && p2[3] == 0x01) { info.Kind = CardKind.Install; info.RoomIndex = roomIndex; }
             else if (p1[2] == 0x7B) { info.Kind = CardKind.CheckoutHour; info.CheckoutHour = p1[3]; }
-            else if (p2[0] == 0x14) info.Kind = CardKind.TimeSync;   // 校时卡首字节实测 0x14
+            else if (p2[0] == 0x06 || p2[0] == 0x14) info.Kind = CardKind.TimeSync;   // 校时卡：明文 0x06，含旧卡 0x14
             else if ((p2[0] & 0xC0) == 0xC0)
             {
                 // 0xC_ 段：月数编码（实测 90天→0xC3, 120→0xC4, 360→0xCC, 1095→0xE3）
                 info.Kind = CardKind.GuestDay;
                 info.RoomIndex = roomIndex;
-                info.Days = (p2[0] & 0x3F) * 31;   // 近似换算回天数
+                info.Days = (p2[0] & 0x3F) * 30;   // 30 天/月（TD-145 实测：锁按日历月执行）
                 info.IsMonthEncoded = true;
             }
             else if ((p2[0] & 0xC0) == 0x40)
@@ -365,7 +462,15 @@ namespace PmsLockSdk
             }
             else info.Kind = CardKind.Unknown;
 
-            if (p2[3] == Suffix) info.CardNo = (p2[2] << 8) | p2[1];
+            // 页2[3] = 年(高4位) + 月(低4位)：月份 1–12 有效即认为含卡号
+            //（早期拿它和固定 0xAB 比较，改成年月编码后不再适用）
+            int ymMonth = p2[3] & 0x0F;
+            if (ymMonth >= 1 && ymMonth <= 12)
+            {
+                info.CardNo = (p2[2] << 8) | p2[1];
+                // 卡号 = 日(5) + 时(5) + 小时内序号(6)，解出发卡时刻（TD-150 实测）
+                CardBuilder.DecodeTimestampCardNo(info.CardNo, out info.IssueDay, out info.IssueHour, out info.IssueSeq);
+            }
             return info;
         }
     }
@@ -412,6 +517,18 @@ namespace PmsLockSdk
 
         public int Current { get; private set; }
 
+        /// <summary>强制指定发卡时刻（CLI <c>--at</c> / 离线构包用）；null = 用当前时间。</summary>
+        public DateTime? ForcedAt { get; set; }
+
+        /// <summary>强制指定小时内序号（CLI <c>--seq</c>）；null = 按原厂规则自动推算。</summary>
+        public int? ForcedSeq { get; set; }
+
+        /// <summary>
+        /// 上一次 <see cref="Next"/> 是否算出比原值更小的卡号（时钟回拨/跨日）。
+        /// 为 true 时锁可能把这张卡当「旧卡」拒开——仅提示，不拦发卡。
+        /// </summary>
+        public bool LastRollback { get; private set; }
+
         public CardNoStore(string path, int start)
         {
             _path = path;
@@ -434,13 +551,39 @@ namespace PmsLockSdk
             catch { /* 读失败则用默认起点 */ }
         }
 
-        /// <summary>取下一个卡号（并落盘）</summary>
+        /// <summary>取下一个卡号（并落盘）。按 <see cref="ForcedAt"/> 或当前时刻生成，见 TD-150。</summary>
         public int Next()
+        {
+            return NextAt(ForcedAt ?? DateTime.Now);
+        }
+
+        /// <summary>
+        /// 按指定时刻取下一个卡号（离线构包 / 复现 / 测试用）。
+        /// 卡号 = 日(5) + 时(5) + 小时内序号(6)；序号满 63 次进位到下一小时（原厂规则）。
+        /// **强制递增**：算出的值必须大于当前值，否则抛异常拒发（锁会把更小的卡号当旧卡）。
+        /// </summary>
+        public int NextAt(DateTime now)
         {
             lock (_sync)
             {
-                int v = (Current + 1) & 0xFFFF;
-                if (v == 0) throw new InvalidOperationException("卡号已用尽（0xFFFF）");
+                DateTime at;
+                int nth;
+                if (ForcedSeq.HasValue)
+                {
+                    if (ForcedSeq.Value < 1 || ForcedSeq.Value > 63)
+                        throw new InvalidOperationException("--seq 必须是 1–63（本小时第 n 张）");
+                    at = new DateTime(now.Year, now.Month, now.Day, now.Hour, 0, 0);
+                    nth = ForcedSeq.Value;
+                }
+                else
+                {
+                    CardBuilder.NextStamp(Current, now, out at, out nth);
+                }
+                int v = CardBuilder.TimestampCardNo(at, nth - 1);
+                // 2026-11-08 按用户要求：不再因「小于现值」拒发，只保留「每小时 63 张、超出则小时 +1」规则。
+                // 时钟回拨或跨日时新卡号可能小于锁内的房间水位，那会导致锁拒绝开锁——记录标记，不拦发卡。
+                LastRollback = v <= Current;
+
                 Current = v;
                 Save();
                 return v;
@@ -661,13 +804,19 @@ namespace PmsLockSdk
 
         public int IssueGuestDay(string room, int days, CardNoPolicy policy, int explicitCardNo, out CardInfo written)
         {
+            return IssueGuestDay(room, days, policy, explicitCardNo, false, out written);
+        }
+
+        /// <summary>日租客卡；lost = 挂失卡（页1[2] 低 4 位 = 1，让该房间在用卡失效）。</summary>
+        public int IssueGuestDay(string room, int days, CardNoPolicy policy, int explicitCardNo, bool lost, out CardInfo written)
+        {
             int idx;
             if (!ResolveRoom(room, out idx, out written)) return LockResult.ErrParam;
             byte[] p1, p2;
             int no;
             int rc = PrepareCardNo(policy, explicitCardNo, out no);
             if (rc != LockResult.OK) { written = null; return rc; }
-            CardBuilder.BuildGuestDay(idx, days, no, out p1, out p2);
+            CardBuilder.BuildGuestDay(idx, days, no, lost, out p1, out p2);
             return WriteAndVerify(p1, p2, idx, out written);
         }
 
@@ -676,12 +825,18 @@ namespace PmsLockSdk
 
         public int IssueGuestHour(string room, int hours, CardNoPolicy policy, int explicitCardNo, out CardInfo written)
         {
+            return IssueGuestHour(room, hours, policy, explicitCardNo, false, out written);
+        }
+
+        /// <summary>钟点客卡；lost = 挂失卡。</summary>
+        public int IssueGuestHour(string room, int hours, CardNoPolicy policy, int explicitCardNo, bool lost, out CardInfo written)
+        {
             int idx;
             if (!ResolveRoom(room, out idx, out written)) return LockResult.ErrParam;
             byte[] p1, p2; int no;
             int rc = PrepareCardNo(policy, explicitCardNo, out no);
             if (rc != LockResult.OK) { written = null; return rc; }
-            CardBuilder.BuildGuestHour(idx, hours, no, out p1, out p2);
+            CardBuilder.BuildGuestHour(idx, hours, no, lost, out p1, out p2);
             return WriteAndVerify(p1, p2, idx, out written);
         }
 

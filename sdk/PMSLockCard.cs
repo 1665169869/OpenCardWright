@@ -53,6 +53,9 @@ static class Program
         public int Serial = -1; public int Hour = 12; public int Port = -1;
         public string Dir; public string Ini; public string P1, P2;
         public bool Json, Reuse, StrictCardNo, Quiet;
+        public string At;
+        public int Seq = -1;
+        public bool Lost;
     }
 
     static Opt ParseArgs(string[] a, int start)
@@ -76,6 +79,9 @@ static class Program
                 case "--json": o.Json = true; break;
                 case "--reuse": o.Reuse = true; break;
                 case "--strict-cardno": o.StrictCardNo = true; break;
+                case "--at": o.At = a[++i]; break;
+                case "--seq": o.Seq = int.Parse(a[++i]); break;
+                case "--lost": o.Lost = true; break;
                 case "--quiet": o.Quiet = true; break;
                 default: throw new ArgumentException("未知参数 " + a[i]);
             }
@@ -139,15 +145,31 @@ static class Program
             int rc = r.Open();
             if (rc != 0) return Fail(rc, o);
 
+            if (!string.IsNullOrEmpty(o.At))
+            {
+                DateTime at;
+                if (!DateTime.TryParse(o.At, out at))
+                {
+                    Console.Error.WriteLine("× --at 时间格式不正确，例：\"2026-11-08 14\" 或 \"2026-11-08 14:30\"");
+                    return 1;
+                }
+                r.CardNos.ForcedAt = at;
+                // 页2[3] 是「年+月」，由 CardBuilder.Now 决定——必须与卡号用同一个时间源，
+                // 否则 --at 造出的卡会出现「卡号 2027 年、页2[3] 却还是当前年月」的打架。
+                CardBuilder.Now = at;
+            }
+            if (o.Seq >= 0)
+                r.CardNos.ForcedSeq = o.Seq;
+
             CardInfo info = null;
             switch (o.Type)
             {
                 case "guest":
                 case "day":
                     if (o.Hours > 0)
-                        rc = r.IssueGuestHour(o.Room, o.Hours, policy, o.Serial, out info);
+                        rc = r.IssueGuestHour(o.Room, o.Hours, policy, o.Serial, o.Lost, out info);
                     else
-                        rc = r.IssueGuestDay(o.Room, o.Days <= 0 ? 1 : o.Days, policy, o.Serial, out info);
+                        rc = r.IssueGuestDay(o.Room, o.Days <= 0 ? 1 : o.Days, policy, o.Serial, o.Lost, out info);
                     break;
                 case "hour":
                     rc = r.IssueGuestHour(o.Room, o.Hours <= 0 ? 1 : o.Hours, policy, o.Serial, out info);
@@ -231,18 +253,18 @@ static class Program
 
     static readonly Vector[] Vectors = new[]
     {
-        new Vector{ Name="220/5天",   Kind=CardKind.GuestDay, RoomIndex=15, Days=5, CardNo=0x2288, P1="5BECF100", P2="858822AB" },
-        new Vector{ Name="209/1天",   Kind=CardKind.GuestDay, RoomIndex=6,  Days=1, CardNo=0x2250, P1="5BEC6100", P2="815022AB" },
-        new Vector{ Name="260/1天",   Kind=CardKind.GuestDay, RoomIndex=39, Days=1, CardNo=0x2281, P1="5BEC7102", P2="818122AB" },
-        new Vector{ Name="201/1天",   Kind=CardKind.GuestDay, RoomIndex=0,  Days=1, CardNo=0x224A, P1="5BEC0100", P2="814A22AB" },
+        new Vector{ Name="220/5天",   Kind=CardKind.GuestDay, RoomIndex=15, Days=5, CardNo=0x2288, P1="5BECF000", P2="858822AB" },
+        new Vector{ Name="209/1天",   Kind=CardKind.GuestDay, RoomIndex=6,  Days=1, CardNo=0x2250, P1="5BEC6000", P2="815022AB" },
+        new Vector{ Name="260/1天",   Kind=CardKind.GuestDay, RoomIndex=39, Days=1, CardNo=0x2281, P1="5BEC7002", P2="818122AB" },
+        new Vector{ Name="201/1天",   Kind=CardKind.GuestDay, RoomIndex=0,  Days=1, CardNo=0x224A, P1="5BEC0000", P2="814A22AB" },
         new Vector{ Name="205/3天",   Kind=CardKind.GuestDay, RoomIndex=3,  Days=3, CardNo=0x2249, P1="5BEC3000", P2="834922AB" },
         new Vector{ Name="205/4天",   Kind=CardKind.GuestDay, RoomIndex=3,  Days=4, CardNo=0x2249, P1="5BEC3000", P2="844922AB" },
-        new Vector{ Name="220/1天",   Kind=CardKind.GuestDay, RoomIndex=15, Days=1, CardNo=0x2403, P1="5BECF100", P2="810324AB" },
-        new Vector{ Name="220/1小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=1,  CardNo=0x228A, P1="5BECF100", P2="428A22AB" },
-        new Vector{ Name="220/3小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=3,  CardNo=0x2289, P1="5BECF100", P2="448922AB" },
-        new Vector{ Name="220/6小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=6,  CardNo=0x228B, P1="5BECF100", P2="478B22AB" },
-        new Vector{ Name="220/62小时",Kind=CardKind.GuestHour, RoomIndex=15, Hours=62, CardNo=0x228C, P1="5BECF100", P2="7F8C22AB" },
-        new Vector{ Name="220/1小时#2",Kind=CardKind.GuestHour,RoomIndex=15, Hours=1,  CardNo=0x2404, P1="5BECF100", P2="420424AB" },
+        new Vector{ Name="220/1天",   Kind=CardKind.GuestDay, RoomIndex=15, Days=1, CardNo=0x2403, P1="5BECF000", P2="810324AB" },
+        new Vector{ Name="220/1小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=1,  CardNo=0x228A, P1="5BECF000", P2="428A22AB" },
+        new Vector{ Name="220/3小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=3,  CardNo=0x2289, P1="5BECF000", P2="448922AB" },
+        new Vector{ Name="220/6小时", Kind=CardKind.GuestHour, RoomIndex=15, Hours=6,  CardNo=0x228B, P1="5BECF000", P2="478B22AB" },
+        new Vector{ Name="220/62小时",Kind=CardKind.GuestHour, RoomIndex=15, Hours=62, CardNo=0x228C, P1="5BECF000", P2="7F8C22AB" },
+        new Vector{ Name="220/1小时#2",Kind=CardKind.GuestHour,RoomIndex=15, Hours=1,  CardNo=0x2404, P1="5BECF000", P2="420424AB" },
         new Vector{ Name="总控卡1天",  Kind=CardKind.Master,   Days=1, CardNo=0x2248, P1="5BECF0FF", P2="814822AB" },
         new Vector{ Name="总控2小时",  Kind=CardKind.Master,   Hours=2, CardNo=0x2BC2, P1="5BECF0FF", P2="42C22BAB" },
         new Vector{ Name="总控3小时",  Kind=CardKind.Master,   Hours=3, CardNo=0x2BC3, P1="5BECF0FF", P2="43C32BAB" },
@@ -251,7 +273,7 @@ static class Program
         new Vector{ Name="总控90天",   Kind=CardKind.Master,   Days=90, CardNo=0x2BC8, P1="5BECF0FF", P2="C3C82BAB" },
         new Vector{ Name="总控120天",  Kind=CardKind.Master,   Days=120, CardNo=0x2BC9, P1="5BECF0FF", P2="C4C92BAB" },
         new Vector{ Name="总控360天",  Kind=CardKind.Master,   Days=360, CardNo=0x2BCB, P1="5BECF0FF", P2="CCCB2BAB" },
-        new Vector{ Name="总控1095天", Kind=CardKind.Master,   Days=1095, CardNo=0x2BCD, P1="5BECF0FF", P2="E3CD2BAB" },
+        new Vector{ Name="总控1095天", Kind=CardKind.Master,   Days=1095, CardNo=0x2BCD, P1="5BECF0FF", P2="E4CD2BAB" },
         new Vector{ Name="复位卡",     Kind=CardKind.Reset,    CardNo=0x2441, P1="5BEC0A00", P2="004124AB" },
         new Vector{ Name="清除卡",     Kind=CardKind.Clear,    CardNo=0x2442, P1="5BEC9BE5", P2="C74224AB" },
         new Vector{ Name="安装卡220",  Kind=CardKind.Install,  RoomIndex=15, CardNo=-1, P1="5BECFC00", P2="46F20001" },
@@ -263,6 +285,9 @@ static class Program
     static int SelfTest()
     {
         int pass = 0, fail = 0;
+        // 页2[3] 现在是「年+月」编码，向量里的 0xAB 对应 2026-11。
+        // 固定时间基准，避免黄金向量随真实日期漂移（2027 年会变成 0xBB）。
+        CardBuilder.Now = new DateTime(2026, 11, 8, 14, 0, 0);
         foreach (var v in Vectors)
         {
             byte[] p1, p2;
@@ -304,6 +329,71 @@ static class Program
             }
         }
         Console.WriteLine();
+        // ---- 卡号时间戳编码（TD-150）----
+        DateTime t0 = new DateTime(2026, 11, 8, 14, 0, 0);
+        int[] seqs = new int[] { 0, 1, 62 };
+        int[] wants = new int[] { 0x4380, 0x4381, 0x43BE };
+        for (int i = 0; i < seqs.Length; i++)
+        {
+            int got = CardBuilder.TimestampCardNo(t0, seqs[i]);
+            if (got == wants[i]) pass++;
+            else
+            {
+                fail++;
+                Console.WriteLine("  × 卡号 seq=" + seqs[i] + " 期望 " + wants[i].ToString("X4") + " 实际 " + got.ToString("X4"));
+            }
+        }
+
+        // 解码回环：实测样本 0x5B34 = 11 日 12 点、卡内序号 52（即本小时第 53 张）
+        int d, h, s;
+        CardBuilder.DecodeTimestampCardNo(0x5B34, out d, out h, out s);
+        if (d == 11 && h == 12 && s == 52) pass++;
+        else { fail++; Console.WriteLine("  × 解码 0x5B34 得到 " + d + "日" + h + "点seq" + s); }
+
+        // 第 64 张：满 63 张后进位到下一小时、n 归 1
+        DateTime at;
+        int nth;
+        CardBuilder.NextStamp(0x43BE, t0, out at, out nth);   // 上次 = 14 点 seq62 = 第 63 张
+        int carried = CardBuilder.TimestampCardNo(at, nth - 1);
+        if (nth == 1 && carried == 0x43C0) pass++;
+        else { fail++; Console.WriteLine("  × 第64张进位：期望 nth=1/0x43C0，实际 nth=" + nth + "/" + carried.ToString("X4")); }
+
+        // 第 65 张（时钟仍是 14:00）：必须仍在 15 点，不能退回 14 点
+        CardBuilder.NextStamp(0x43C0, t0, out at, out nth);
+        int after = CardBuilder.TimestampCardNo(at, nth - 1);
+        if (nth == 2 && after == 0x43C1) pass++;
+        else { fail++; Console.WriteLine("  × 第65张：期望 nth=2/0x43C1（15点），实际 nth=" + nth + "/" + after.ToString("X4")); }
+
+        // 跨日进位：23 点发满 → 次日 0 点第 1 张
+        DateTime t1 = new DateTime(2026, 11, 8, 23, 30, 0);
+        int lastOfDay = CardBuilder.TimestampCardNo(t1, 62);
+        CardBuilder.NextStamp(lastOfDay, t1, out at, out nth);
+        int nextDay = CardBuilder.TimestampCardNo(at, nth - 1);
+        if (nth == 1 && nextDay == (9 << 11)) pass++;
+        else { fail++; Console.WriteLine("  × 跨日进位：期望 nth=1/0x4800，实际 nth=" + nth + "/" + nextDay.ToString("X4")); }
+
+        // ---- 时长码月数（TD-145，30 天/月）----
+        int[][] durCases = new int[][]
+        {
+            new int[] { 63, 0xBF },    // 63 天：0x80|63，不改月
+            new int[] { 64, 0xC2 },    // 64/30≈2.1 → 2 月
+            new int[] { 90, 0xC3 },    // 3 月
+            new int[] { 150, 0xC5 },   // 5 月
+            new int[] { 360, 0xCC },   // 12 月
+            new int[] { 1095, 0xE4 },  // 36 月（原 31 天/月会算成 35）
+        };
+        for (int i = 0; i < durCases.Length; i++)
+        {
+            byte got = CardBuilder.DurationDays(durCases[i][0]);
+            if (got == (byte)durCases[i][1]) pass++;
+            else
+            {
+                fail++;
+                Console.WriteLine("  × DurationDays(" + durCases[i][0] + ") 期望 "
+                    + ((byte)durCases[i][1]).ToString("X2") + " 实际 " + got.ToString("X2"));
+            }
+        }
+
         Console.WriteLine("自检结果: " + pass + " 通过, " + fail + " 失败");
         return fail == 0 ? 0 : 5;
     }
@@ -350,9 +440,25 @@ static class Program
         sb.Append("\"days\":").Append(c.Kind == CardKind.GuestDay ? c.Days : 0).Append(',');
         sb.Append("\"hours\":").Append(c.Kind == CardKind.GuestHour ? c.Hours : 0).Append(',');
         sb.Append("\"cardNo\":").Append(c.CardNo >= 0 ? "\"0x" + c.CardNo.ToString("X4") + "\"" : "null").Append(',');
+        // 卡内解析字段（TD-150/156）：前端「卡号 YYMMDDHHnn」与「入住时间」依赖它们，
+        // 缺了就只能回退成十六进制显示。
+        sb.Append("\"isLost\":").Append(c.IsLost ? "true" : "false").Append(',');
+        sb.Append("\"issueDay\":").Append(c.IssueDay).Append(',');
+        sb.Append("\"issueHour\":").Append(c.IssueHour).Append(',');
+        sb.Append("\"issueSeq\":").Append(c.IssueSeq).Append(',');
+        sb.Append("\"cardYm\":").Append(CardYmByte(c)).Append(',');
         sb.Append("\"raw\":\"").Append(c.RawHex).Append("\"");
         sb.Append("}}");
         return sb.ToString();
+    }
+
+    /// <summary>页2[3]（年 + 月）原始字节：从 RawHex 第 8 个字节取（hex 字符 14..16）。</summary>
+    static int CardYmByte(CardInfo c)
+    {
+        var h = c.RawHex;
+        if (h == null || h.Length < 16) return 0;
+        int v;
+        return int.TryParse(h.Substring(14, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out v) ? v : 0;
     }
 
     static string JsonEscape(string s)
