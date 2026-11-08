@@ -38,3 +38,12 @@ desktop.ini
 # 本地 agent 记忆与计划（含本机绝对路径，不入库）
 .ai-memory/
 .workbuddy/
+
+# IDA / 反编译产物（分析 vendor/ 里的二进制时生成，不入库）
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.idb
