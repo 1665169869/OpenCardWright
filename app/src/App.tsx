@@ -382,7 +382,9 @@ export default function App() {
           />
         ) : null}
 
-        <Tabs defaultActiveKey="rooms" items={tabs} />
+        {/* destroyOnHidden：切走即卸载、切回重新挂载 —— 每个页面进入时都会拉一次最新数据。
+            记录页的生命周期状态（未到期/已到期/已退房）、房间页的有效卡数都不能是切页前的旧值。 */}
+        <Tabs defaultActiveKey="rooms" items={tabs} destroyOnHidden />
         <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
 
         {/* 关窗确认（TD-109）：默认「缩小到托盘」，后台继续跑到期提醒与自动备份 */}
