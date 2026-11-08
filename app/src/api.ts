@@ -408,6 +408,7 @@ export type AdminCardRequest =
   | { kind: 'install'; roomNo: string }
   | { kind: 'checkout'; hour: number }
   | { kind: 'timeSync'; hour?: number | null; minute?: number | null }
+  | { kind: 'blank' }
   | { kind: 'raw'; p1: string; p2: string }
 
 export interface IssuedCard {

@@ -30,7 +30,7 @@ import {
 
 const { Text } = Typography
 
-type Kind = 'master' | 'reset' | 'clear' | 'install' | 'checkout' | 'timeSync' | 'raw'
+type Kind = 'master' | 'reset' | 'clear' | 'install' | 'checkout' | 'timeSync' | 'blank' | 'raw'
 
 const KIND_LABEL: Record<Kind, string> = {
   master: '总控卡',
@@ -39,6 +39,7 @@ const KIND_LABEL: Record<Kind, string> = {
   install: '安装卡',
   checkout: '退房钟点卡',
   timeSync: '校时卡',
+  blank: '空白卡（清零）',
   raw: '原始直写',
 }
 
@@ -53,6 +54,8 @@ const WARNING: Record<Kind, string> = {
     '安装卡只含房间序号，不含房号也不含卡号。拿到锁上刷一次即完成绑定；刷错房间会让锁绑定到错误的房间。',
   checkout: '退房钟点卡只改变锁内记录的退房时间，不改变已发出的卡。',
   timeSync: '校时卡只含当日时/分，不含日期。锁用它建立时间基准。',
+  blank:
+    '空白卡把卡内 8 字节全部写 0，相当于擦成空白卡：锁会当成无效卡拒开。用于回收旧卡、或在现场把废卡彻底清掉。写完后建议在读卡页读一次确认是「空白卡」。',
   raw: '原始直写会把这 8 个字节原样写进卡里，可能把卡写成任何卡型或废卡。除非你在做逆向验证，否则不要用。',
 }
 
@@ -114,6 +117,8 @@ export default function AdminCards({
         return { kind: 'checkout', hour: checkoutHour }
       case 'timeSync':
         return now ? { kind: 'timeSync' } : { kind: 'timeSync', hour, minute }
+      case 'blank':
+        return { kind: 'blank' }
       case 'raw':
         return { kind: 'raw', p1, p2 }
     }
@@ -313,7 +318,7 @@ export default function AdminCards({
         cancelText="取消"
         confirmLoading={loading}
         okButtonProps={{
-          danger: kind === 'reset' || kind === 'clear' || kind === 'raw',
+          danger: kind === 'reset' || kind === 'clear' || kind === 'blank' || kind === 'raw',
           disabled: !longConfirmed,
         }}
         onOk={confirmIssue}

@@ -503,6 +503,8 @@ pub enum AdminCardRequest {
     Checkout { hour: u8 },
     TimeSync { hour: Option<u8>, minute: Option<u8> },
     Raw { p1: String, p2: String },
+    /// 空白卡（TD-136）：把卡 8 字节全部写 0。字节与持卡退房的擦卡相同，但走管理卡通道、留独立记录。
+    Blank,
 }
 
 impl AdminCardRequest {
@@ -515,6 +517,7 @@ impl AdminCardRequest {
             Self::Checkout { .. } => "退房钟点卡",
             Self::TimeSync { .. } => "校时卡",
             Self::Raw { .. } => "原始直写",
+            Self::Blank => "空白卡",
         }
     }
 
@@ -584,6 +587,15 @@ impl AdminCardRequest {
                 a.push(p1.to_uppercase());
                 a.push("--p2".into());
                 a.push(p2.to_uppercase());
+            }
+            // 空白卡（TD-136）：走 raw 通道写全零，与持卡退房的擦卡同字节
+            Self::Blank => {
+                a.push("--type".into());
+                a.push("raw".into());
+                a.push("--p1".into());
+                a.push("00000000".into());
+                a.push("--p2".into());
+                a.push("00000000".into());
             }
         }
         Ok(a)
@@ -3369,6 +3381,17 @@ mod tests {
         let card = dev.erase_card().expect("模拟擦卡应成功");
         assert!(card.kind.is_blank(), "擦卡结果必须是空白卡");
         assert!(card.card_no.is_none(), "空白卡不含卡号");
+    }
+
+    #[test]
+    fn blank_card_writes_all_zero_bytes() {
+        // TD-136：空白卡走 raw 通道写全零（与持卡退房擦卡同字节），但 label 必须显示「空白卡」，
+        // 否则发卡记录/CSV 里会混成「原始直写」，事后分不清操作意图。
+        assert_eq!(AdminCardRequest::Blank.label(), "空白卡");
+        assert_eq!(
+            args(AdminCardRequest::Blank),
+            vec!["--type", "raw", "--p1", "00000000", "--p2", "00000000"]
+        );
     }
 
     #[test]

@@ -40,17 +40,23 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
     void load()
   }, [load])
 
-  const savePort = async () => {
+  /**
+   * 切串口（TD-137）：选完立即生效，不再需要点「保存」。
+   * 失败时把下拉回滚到当前生效值，避免界面显示的串口和实际用的不一致。
+   */
+  const switchPort = async (next: number) => {
     setBusy('port')
     setError(null)
     setNotice(null)
     try {
-      const i = await api.setPort(port)
+      const i = await api.setPort(next)
       setInfo(i)
-      setNotice(`已切换到 COM${i.port + 1}`)
+      setPort(i.port)
+      setNotice(`已切换到 COM${i.port + 1}（已自动保存，下次启动沿用）`)
       onChanged?.()
     } catch (e) {
       setError(describeError(e))
+      setPort(info?.port ?? next)
     } finally {
       setBusy(null)
     }
@@ -109,9 +115,15 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
       {/* 模拟设备的横幅只在主界面顶部显示一次，这里不再重复 */}
       <Card title="串口" size="small">
         <Space wrap>
-          <Select style={{ width: 200 }} value={port} onChange={setPort} options={PORT_OPTIONS} />
-          <Button type="primary" loading={busy === 'port'} onClick={savePort}>
-            保存并切换
+          <Select
+            style={{ width: 200 }}
+            value={port}
+            disabled={busy === 'port'}
+            onChange={(v) => void switchPort(Number(v))}
+            options={PORT_OPTIONS}
+          />
+          <Button loading={busy === 'port'} onClick={() => void switchPort(port)}>
+            重新连接
           </Button>
           <Button loading={busy === 'probe'} onClick={probe}>
             探测端口
@@ -122,6 +134,7 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
         </Space>
         <div style={{ marginTop: 12 }}>
           <Text type="secondary">
+            选串口立即生效并自动保存（下次启动沿用）；切到同一个串口等于重连。
             索引 0 = COM1，索引 6 = COM7（驱动内部按 index + 1 打开串口）。原门锁软件会独占串口，切换前先退出它。
           </Text>
         </div>
@@ -173,9 +186,8 @@ export default function DevicePanel({ onChanged }: { onChanged?: () => void }) {
                   row.available ? (
                     <Button
                       size="small"
-                      onClick={() => {
-                        setPort(row.port)
-                      }}
+                      loading={busy === 'port'}
+                      onClick={() => void switchPort(row.port)}
                     >
                       选这个
                     </Button>

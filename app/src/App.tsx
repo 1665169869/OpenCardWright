@@ -9,6 +9,7 @@ import {
   Spin,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   type TabsProps,
 } from 'antd'
@@ -18,6 +19,7 @@ import {
   LogoutOutlined,
   ScanOutlined,
   HistoryOutlined,
+  LoadingOutlined,
   SettingOutlined,
 } from '@ant-design/icons'
 import {
@@ -55,6 +57,10 @@ export default function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null)
   const [bootError, setBootError] = useState<string | null>(null)
   const [info, setInfo] = useState<AppInfo | null>(null)
+  /** 启动探测（TD-138）：appInfo 未回来之前顶栏显示「探测设备中…」 */
+  const [infoLoading, setInfoLoading] = useState(true)
+  /** 设备可用性：null = 还没有结果；先由 appInfo 快判，再由后台 probePorts 覆盖 */
+  const [deviceOk, setDeviceOk] = useState<boolean | null>(null)
   const [status, setStatus] = useState<CardNoStatus | null>(null)
   const [error, setError] = useState<string | null>(null)
   // 房间列表的版本号：房间页一变就 +1，让发卡页/管理卡页重新拉列表
@@ -96,10 +102,24 @@ export default function App() {
   }, [])
 
   const refreshInfo = useCallback(() => {
+    setInfoLoading(true)
     api
       .appInfo()
-      .then(setInfo)
-      .catch((e: unknown) => setError(describeError(e)))
+      .then((i) => {
+        setInfo(i)
+        // 快判（TD-138）：SDK 运行时副本就绪才算设备可用——毫秒级，先给顶栏 tag 定型
+        setDeviceOk(i.driverSha256 !== null && i.sdkSource !== null)
+        // 后台再真探测串口（逐个开 COM1–COM8，比较慢）；结果覆盖快判，失败就保留快判
+        api
+          .probePorts()
+          .then((list) => setDeviceOk(list.some((p) => p.available)))
+          .catch(() => {})
+      })
+      .catch((e: unknown) => {
+        setError(describeError(e))
+        setDeviceOk(false)
+      })
+      .finally(() => setInfoLoading(false))
     refreshStatus()
   }, [refreshStatus])
 
@@ -315,7 +335,19 @@ export default function App() {
             门锁发卡台
           </Title>
           {info ? <Tag>v{info.version}</Tag> : null}
-          {info?.simulation ? <Tag color="orange">模拟设备</Tag> : info ? <Tag color="green">设备就绪</Tag> : null}
+          {infoLoading ? (
+            <Tag icon={<LoadingOutlined spin />} color="processing">
+              探测设备中…
+            </Tag>
+          ) : info?.simulation ? (
+            <Tag color="orange">模拟设备</Tag>
+          ) : deviceOk === false ? (
+            <Tooltip title="检查读卡器 USB / 驱动，或原门锁软件是否占着串口；可去「设置 → 设备 → 探测端口」重试">
+              <Tag color="orange">未探测到设备</Tag>
+            </Tooltip>
+          ) : (
+            <Tag color="green">设备就绪</Tag>
+          )}
         </Space>
 
         <Space size="middle">
