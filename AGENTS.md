@@ -20,7 +20,7 @@
 | `docs/抓包样本与验证记录.md` | 原厂字节样本表、实测结论、复现方法 | 新样本**必须**登记在这里 |
 | `docs/SDK使用说明.md` | .NET / COM / CLI 三种用法、错误码、FAQ | 接口变了才改 |
 | `sdk/PMSLockSDK.cs` | 类库：`CardBuilder`（纯函数）、`LockCardReader`（P/Invoke）、配置/状态 | 见第 4 节约定 |
-| `sdk/PMSLockCard.cs` | CLI，含 `selftest` 的 27 条黄金样本 | 加样本只追加 |
+| `sdk/PMSLockCard.cs` | CLI，含 `selftest` 的 40 项（27 字节向量 + 7 卡号编码 + 6 时长码） | 加样本只追加 |
 | `sdk/PMSLockSDK.Com.cs` | COM 可见封装（`PmsLockSdk.Reader`） | 改 ProgId/GUID 会破坏调用方 |
 | `sdk/demo/` | COM/VBScript 与 C# 调用示例（`Demo.cs`、`ComTest.vbs`），自含一份 SDK dll 副本 | 改接口时同步示例 |
 | `sdk/tools/RawRead.exe` | 原始读卡小工具（联机排障用） | 慎改 |
@@ -55,7 +55,7 @@ csc /target:library /platform:x86 /out:PMSLockSDK.Com.dll /r:PMSLockSDK.dll PMSL
 - 源码含中文注释与中文输出：若编译后乱码，加 `/codepage:65001`，**不要**转成 GBK 保存。
 - 交付物是 `.dll/.exe`，仓库里已提交编译结果；改源码后要同步重建，否则现场跑的是旧二进制。
 - **产品侧不要手工执行上面的 csc**：统一走 `app/scripts/build-sdk.ps1`
-  （额外编 `OCWCardBuild.exe`、跑 27 条自检门禁、不复制 `CardNo.state`）。
+  （额外编 `OCWCardBuild.exe`、跑 40 项自检门禁、不复制 `CardNo.state`）。
 
 ## 3. 验证（不需要读卡器）
 
@@ -64,8 +64,8 @@ cd sdk
 PMSLockCard.exe selftest
 ```
 
-- 期望末行 `自检结果: 27 通过, 0 失败`；失败时进程返回 `5`。
-- 27 条向量取自 `docs/抓包样本与验证记录.md` 的原厂样本（该表共 28 行，校时卡样本未进向量；
+- 期望末行 `自检结果: 40 通过, 0 失败`；失败时进程返回 `5`。
+- 40 项自检取自 `docs/抓包样本与验证记录.md` 的原厂样本（该表共 28 行，校时卡样本未进向量；
   总控 90/120/360/1095 天来自月数编码实验表）。`NAME` 字段可与表对号。
 - **纯字节回归**：`CardBuilder` 是静态纯函数，`selftest` 不打开串口，可随时跑。
 - 需要硬件时才用 `PMSLockCard.exe ports` / `read`；驱动哈希不符、串口被 `NacreHis.exe` 占用都会失败。
@@ -92,7 +92,7 @@ PMSLockCard.exe selftest
 
 ```
 页1 = 5B EC | ((序号 & 0x0F) << 4 | 低4位) | (序号 >> 4)
-页2 = 时长码 | 卡号低 | 卡号高 | AB
+页2 = 时长码 | 卡号低 | 卡号高 | **年月**（高 4 位 = `(年−2000) & 0x0F`、低 4 位 = 月；还原时 `年 = 2000 + 16×⌊(当前年−2000)/16⌋ + 高4位`，**16 年一循环**。**不是常量**：2026-11 写 `0xAB`、2027-11 写 `0xBB`，已实测。见 `docs/TEMIC门锁卡技术规格.md` §4.4.2）
 ```
 
 | 项 | 规则 |
@@ -101,12 +101,20 @@ PMSLockCard.exe selftest
 | 时长码（小时） | 客卡 `0x40 ｜ (小时+1)`；总控卡 `0x40 ｜ 小时`（差 1，实测） |
 | 总控卡页1 | `5B EC F0 FF` |
 | 安装卡页2 | 固定 `46 F2 00 01`，**不含**卡号 |
-| 校时卡 | `值 = 16 × 当日分钟数 + 953`，页2 首字节 `0x14`（照抄，含义未定） |
+| 校时卡 | `值 = 16 × 当日分钟数 + 953`（小端）；页2 首字节 **`0x06`**（明文，IDA: `LOBYTE(v14[2]) = 6`）；页1[2] 必须满足 `& 0x09 == 0x09`，否则读卡返回错误 4 |
+| 卡号 | **时间戳编码**：`(日 << 11) | (时 << 6) | 小时内序号`（序号 0–62；满 63 张则小时 +1、序号归 0）。不再用纯递增计数器 |
+| CLI 时间源 | `issue --at "YYYY-MM-DD HH:mm"` **同时**驱动卡号（`CardNoStore.ForcedAt`）与 `页2[3]` 年月（`CardBuilder.Now`）——两者必须同源，否则会出现「卡号 2027 年、年月 2026」 |
+| 挂失 | `页1[2]` **低 4 位** = 1 即挂失（`BuildGuestDay/Hour(..., lost)`）；原 `LowNibble`（`天数&3==1`）已删除，那会让 1 天卡/钟点卡被误标挂失 |
+| 时长码·月 | 超 63 天走 `0xC0 \| 月数`，**按 30 天/月换算**（90→3 月、1095→**36 月**）；锁按日历月执行 |
+| 发卡数量 | **无上限**（2026-11-08 移除「最大发卡数」与「同房复用首卡卡号」）；同房多张卡各用新卡号，靠锁的卡号水位共存 |
+| 让旧卡失效 | 只能发**挂失卡**（`页1[2]` 低 4 位 = 1）；与「同房多发卡」是两套独立机制 |
 | 卡号 | 16 位、低字节在前；`N_H << 8 ｜ N_L` |
 | 锁的判定 | 每个房间 × 每种卡型各自维护高水位：大于→开并更新，等于→开，小于→拒 |
 | 日租 / 钟点 | 两套高水位**互不影响** |
 | 复位卡 | 清空该房间卡记录（高水位归零），且不受卡号大小限制 |
 | 总控卡 vs 高水位 | **【待定】** 现场线索称总控卡可能不受客房高水位限制，未做受控实验；验证方法见 `docs/TEMIC门锁卡技术规格.md` §11.6。不要据此放宽卡号保护 |
+| 发卡台「水位」UI | **已移除**（2026-11-08）：顶栏水位告警条、设置页「水位」页签、发卡前的卡号闸门、长有效期卡的「顶高水位」确认词全部删除；`CardNo.state` 仍保留，仅用于算「本小时第几张」。**锁侧的高水位机制完全不变**（见上面三行） |
+| 读卡退房范围 | **只允许客卡**（日租/钟点）。持卡退房会擦卡（写零），若把总控/复位/安装/校时卡放上去会被擦成空白；后端 `checkout_card` 与前端 `CheckoutCardModal` 都会拦 |
 
 驱动侧固定参数：写密码 `12000206`，必须 `config_parameter(0)`（明文，加扰模式 `3` 会"能读不能写"），
 写卡走 `te_setuppwm_asc` + `te_writepwm_asc`（`te_write` 对空白卡无效），写完立刻回读可能拿到旧值
@@ -142,7 +150,7 @@ PMSLockCard.exe selftest
 ## 8. 环境注记
 
 - 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用；2026-11-07 起前端包管理改用
-  **pnpm 12**（`pnpm build:sdk` 实测 27/27 通过）。`app/pnpm-workspace.yaml` 的 `allowBuilds: esbuild`
+  **pnpm 12**（`pnpm build:sdk` 实测 40/40 通过）。`app/pnpm-workspace.yaml` 的 `allowBuilds: esbuild`
   不能删，否则 `pnpm install` 会以 `ERR_PNPM_IGNORED_BUILDS` 失败。若某会话 `pwsh` 启动失败
   （`0xC0000142` DLL 初始化失败），先确认能否编译，
   不要把“没跑过命令”当成验证通过。
@@ -151,8 +159,9 @@ PMSLockCard.exe selftest
 - 驱动版本敏感：结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
 - 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
-  常规改动直接提交即可；但 `sdk/CardNo.state` 是现场计数器，提交前确认值未被误改。
-  注意 `app/src-tauri/resources/sdk/` 是构建产物，不入库。
+  **未明确要求不得提交**：除非用户当轮明确说要「提交 / commit / 推送」，否则只改工作区、在回复里列出改动，
+  **不要 `git add` / `git commit` / `git push`**；需要提交时先给 `git status` 摘要等用户点头。
+  `sdk/CardNo.state` 是现场计数器，提交前确认值未被误改；`app/src-tauri/resources/sdk/` 是构建产物，不入库。
 
 ---
 
@@ -166,7 +175,7 @@ PMSLockCard.exe selftest
 | `sdk/` 的定位 | 产品的**设备实现与参考实现**。产品在构建期用 `csc` 从 `sdk/*.cs` 现编，产物打进 `src-tauri/resources/sdk/` |
 | 能否修改 `sdk/` | **不能**（沿用第 1、4、6 节约束）。需要改设备行为时，改的是产品的适配层，不是 SDK |
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
-| 回归口径 | `sdk` 自带的 27 条黄金向量；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
+| 回归口径 | `sdk` 自带的 40 项自检；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
 | 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build` |
 | 编译环境坑 | 仓库路径含中文时 MSVC 会报 `D8050`：设 `CARGO_TARGET_DIR` 到 ASCII 路径 + `DEBUG=false`。详见 `app/README.md` §4 |
 
@@ -188,7 +197,7 @@ PMSLockCard.exe selftest
 
 ```powershell
 pnpm install
-pnpm build:sdk      # 编译 ../sdk → resources/sdk，跑 27 条黄金向量门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
+pnpm build:sdk      # 编译 ../sdk → resources/sdk，跑 40 项门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
 pnpm dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
 pnpm tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
 pnpm build          # build:sdk + tsc --noEmit + vite build
@@ -214,10 +223,16 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`。模拟设备会调用 `OCWCardBuild.exe`
 离线构包并推进 `CardNo.state`，卡号/字节与真机一致，只是不真写卡（缺构包器时退回固定样本）。
 
-**运行时数据不在仓库里**：`%PROGRAMDATA%\OpenCardWright\opencardwright.db`（SQLite）+
-`runtime\`（构建期从 `src-tauri/resources/sdk` 拷入）。debug 构建在空库时会自动导入
-`data/NacreHis.json` 的 `Kf_fh`，建 30 个房间 + 房型 + 房态；发布版不含这段。
-查数据直接读那个 db，不要指望仓库内有 `*.db`。
+**运行时数据不在仓库里**，且**调试与正式环境分目录存放**（`provision.rs::data_root()`）：
+
+| 构建 | 数据目录 |
+|---|---|
+| `pnpm tauri dev` / `cargo run`（debug） | `%PROGRAMDATA%\OpenCardWright-dev\` |
+| 安装包（release） | `%PROGRAMDATA%\OpenCardWright\` |
+
+两个目录里都有 `opencardwright.db`（SQLite）+ `runtime\`（构建期从 `src-tauri/resources/sdk` 拷入）。
+debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 30 个房间 + 房型 + 房态；发布版不含这段。
+查数据时先确认自己看的是哪个目录，不要指望仓库内有 `*.db`。
 
 ### 房间与卡片的业务铁律（改房间/发卡相关代码前必读）
 

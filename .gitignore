@@ -47,3 +47,7 @@ desktop.ini
 *.nam
 *.til
 *.idb
+
+# 逆向实验产物（含打过补丁的第三方 DLL、原始备份），不入库
+vendor/**/接口文件-patched/
+*.orig

@@ -17,18 +17,18 @@
 
 | 阶段 | 状态 |
 |---|---|
-| M0 地基（工程骨架、构建脚本、CI、SQLite schema） | ✅ **已验证**：SDK 构建 + 27/27 门禁、前端 tsc/vite 通过、`cargo test` 26 项通过 |
+| M0 地基（工程骨架、构建脚本、CI、SQLite schema） | ✅ **已验证**：SDK 构建 + 40/40 门禁、前端 tsc/vite 通过、`cargo test` 26 项通过 |
 | M1 设备通道 + 读卡页 | ✅ 解析器与真机 `selftest` 集成测试通过；读卡页含四态提示 |
 | M2 发卡主流程 | ✅ 代码就位（发卡/落库/幂等/水位闸门），**未上真机** |
 | M3 管理卡与权限 | ✅ 6 类管理卡 + 原始直写、二次确认、审计落库；⬜ 角色鉴权未做 |
 | M4 房号生命周期 | ✅ 新增房间（二级表单）自动分配序号 + 制作安装卡、改房名、逻辑删除；⬜ 初始 ini/CSV 导入 |
 | M5 运维 | ✅ 数据库备份 / 恢复 / 自动备份（设置 → 备份）；⬜ 诊断包、发卡记录页与 CSV、文件日志轮转 |
-| M6 打包发布 | ✅ **NSIS 安装包 1.96 MiB**，静默安装 + 启动 + 27/27 自检全通过；⬜ 代码签名、正式文档 |
+| M6 打包发布 | ✅ **NSIS 安装包 1.96 MiB**，静默安装 + 启动 + 40/40 自检全通过；⬜ 代码签名、正式文档 |
 
 已实测通过的命令：
 
 ```powershell
-pnpm build:sdk     # 编译 sdk/ → resources/sdk，跑 27 条黄金向量
+pnpm build:sdk     # 编译 sdk/ → resources/sdk，跑 40 项自检
 pnpm exec tsc --noEmit      # 前端类型检查
 pnpm exec vite build        # 前端产物
 - `cargo test --workspace` — **120 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 43、命令层 44）
@@ -75,7 +75,7 @@ pnpm exec vite build        # 前端产物
 - 卡号治理：**全局统一水位**（所有房间共用一个卡号计数器）；警戒线可在「设置 → 水位」调整，
   到线后顶栏告警提示"给全部门锁刷一遍复位卡"，刷完再在设置里把水位重置到低位
 - 到期提醒：按发卡时间估算客卡到期，可设**提前 N 分钟**提醒（默认 30），带**提示声**与顶栏铃铛
-- 设备（设置 → 设备，二级页签第一项）：探测串口、切换 COM、跑 27 条自检、看驱动指纹——**dev 模式同样可用**
+- 设备（设置 → 设备，二级页签第一项）：探测串口、切换 COM、跑 40 项自检、看驱动指纹——**dev 模式同样可用**
 - 身份证读卡（TD-135）：开卡表单的「读取身份证」按钮连本机华视读卡服务的 WebSocket
   （默认 `ws://127.0.0.1:9001`，**连上即推送、无需发命令**），自动填姓名/性别/民族/出生日期/住址/证件号。
   它与发卡用的 125 kHz 读卡器是**两个独立设备**；服务没起/超时只弹提示，不影响手填发卡。
@@ -214,10 +214,13 @@ pnpm exec tauri build               # 出安装包
 
 ```powershell
 cargo run -p ocw-device --example probe -- `
-  "$env:ProgramData\OpenCardWright\runtime\PMSLockCard.exe" `
-  "$env:ProgramData\OpenCardWright\runtime\LockCard.ini" `
-  "$env:ProgramData\OpenCardWright\runtime\IOServer\LC2000" 6 ports
+  "$env:ProgramData\OpenCardWright-dev\runtime\PMSLockCard.exe" `
+  "$env:ProgramData\OpenCardWright-dev\runtime\LockCard.ini" `
+  "$env:ProgramData\OpenCardWright-dev\runtime\IOServer\LC2000" 6 ports
 ```
+
+> debug 构建的数据目录是 `OpenCardWright-dev\`（见 `provision.rs::data_root()`）；
+> 安装包才用 `OpenCardWright\`。上面这条是 `cargo run`，所以走 `-dev`。
 
 它会打印退出码、stdout/stderr 原文和解析结果。
 
