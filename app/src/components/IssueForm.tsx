@@ -17,6 +17,7 @@ import {
   type IssuedCard,
   type Room,
 } from '../api'
+import { readIdCard } from '../idcard'
 
 const { TextArea } = Input
 const { Text } = Typography
@@ -59,6 +60,9 @@ export default function IssueForm({
   const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
   /** 长有效期卡（>62 天）必须原样输入这个确认词 */
   const [confirmWord, setConfirmWord] = useState('')
+  /** 身份证读卡（TD-135）：独立设备，按钮 loading 与失败提示 */
+  const [idBusy, setIdBusy] = useState(false)
+  const [idError, setIdError] = useState<string | null>(null)
   /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数。
    *  TD-126：初值读「退房钟点」设置项（默认 12），只读展示，改配置去设置页。 */
   const [checkoutTime, setCheckoutTime] = useState('12:00')
@@ -73,6 +77,23 @@ export default function IssueForm({
 
   const setGuestField = (key: keyof GuestInput, value: string) => {
     setGuest((prev) => ({ ...prev, [key]: value }))
+  }
+
+  /**
+   * 读身份证（TD-135）：走独立设备的本地 WebSocket，与发卡读卡器无关。
+   * 读到就填表（证件类型固定「身份证」），读不到只提示，不影响手填与发卡。
+   */
+  const onReadIdCard = async () => {
+    setIdBusy(true)
+    setIdError(null)
+    try {
+      const info = await readIdCard()
+      setGuest((prev) => ({ ...prev, ...info, idType: '身份证' }))
+    } catch (e) {
+      setIdError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setIdBusy(false)
+    }
   }
 
   const guestHasInput = Object.values(guest).some((v) => (v ?? '').trim() !== '')
@@ -200,6 +221,23 @@ export default function IssueForm({
               : '按发卡时间估算；时间只影响记录与到期估算，锁按首次刷卡起算，可能比这里晚。'
           }
         />
+
+        <Space wrap align="center">
+          <Text type="secondary">客人身份（可选，填写后进入入住记录）</Text>
+          <Button size="small" loading={idBusy} onClick={() => void onReadIdCard()}>
+            读取身份证
+          </Button>
+        </Space>
+        {idError ? (
+          <Alert
+            type="warning"
+            showIcon
+            closable
+            message="读取身份证失败（可以手动填写）"
+            description={idError}
+            onClose={() => setIdError(null)}
+          />
+        ) : null}
 
         <Space wrap>
           <Input
