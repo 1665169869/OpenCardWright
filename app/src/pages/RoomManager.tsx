@@ -95,6 +95,8 @@ export default function RoomManager({
   settingsVersion: number
 }) {
   const [rooms, setRooms] = useState<Room[]>([])
+  /** 全局默认最大发卡数（TD-161）：卡片上算「有效卡 N/上限」用 */
+  const [maxDefault, setMaxDefault] = useState(2)
   const [roomTypes, setRoomTypes] = useState<RoomType[]>([])
   const [statuses, setStatuses] = useState<RoomStatus[]>([])
   const [roomNo, setRoomNo] = useState('')
@@ -248,6 +250,14 @@ export default function RoomManager({
   useEffect(() => {
     void reload()
   }, [reload, settingsVersion])
+
+  // 全局默认上限（TD-161）：设置页改完 `settingsVersion` 会变，卡片上的「N/上限」要跟着刷
+  useEffect(() => {
+    void api
+      .getMaxCardsDefault()
+      .then(setMaxDefault)
+      .catch(() => {})
+  }, [settingsVersion])
 
   const statusOf = (key: string): RoomStatus | undefined => statuses.find((s) => s.key === key)
 
@@ -1088,7 +1098,7 @@ export default function RoomManager({
                       <Text type="secondary" style={{ fontSize: 12 }}>
                         序号 {room.roomIndex} · 有效卡{' '}
                         <Text style={{ fontSize: 12, color: '#595959' }} strong>
-                          {room.activeCards}
+                          {room.activeCards}/{room.maxCards === 0 ? '∞' : (room.maxCards ?? maxDefault)}
                         </Text>
                       </Text>
 
