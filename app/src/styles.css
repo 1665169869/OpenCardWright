@@ -10,6 +10,38 @@ body {
   background: #f5f5f5;
 }
 
+/* 左侧导航品牌区：与右侧 Header 同高；展开显示图标 + 标题，折叠只显示图标 */
+.ocw-sider-brand {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 16px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ocw-sider-logo {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+
+.ocw-sider-brand--collapsed {
+  justify-content: center;
+  padding: 0;
+  font-size: 14px;
+}
+
+.ocw-page-loading {
+  padding: 48px 0;
+  text-align: center;
+}
+
 /* 28 字节原文要等宽、可整块选中 */
 .ocw-hex {
   font-family: 'Cascadia Mono', Consolas, 'Courier New', monospace;

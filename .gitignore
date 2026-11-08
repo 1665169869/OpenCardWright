@@ -9,6 +9,8 @@ app/src-tauri/target/
 # 前端构建与打包产物
 app/dist/
 app/release/
+# Vite 依赖预构建缓存
+app/.vite/
 
 # 构建脚本生成的 SDK 运行副本（由 sdk/*.cs 现编，不入库）
 app/src-tauri/resources/sdk/

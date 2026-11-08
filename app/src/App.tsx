@@ -4,14 +4,14 @@ import {
   App as AntdApp,
   Button,
   Layout,
+  Menu,
   Modal,
   Space,
   Spin,
-  Tabs,
   Tag,
   Tooltip,
   Typography,
-  type TabsProps,
+  type MenuProps,
 } from 'antd'
 import {
   HomeOutlined,
@@ -35,11 +35,12 @@ import {
 } from './api'
 import AuthGate from './pages/AuthGate'
 import ExpiryBell from './components/ExpiryBell'
+import appIcon from './assets/app-icon.png'
 import { playAlert, speak, unlockSound } from './utils/sound'
 import { expirySpeech } from './utils/reminder'
 import { listen } from '@tauri-apps/api/event'
 
-const { Header, Content } = Layout
+const { Header, Content, Sider } = Layout
 const { Title, Text } = Typography
 
 // 一级页面按需加载（TD-902）：首屏只加载当前页签，切到其它页时再拉对应 chunk。
@@ -67,6 +68,9 @@ export default function App() {
   const [roomsVersion, setRoomsVersion] = useState(0)
   // 设置页的版本号：房型/房态的颜色图标改完就 +1，房间页据此重新拉数据（不用手动刷新）
   const [settingsVersion, setSettingsVersion] = useState(0)
+  /** 一级导航当前页；Sider 折叠状态由 antd 的 breakpoint 自动切换 */
+  const [activeKey, setActiveKey] = useState('rooms')
+  const [collapsed, setCollapsed] = useState(false)
 
   // 到期提醒
   const [reminder, setReminder] = useState<ReminderSettings | null>(null)
@@ -251,46 +255,56 @@ export default function App() {
 
   const admin = isAdmin(auth)
 
-  // 一级导航。图标沿用项目里的 antd 线性 Outlined 风格（与右键菜单、房态图标一致）。
-  const tabs: NonNullable<TabsProps['items']> = [
+  // 一级导航：左侧 Sider 菜单。图标沿用项目里的 antd 线性 Outlined 风格。
+  const pageKey = admin || !['admin', 'settings'].includes(activeKey) ? activeKey : 'rooms'
+  const pageTitle: Record<string, string> = {
+    rooms: '房间',
+    read: '读卡',
+    logs: '记录',
+    admin: '管理卡',
+    settings: '设置',
+  }
+
+  const menuItems: NonNullable<MenuProps['items']> = [
     // 房间放最前面：前台最常用的是"选房间 → 发卡/退房"，
     // 读卡更多是偶尔核对一张卡时才用。
-    {
-      key: 'rooms',
-      icon: <HomeOutlined />,
-      label: '房间',
-      children: (
-        <RoomManager
-          onRoomsChanged={onRoomsChanged}
-          canAdmin={admin}
-          settingsVersion={settingsVersion}
-        />
-      ),
-    },
-    { key: 'read', icon: <ScanOutlined />, label: '读卡', children: <ReadCard /> },
-    { key: 'logs', icon: <HistoryOutlined />, label: '记录', children: <Logs canAdmin={admin} /> },
+    { key: 'rooms', icon: <HomeOutlined />, label: '房间' },
+    { key: 'read', icon: <ScanOutlined />, label: '读卡' },
+    { key: 'logs', icon: <HistoryOutlined />, label: '记录' },
   ]
-
   if (admin) {
-    tabs.push(
-      {
-        key: 'admin',
-        icon: <IdcardOutlined />,
-        label: '管理卡',
-        children: (
+    menuItems.push(
+      { key: 'admin', icon: <IdcardOutlined />, label: '管理卡' },
+      { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+    )
+  }
+
+  // 只渲染当前页；切页即卸载旧页面（等价于原 Tabs 的 destroyOnHidden）。
+  const page = (() => {
+    switch (pageKey) {
+      case 'rooms':
+        return (
+          <RoomManager
+            onRoomsChanged={onRoomsChanged}
+            canAdmin={admin}
+            settingsVersion={settingsVersion}
+          />
+        )
+      case 'read':
+        return <ReadCard />
+      case 'logs':
+        return <Logs canAdmin={admin} />
+      case 'admin':
+        return (
           <AdminCards
             roomsVersion={roomsVersion}
             onChanged={() => {
               refreshInfo()
             }}
           />
-        ),
-      },
-      {
-        key: 'settings',
-        icon: <SettingOutlined />,
-        label: '设置',
-        children: (
+        )
+      case 'settings':
+        return (
           <Settings
             onChanged={() => {
               refreshInfo()
@@ -302,14 +316,50 @@ export default function App() {
                 .catch(() => undefined)
             }}
           />
-        ),
-      },
-    )
-  }
+        )
+      default:
+        return null
+    }
+  })()
 
   return (
     <Layout style={{ minHeight: '100%' }}>
-      <Header
+      <Sider
+        width={200}
+        collapsedWidth={64}
+        collapsible
+        collapsed={collapsed}
+        onCollapse={setCollapsed}
+        breakpoint="xl"
+        theme="light"
+        style={{
+          background: '#fff',
+          borderRight: '1px solid #f0f0f0',
+          // 侧栏独立于内容滚动：不随长房间列表下滑，始终铺满视口
+          position: 'sticky',
+          top: 0,
+          height: '100vh',
+          alignSelf: 'flex-start',
+          overflowY: 'auto',
+        }}
+      >
+        <div className={collapsed ? 'ocw-sider-brand ocw-sider-brand--collapsed' : 'ocw-sider-brand'}>
+          <img src={appIcon} alt="" className="ocw-sider-logo" />
+          {!collapsed && <span>门锁发卡台</span>}
+        </div>
+        <Menu
+          mode="inline"
+          theme="light"
+          inlineCollapsed={collapsed}
+          selectedKeys={[pageKey]}
+          items={menuItems}
+          onClick={({ key }) => setActiveKey(key)}
+          style={{ borderInlineEnd: 0 }}
+        />
+      </Sider>
+
+      <Layout>
+        <Header
         style={{
           background: '#fff',
           borderBottom: '1px solid #f0f0f0',
@@ -325,8 +375,11 @@ export default function App() {
       >
         <Space size="middle" align="center">
           <Title level={4} style={{ margin: 0 }}>
-            门锁发卡台
+            {pageTitle[pageKey]}
           </Title>
+        </Space>
+
+        <Space size="middle" align="center">
           {info ? <Tag>v{info.version}</Tag> : null}
           {infoLoading ? (
             <Tag icon={<LoadingOutlined spin />} color="processing">
@@ -343,13 +396,7 @@ export default function App() {
           ) : (
             <Tag>等待探测…</Tag>
           )}
-        </Space>
-
-        <Space size="middle">
           <ExpiryBell items={reminders} />
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            驱动 {info?.driverSha256 ? info.driverSha256.slice(0, 12).toLowerCase() : '未识别'}
-          </Text>
           <Tag color={admin ? 'blue' : 'default'}>
             {auth.displayName || auth.login} · {admin ? '管理员' : '前台'}
           </Tag>
@@ -384,10 +431,10 @@ export default function App() {
           />
         ) : null}
 
-        {/* destroyOnHidden：切走即卸载、切回重新挂载 —— 每个页面进入时都会拉一次最新数据。
+        {/* 只渲染当前页；切走即卸载、切回重新挂载 —— 每个页面进入时都会拉一次最新数据。
             记录页的生命周期状态（未到期/已到期/已退房）、房间页的有效卡数都不能是切页前的旧值。 */}
-        <Suspense fallback={<div style={{ padding: 24, textAlign: 'center' }}><Spin /></div>}>
-          <Tabs defaultActiveKey="rooms" items={tabs} destroyOnHidden />
+        <Suspense fallback={<div className="ocw-page-loading"><Spin /></div>}>
+          {page}
           <FirstRunWizard open={needWizard} onClose={() => setNeedWizard(false)} />
         </Suspense>
 
@@ -424,7 +471,8 @@ export default function App() {
             </Space>
           </Space>
         </Modal>
-      </Content>
+        </Content>
+      </Layout>
     </Layout>
   )
 }

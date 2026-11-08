@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "门锁发卡台",
+  "productName": "OpenCardWright",
   "version": "2026.11.9+0057",
   "identifier": "io.opencardwright.desktop",
   "build": {
@@ -28,6 +28,13 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "startMenuFolder": "门锁发卡台"
+      }
+    },
     "resources": ["resources/sdk/**/*"]
   }
 }

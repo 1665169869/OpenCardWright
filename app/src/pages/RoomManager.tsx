@@ -843,13 +843,13 @@ export default function RoomManager({
               ),
             },
           ]),
-      // 预定入口（TD-108 按用户要求收回右键菜单；日历视图仍可点空白格直接预定）
+      // 发卡放最前面；预定入口（TD-108 按用户要求收回右键菜单；日历视图仍可点空白格直接预定）
+      { key: 'issue', icon: <IdcardOutlined />, label: '发行房卡', disabled: !canIssueCard },
       {
         key: 'reserve',
         icon: <CalendarOutlined />,
         label: '预定房间',
       },
-      { key: 'issue', icon: <IdcardOutlined />, label: '发行房间门卡', disabled: !canIssueCard },
       { key: 'renew', icon: <FieldTimeOutlined />, label: '续住写卡', disabled: !canIssueCard },
       {
         key: 'move',
@@ -1287,7 +1287,7 @@ export default function RoomManager({
 
             <Space wrap>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                发卡请右键房间卡片选「发行房间门卡」；退房用顶部「读卡退房」或右键菜单。
+                发卡请右键房间卡片选「发行房卡」；退房用顶部「读卡退房」或右键菜单。
               </Text>
             </Space>
 
@@ -1383,13 +1383,13 @@ export default function RoomManager({
         }}
       />
 
-      {/* 发行房间门卡 / 续住写卡（只从右键菜单进入） */}
+      {/* 发行房卡 / 续住写卡（只从右键菜单进入） */}
       <Modal
         open={issueRoom !== null}
         title={
           issueRoom
             ? `${
-                issueMode === 'renew' ? '续住写卡' : issueMode === 'move' ? '换房写卡' : '发行房间门卡'
+                issueMode === 'renew' ? '续住写卡' : issueMode === 'move' ? '换房写卡' : '发行房卡'
               } · ${issueRoom.roomNo}`
             : ''
         }
