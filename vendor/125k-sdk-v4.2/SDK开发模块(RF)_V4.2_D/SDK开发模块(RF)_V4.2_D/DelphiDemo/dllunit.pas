@@ -1,0 +1,22 @@
+unit dllunit;
+
+interface
+
+  Function mif_selecom(nCompport : Integer;nBaudrate : Integer):Integer;stdcall;far;
+  External 'LCRFRW_SDK.dll' name 'mif_selecom';
+
+  Function mif_closecom():integer;stdcall;far;
+  External 'LCRFRW_SDK.dll' name 'mif_closecom';
+
+  Function tem_readdoorcard_sdk(LockId: Pchar;CardId: Pchar;LockAp :Integer):integer;stdcall;far;
+  External 'LCRFRW_SDK.dll'  name 'tem_readdoorcard_sdk';
+
+  Function tem_writedoorcard13_sdk(LockId: Pchar;WriteTime: Pchar;index : Integer;TimeUnit : Integer;TimeLen : Integer;gs : Integer ;LockAp : Integer;CheckOutHour : Integer;OpenInner : Integer):integer;stdcall;far;
+  External 'LCRFRW_SDK.dll'  name 'tem_writedoorcard13_sdk';
+
+  Function tem_readdatetime13_sdk(Time: Pchar;TimeUnit: Pchar;TimeLen: Pchar;CheckOutHour: Pchar;OpenInner: Pchar;nLockAp : Integer):integer;stdcall;far;
+  External 'LCRFRW_SDK.dll'  name 'tem_readdatetime13_sdk';
+
+implementation
+
+end.
