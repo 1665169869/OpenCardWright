@@ -481,6 +481,12 @@ export const api = {
     invoke<void>('set_room_type', { roomNo, roomTypeId }),
 
   listRoomStatuses: () => invoke<RoomStatus[]>('list_room_statuses'),
+  /** 改单个房间的最大发卡数（TD-161）：`null` = 跟随全局默认；`0` = 不限；`n` = 具体张数 */
+  setRoomMaxCards: (roomNo: string, maxCards: number | null) =>
+    invoke<void>('set_room_max_cards', { roomNo, maxCards }),
+  /** 全局默认最大发卡数（`0` = 不限；房间留空即跟随此值） */
+  getMaxCardsDefault: () => invoke<number>('get_max_cards_default'),
+  setMaxCardsDefault: (value: number) => invoke<number>('set_max_cards_default', { value }),
   setRoomStatus: (roomNo: string, status: string) =>
     invoke<void>('set_room_status', { roomNo, status }),
   updateRoomStatusStyle: (key: string, icon: string, color: string) =>

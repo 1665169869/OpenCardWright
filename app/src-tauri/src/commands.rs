@@ -1114,9 +1114,27 @@ pub async fn issue_guest(
             ));
         }
 
-        // 注：房间级「最大发卡数」与「同房复用首卡卡号」逻辑已于 2026-11-08 移除
-        //（用户要求：同房间发多张卡各自用新卡号，靠锁的卡号水位自然区分；
-        //  让旧卡失效请用「挂失卡」，两套机制互不替代）。
+        // 2.5) 最大发卡数（TD-161）：房间自设 → 全局默认；房间填 0 = 不限。
+        //     同房多张卡各用新卡号（不复用首卡号），让旧卡失效请用「挂失卡」——两套机制独立。
+        {
+            let conn = lock_db(&db)?;
+            let global = ocw_store::get_max_cards_default(&conn)?;
+            if let Some(limit) = ocw_store::effective_max_cards(room.max_cards, global) {
+                let active = ocw_store::count_active_cards(&conn, &room_no)?;
+                if active >= limit {
+                    let src = if room.max_cards.is_some() {
+                        "本房设置"
+                    } else {
+                        "全局默认"
+                    };
+                    return Err(CommandError::new(
+                        409,
+                        format!("{room_no} 房有效卡 {active} 张，已达上限 {limit}（{src}）"),
+                        "可对在用卡发挂失卡作废，或在房间信息／设置里调整上限（0 = 不限）",
+                    ));
+                }
+            }
+        }
 
         // 3) 水位闸门已移除（2026-11-08）：卡号改成「时刻 + 本小时序号」后不会再触顶
         //    （旧逻辑是卡号逼近 0xFF00 时拒发），`CardNo.state` 保留仅用于算「本小时第几张」。
@@ -1187,11 +1205,23 @@ pub async fn issue_guest(
             let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
                 .and_then(|r| r.expires_at);
 
-            // 6) 发卡成功后同步房态（TD-115）：空净房 / 预定房 → 未满房。
-            //    维修 / 其他 / 已满 不动；「已满房」不再按发卡数自动判定（最大发卡数已移除，改人工维护）。
+            // 6) 发卡成功后同步房态（TD-115 + TD-161）：空净房 / 预定房 / 未满房 → 未满房；
+            //    发完这张后有效卡数达到上限 → 直接「已满房」。维修 / 其他 / 已满 不动。
             //    只在成功分支执行 —— 写卡失败保持原房态。
-            if matches!(room.status.as_str(), "vacant_clean" | "reserved") {
-                ocw_store::set_room_status(&conn, &room_no, "occupied_partial")?;
+            if matches!(
+                room.status.as_str(),
+                "vacant_clean" | "reserved" | "occupied_partial"
+            ) {
+                let global = ocw_store::get_max_cards_default(&conn)?;
+                let limit = ocw_store::effective_max_cards(room.max_cards, global);
+                let after = ocw_store::count_active_cards(&conn, &room_no)?;
+                let next = match limit {
+                    Some(max) if after >= max => "occupied_full",
+                    _ => "occupied_partial",
+                };
+                if room.status != next {
+                    ocw_store::set_room_status(&conn, &room_no, next)?;
+                }
             }
 
             // 7) 发卡即入住（TD-128）：把该房覆盖今天的有效预定标为「已入住」——
@@ -1417,6 +1447,68 @@ pub async fn list_room_statuses(
     blocking(move || {
         let conn = lock_db(&db)?;
         Ok(ocw_store::list_room_statuses(&conn)?)
+    })
+    .await
+}
+
+/// 改单个房间的最大发卡数（管理员）。
+/// `None` = 留空跟随全局默认；`Some(0)` = 不限；`Some(n)` = 具体张数。
+#[tauri::command]
+pub async fn set_room_max_cards(
+    state: State<'_, AppState>,
+    room_no: String,
+    max_cards: Option<i64>,
+) -> Result<(), CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_room_max_cards(&conn, &room_no, max_cards)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "set_room_max_cards",
+            Some(&room_no),
+            Some(&format!("maxCards={max_cards:?}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// 读全局默认最大发卡数（`0` = 不限）。前台也要看，所以只要登录。
+#[tauri::command]
+pub async fn get_max_cards_default(state: State<'_, AppState>) -> Result<i64, CommandError> {
+    let _me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::get_max_cards_default(&conn)?)
+    })
+    .await
+}
+
+/// 设全局默认最大发卡数（管理员）。`0` = 不限；房间留空即跟随此值。
+#[tauri::command]
+pub async fn set_max_cards_default(
+    state: State<'_, AppState>,
+    value: i64,
+) -> Result<i64, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_max_cards_default(&conn, value)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "set_max_cards_default",
+            None,
+            Some(&format!("value={value}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(value)
     })
     .await
 }
@@ -3443,6 +3535,7 @@ mod tests {
         ("list_room_types", Level::Login),
         ("list_room_statuses", Level::Login),
         ("set_room_status", Level::Login),
+        ("get_max_cards_default", Level::Login),
         ("room_move_preview", Level::Login),
         ("room_move_out", Level::Login),
         ("checkout_room", Level::Login),
@@ -3479,6 +3572,8 @@ mod tests {
         ("create_room_type", Level::Admin),
         ("rename_room_type", Level::Admin),
         ("delete_room_type", Level::Admin),
+        ("set_room_max_cards", Level::Admin),
+        ("set_max_cards_default", Level::Admin),
         ("set_room_type", Level::Admin),
         ("update_room_status_style", Level::Admin),
         ("backup_database", Level::Admin),
@@ -3591,8 +3686,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (35, 28, 7));
-        assert_eq!(command_bodies().len(), 70, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (37, 29, 7));
+        assert_eq!(command_bodies().len(), 73, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {

@@ -2008,6 +2008,35 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// 全局默认最大发卡数。**找不到 key 时返回 `2`**（产品默认值）。
+pub fn get_max_cards_default(conn: &Connection) -> Result<i64> {
+    let raw = get_setting(conn, "max_cards_default")?;
+    Ok(raw
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(2)
+        .max(0))
+}
+
+/// 设置全局默认最大发卡数（`0` = 不限）。
+pub fn set_max_cards_default(conn: &Connection, n: i64) -> Result<()> {
+    if n < 0 {
+        return Err(StoreError::Invalid("最大发卡数不能为负".into()));
+    }
+    set_setting(conn, "max_cards_default", &n.to_string())
+}
+
+/// 把「房间自设值 + 全局默认」合成实际生效的上限：
+/// - 房间填 `0` → `None`（不限）
+/// - 房间填 `n` → `Some(n)`
+/// - 房间留空（`None`）→ `Some(global_default)`
+pub fn effective_max_cards(room_value: Option<i64>, global_default: i64) -> Option<i64> {
+    match room_value {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some(global_default),
+    }
+}
+
 
 // ---------------------------------------------------------------- 发卡记录 / 操作审计
 
@@ -2314,6 +2343,28 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn max_cards_default_and_room_override() {
+        let (conn, path) = temp_db();
+
+        // 缺省就是 2（产品默认值），不需要初始化
+        assert_eq!(get_max_cards_default(&conn).unwrap(), 2, "缺省应为 2");
+
+        // 改全局 → 读回新值
+        set_max_cards_default(&conn, 5).unwrap();
+        assert_eq!(get_max_cards_default(&conn).unwrap(), 5);
+
+        // 生效值三态：留空跟随全局 / 0 不限 / n 覆盖
+        assert_eq!(effective_max_cards(None, 5), Some(5), "留空跟随全局");
+        assert_eq!(effective_max_cards(Some(0), 5), None, "0 = 不限");
+        assert_eq!(effective_max_cards(Some(3), 5), Some(3), "房间覆盖优先");
+
+        // 负数拒绝
+        assert!(set_max_cards_default(&conn, -1).is_err(), "负数应拒绝");
+
+        cleanup(conn, path);
     }
 
     #[test]

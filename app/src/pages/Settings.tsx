@@ -51,6 +51,7 @@ export default function Settings({ onChanged }: { onChanged?: () => void }) {
           { key: 'operators', label: '用户', children: <OperatorPanel onChanged={onChanged} /> },
           { key: 'roomtypes', label: '房型', children: <RoomTypePanel onChanged={onChanged} /> },
           { key: 'roomstatus', label: '房态', children: <RoomStatusPanel onChanged={onChanged} /> },
+          { key: 'maxcards', label: '发卡数量', children: <MaxCardsPanel onChanged={onChanged} /> },
           { key: 'rooms', label: '房间', children: <RoomsPanel onChanged={onChanged} /> },
           { key: 'backup', label: '备份', children: <BackupPanel onChanged={onChanged} /> },
         ]}
@@ -965,6 +966,70 @@ function RoomStatusPanel({ onChanged }: { onChanged?: () => void }) {
       <Text type="secondary">
         房态用途固定，只改外观；房间卡片、筛选和退房都会用这里的颜色与图标。
       </Text>
+    </Space>
+  )
+}
+
+// ---------------------------------------------------------------- 发卡数量
+
+/**
+ * 全局默认最大发卡数（TD-161）。
+ *
+ * 房间信息里可以单独覆盖：**留空 = 跟随这里的值**、填 `0` = 不限。
+ * 有效卡张数达到上限时，发卡会被后端直接拒绝（409）。
+ */
+function MaxCardsPanel({ onChanged }: { onChanged?: () => void }) {
+  const [value, setValue] = useState<number | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [msg, setMsg] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    void api
+      .getMaxCardsDefault()
+      .then(setValue)
+      .catch((e: unknown) => setError(describeError(e)))
+  }, [])
+
+  const save = async () => {
+    if (value === null) return
+    setSaving(true)
+    setError(null)
+    setMsg(null)
+    try {
+      const next = await api.setMaxCardsDefault(value)
+      setValue(next)
+      setMsg(`已保存：全局默认 ${next === 0 ? '不限' : `${next} 张`}`)
+      onChanged?.()
+    } catch (e) {
+      setError(describeError(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Space direction="vertical" size={12} style={{ width: '100%', maxWidth: 560 }}>
+      <Text type="secondary">
+        这里是**全局默认值**。每个房间可以在「房间」页的抽屉里单独覆盖：留空就跟随全局，填 0 表示不限。
+        房间的有效卡张数达到上限后，再发卡会被直接拒绝。
+      </Text>
+      <Space align="center" wrap>
+        <Text>默认最大发卡数</Text>
+        <InputNumber
+          min={0}
+          max={99}
+          value={value}
+          onChange={(v) => setValue(v === null ? 0 : Number(v))}
+          addonAfter={value === 0 ? '不限' : '张'}
+          style={{ width: 170 }}
+        />
+        <Button type="primary" loading={saving} onClick={() => void save()} disabled={value === null}>
+          保存
+        </Button>
+      </Space>
+      {msg ? <Alert type="success" showIcon message={msg} /> : null}
+      {error ? <Alert type="error" showIcon message="保存失败" description={error} /> : null}
     </Space>
   )
 }

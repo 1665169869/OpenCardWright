@@ -130,6 +130,9 @@ export default function RoomManager({
   const [savingEdit, setSavingEdit] = useState(false)
   // 改房号（房间显示名称）是独立动作：序号不变，房号不能与其它房间重复
   const [editRoomNo, setEditRoomNo] = useState('')
+  /** 房间级最大发卡数（TD-161）：`null` = 跟随全局、`0` = 不限、`n` = 具体张数 */
+  const [editMax, setEditMax] = useState<number | null>(null)
+  const [maxBusy, setMaxBusy] = useState(false)
   const [renameBusy, setRenameBusy] = useState(false)
   const [renameErr, setRenameErr] = useState<string | null>(null)
   const [renameOk, setRenameOk] = useState<string | null>(null)
@@ -440,6 +443,7 @@ export default function RoomManager({
     setActiveRoom(room)
     setEditTypeId(room.roomTypeId)
     setEditRoomNo(room.roomNo)
+    setEditMax(room.maxCards)
     setRenameErr(null)
     setRenameOk(null)
     setError(null)
@@ -472,6 +476,27 @@ export default function RoomManager({
       setRenameErr(describeError(e))
     } finally {
       setRenameBusy(false)
+    }
+  }
+
+  /** 保存房间级最大发卡数（TD-161）：留空跟随全局、`0` = 不限。 */
+  const saveMax = async () => {
+    if (!active) return
+    setMaxBusy(true)
+    setError(null)
+    try {
+      await api.setRoomMaxCards(active.roomNo, editMax)
+      setNotice(
+        `${active.roomNo} 房最大发卡数已更新：${
+          editMax === null ? '跟随全局默认' : editMax === 0 ? '不限' : `${editMax} 张`
+        }`,
+      )
+      await reload()
+      onRoomsChanged?.()
+    } catch (e) {
+      setError(describeError(e))
+    } finally {
+      setMaxBusy(false)
     }
   }
 
@@ -1154,6 +1179,31 @@ export default function RoomManager({
                 )}
               </div>
             ) : null}
+
+            <div>
+              <Text type="secondary">最大发卡数（留空 = 跟随全局，0 = 不限）</Text>
+              <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+                <InputNumber
+                  min={0}
+                  max={99}
+                  value={editMax}
+                  onChange={(v) => setEditMax(v === null ? null : Number(v))}
+                  placeholder="留空 = 跟随全局"
+                  disabled={!canAdmin || maxBusy}
+                  style={{ flex: 1 }}
+                />
+                <Button
+                  loading={maxBusy}
+                  disabled={!canAdmin || (editMax ?? null) === (active.maxCards ?? null)}
+                  onClick={() => void saveMax()}
+                >
+                  保存
+                </Button>
+              </div>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                当前有效卡 {active.activeCards} 张
+              </Text>
+            </div>
 
             <div>
               <Text type="secondary">房态</Text>
