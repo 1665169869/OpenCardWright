@@ -459,7 +459,7 @@ pub async fn run_selftest(state: State<'_, AppState>) -> Result<SelfTestDto, Com
 pub async fn probe_ports(
     state: State<'_, AppState>,
 ) -> Result<Vec<ocw_device::PortProbe>, CommandError> {
-    require_login(&state)?;
+    // 公开命令（TD-159）：登录页也要能自动探测设备，所以这里不校验会话。
     let device = state.device();
     blocking(move || Ok(device.probe_ports()?)).await
 }
@@ -3437,7 +3437,7 @@ mod tests {
         ("read_card", Level::Login),
         ("list_rooms", Level::Login),
         ("run_selftest", Level::Login),
-        ("probe_ports", Level::Login),
+        ("probe_ports", Level::Public),
         ("card_no_status", Level::Login),
         ("issue_guest", Level::Login),
         ("list_room_types", Level::Login),
@@ -3591,7 +3591,7 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (35, 29, 6));
+        assert_eq!((admin, login, public), (35, 28, 7));
         assert_eq!(command_bodies().len(), 70, "命令数量变了，矩阵要同步");
     }
 

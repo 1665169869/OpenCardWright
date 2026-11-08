@@ -114,6 +114,12 @@ export default function App() {
   }, [])
 
   const loggedIn = auth?.loggedIn === true
+  // 设备探测不依赖登录（`probe_ports` 已是 Public 级）：挂载即探测，
+  // 登录状态变化后再刷一次，避免登录页顶栏一直卡在「探测设备中…」。
+  useEffect(() => {
+    refreshInfo()
+  }, [refreshInfo])
+
   useEffect(() => {
     if (loggedIn) refreshInfo()
   }, [loggedIn, refreshInfo])
@@ -330,8 +336,10 @@ export default function App() {
             <Tooltip title="检查读卡器 USB / 驱动，或原门锁软件是否占着串口；可去「设置 → 设备 → 探测端口」重试">
               <Tag color="orange">未探测到设备</Tag>
             </Tooltip>
-          ) : (
+          ) : deviceOk === true ? (
             <Tag color="green">设备就绪</Tag>
+          ) : (
+            <Tag>等待探测…</Tag>
           )}
         </Space>
 
