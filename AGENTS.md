@@ -31,7 +31,7 @@
 | `vendor/125k-sdk-v4.2/` | 原厂 SDK 开发模块留档（IDA / dumpbin 分析材料） | 只读；结论进 `docs/` |
 | `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链（`scripts/build-sdk.ps1` → `pnpm` → `build-release.ps1`） | 见第 9 节 |
 | `app/docs/使用手册.md`、根 `CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
-| `app/build-release.ps1`、`app/.github/workflows/ci.yml` | 一键 MSI 发布（需 WiX Toolset v3）、CI 四道门禁（selftest / cargo test / cargo check / 前端） | 发布链变了要同步 |
+| `app/build-release.ps1`、`.github/workflows/ci.yml` | 一键 MSI 发布（需 WiX Toolset v3）、CI 四道门禁（selftest / cargo test / cargo check / 前端） | 发布链变了要同步 |
 | `app/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder`；**卡号必须由 `--serial` 传入**，不再自增） | 随 SDK 接口同步 |
 | `plan/` | 建设方案（v0.1 作废留档、v0.2 已批准）、`待办清单.md`（索引）、`已完成.md`（摘要）与 `td-xxx.md`（条目详情） | 方案改结论要留痕；待办清单每轮更新，见第 10 节 |
 

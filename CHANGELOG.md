@@ -3,6 +3,14 @@
 本文件记录 OpenCardWright 产品工作区（`app/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 26.11.1008 — 2026-11-10
+
+### 变更：CI 配置移到仓库根
+
+- `app/.github/workflows/ci.yml` → `.github/workflows/ci.yml`（GitHub 只识别仓库根的 workflows）；
+  `working-directory: app`、`paths: app/**`、pnpm 缓存路径与 `workspaces: app/src-tauri` 均保持正确。
+- `AGENTS.md` 目录职责表同步路径。
+
 ## 26.11.1007 — 2026-11-10
 
 ### 变更：开源协议改为 MIT
