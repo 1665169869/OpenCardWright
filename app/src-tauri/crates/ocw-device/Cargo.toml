@@ -2,7 +2,7 @@
 name = "ocw-device"
 version = "0.1.0"
 edition = "2021"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 description = "OpenCardWright device adapter: drives PMSLockCard.exe and parses its JSON/text output"
 
 [dependencies]

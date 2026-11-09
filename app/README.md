@@ -214,4 +214,5 @@ pwsh -NoProfile -File build-release.ps1
   `fixtures/`（样本说明，实际样本内联在 `ocw-device` 里）、`docs/使用手册.md`。
 - **构建产物**：`src-tauri/resources/sdk/`（gitignore）、`app/output/`（交付目录，gitignore）。
 - **未完成项**只认 [`../plan/待办清单.md`](../plan/待办清单.md)；本文件与根 README 只写现状。
-- **许可**：AGPL-3.0，见 `LICENSE`。商用部署、定制、实施服务不受限制；分发修改版须同样开源。
+- **许可**：MIT，见 [`../LICENSE`](../LICENSE)。可自由商用、修改、闭源分发，只需保留版权与许可声明；
+  随包分发的厂商驱动 `LC32RFRW.dll` 不属本项目版权，见 `NOTICE`。

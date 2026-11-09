@@ -321,3 +321,10 @@ OpenCardWright/
 
 sdk 的全部结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
 的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立；厂商升级驱动需重新评估。
+
+---
+
+## 十一、许可
+
+**MIT**，见 [`LICENSE`](LICENSE)。可自由使用、修改、商用与闭源分发，只需保留版权与许可声明。
+随包分发的厂商驱动 `LC32RFRW.dll` 不属本项目版权，见 [`app/NOTICE`](app/NOTICE)。

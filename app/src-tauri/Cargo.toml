@@ -1,9 +1,9 @@
 [package]
 name = "opencardwright"
-version = "26.11.1006"
+version = "26.11.1007"
 edition = "2021"
 rust-version = "1.77"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 description = "Open-source card issuing console for 125 kHz hotel door locks"
 
 [workspace]

@@ -3,6 +3,15 @@
 本文件记录 OpenCardWright 产品工作区（`app/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 26.11.1007 — 2026-11-10
+
+### 变更：开源协议改为 MIT
+
+- 新增根 `LICENSE`（MIT，Copyright 2026 OpenCardWright contributors），删除 `app/LICENSE`（AGPL-3.0 副本）。
+- `app/package.json` 与三个 `Cargo.toml` 的 license 字段改为 `MIT`；`app/README.md` 许可说明、
+  根 README 新增「许可」章、`plan/建设方案-v0.2.md` 同步。
+- `app/NOTICE` 保留厂商驱动 `LC32RFRW.dll` 不属本项目版权的说明。
+
 ## 26.11.1006 — 2026-11-10
 
 ### 文档：更正钟点卡 / 日租卡的到期语义
