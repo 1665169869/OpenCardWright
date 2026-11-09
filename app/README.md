@@ -1,308 +1,217 @@
-# OpenCardWright
+# OpenCardWright（产品工作区）
 
-开源的**门锁发卡台**：给中小宾馆/公寓前台用的桌面程序，完成「读卡 → 发卡 → 留痕」，
-用于替代已停止维护的智能门锁管理软件 V8.9 中的**发卡**这一环。
+开源的**门锁发卡台**：给中小宾馆 / 公寓前台用的桌面程序，完成「读卡 → 发卡 → 留痕」，
+替代已停止维护的智能门锁管理软件 V8.9 中的发卡环节。
 
-> ⚠️ **安全提示**：门锁是人身与财产安全设备。复位卡、清除卡、安装卡一旦误用，
-> 可能导致整层楼的卡失效或门锁变"未安装"。管理卡操作请交由受训管理员。
->
-> 本产品不修改、不重编译本仓库的 `sdk/`，而是在构建期把它现编成运行时组件，见 §3。
+- **最终用户**看 [`docs/使用手册.md`](docs/使用手册.md)（安装、首启、发卡、退房、管理卡风险、备份、FAQ）。
+- **集成方**看仓库根 [`README.md`](../README.md) 的 SDK / CLI 章节。
+- 本文件面向开发者：构建、架构、模块边界与踩过的坑。
 
----
-
-> **最终用户请看 [`docs/使用手册.md`](docs/使用手册.md)**（安装、首启、发卡、退房、管理卡风险、备份、FAQ）。
-> 本 README 面向开发者，只讲构建、架构与踩坑。
-
-## 1. 现在是什么状态
-
-| 阶段 | 状态 |
-|---|---|
-| M0 地基（工程骨架、构建脚本、CI、SQLite schema） | ✅ **已验证**：SDK 构建 + 40/40 门禁、前端 tsc/vite 通过、`cargo test` 26 项通过 |
-| M1 设备通道 + 读卡页 | ✅ 解析器与真机 `selftest` 集成测试通过；读卡页含四态提示 |
-| M2 发卡主流程 | ✅ 代码就位（发卡/落库/幂等/记录 id 退房），**未上真机** |
-| M3 管理卡与权限 | ✅ 6 类管理卡 + 原始直写、二次确认、审计落库；⬜ 角色鉴权未做 |
-| M4 房号生命周期 | ✅ 新增房间（二级表单）自动分配序号 + 制作安装卡、改房名、逻辑删除；⬜ 初始 ini/CSV 导入 |
-| M5 运维 | ✅ 数据库备份 / 恢复 / 自动备份（设置 → 备份）；恢复整库时按 login 保留当前账号密码 / 角色 / 启用状态，备份新增账号默认停用；⬜ 诊断包、发卡记录页与 CSV、文件日志轮转 |
-| M6 打包发布 | ✅ **NSIS 安装包 2.60 MiB**，静默安装 + 启动 + 46/46 自检全通过；⬜ 代码签名、正式文档 |
-
-已实测通过的命令：
-
-```powershell
-pnpm build:sdk     # 编译 sdk/ → resources/sdk，跑 40 项自检
-pnpm exec tsc --noEmit      # 前端类型检查
-pnpm exec vite build        # 前端产物
-- `cargo test --workspace` — **130 项全绿**（解析器 27、真实 selftest 集成 1、模拟构包 5、存储 51、命令层 46）
-```
-
-功能规划、验收标准、风险登记见 `../plan/开源门锁发卡软件-建设方案-v0.2.md`；
-**未完成项见 `../plan/待办清单.md`**（本页状态表只写「现在能不能用」，不逐条同步）。
+> 本产品**不改** `sdk/` 的源码（卡格式留在那里），构建期用 `csc` 把它现编成运行时组件。
+> 卡格式与锁行为的权威结论在仓库 `docs/`，本文件不重复。
 
 ---
 
-## 2. 它能做什么（v1 目标范围）
-
-- 读卡：卡型、房号、序号、时长、卡号、28 字节原文；**数据库里查不到也照常显示卡片数据**，只多一行提示
-- 发卡：日租、钟点。**客卡最多 62 天 / 62 小时；总控卡最多 63 天 / 63 小时**；再长只能选固定档位
-  （90 / 120 / 150 / … / 1095 天，走 `0xC0|月数` 编码）。这条边界来自卡内字节，不是产品随便定的
-- 客人信息：发卡时可录入姓名、性别、证件类型、证件号码、民族、出生日期、住址、备注——
-  **只存数据库，不写卡**；读卡命中记录时一并显示
-- 管理卡：总控、复位、清除、安装、退房钟点、校时、原始直写
-- 账号：超管 `admin` 首启设密；管理员可建**用户（admin / frontdesk）**、划分**部门**、重置密码、停用账号。
-  密码规则：**8–128 位、必须同时含字母和数字、不能与登录名相同**；设置界面直接列出规则
-- 房号：初始导入一次；之后「**新增房间**」走二级表单（房号 / 锁内序号 / 房型），序号留空自动分配，
-  新增后**生成安装卡**到锁上绑定；房型支持**自定义标签颜色**（设置 → 房型，新建房型自动配随机色）
-- 房号可在**房间抽屉**里改名（序号不变）；重名会被拒绝，该房还有有效卡时也拒绝（先退房再改），
-  因为发卡/退房链路都按房号对账
-- 房间**格子视图**：每个房间一张卡，按**房态**着色（房型只作中性标签），点卡片直接发卡、改房态、退房。
-  **右键房卡选「多选房间」**进入多选模式（进入后才出现勾选框与批量操作栏，点卡片即勾选/取消，
-  「全选当前结果」按当前筛选范围），选好房态后一次批量应用，失败会列出具体房号。
-  顶部用**房型标签页**筛选（「全部」+ 各房型 + 有未分类房间时多一个「未分类」，数字为房间数），
-  右侧的房态下拉（选项带各自房态图标）可与房型叠加
-- 房态：空净 / 空脏 / 预定 / 未满 / 已满 / 维修 / 其他，**每种可自定义图标与颜色**（设置 → 房态）
-- 退房：顶栏「读卡退房」打开**二级表单**——先点「读卡」把卡读出来核对（卡型、房号、卡号、28 字节原文），
-  核对无误再点「确认退房」；没读卡或卡没有卡号时按钮是灰的。房间卡片**右键菜单**（带图标）：
-  **发行房卡 / 续住写卡** / 持卡退房 / 无卡退房。**持卡退房走的也是上面那个二级表单**
-  （会额外校验这张卡是否属于该房间）；无卡退房才是按房间一次作废全部有效卡。
-  **非本系统发的卡**（本地没有发卡记录）按卡号退不了，按钮变成「强制退房」并**二次确认**：
-  说明会直接写入退房数据（关闭该房全部有效卡 + 改房态），确认后才执行。
-  **退房后自动转成哪个房态可在设置里改**（默认空脏房）
-- 续住写卡：右键里选，弹窗会显示该房**当前有效期至**，天数默认「剩余天数 + 1」，写一张更长的卡覆盖
-- **写卡前必先读卡**：发卡 / 续住 / 安装卡 / 管理卡都会先读一次卡再写；读不到就直接报错
-  （"写卡前读卡失败…请先把卡放到读卡器上"），并把原卡信息打到终端（`[write] 写卡前预读：…`）
-- 发卡：只在房间卡片右键菜单里进入（抽屉不放发卡），会显示**预计退房时间**，如
-  `2026-11-05 21:28 - 2026-11-06 12:00`（日租默认中午退房；按发卡时间估算）
-- 房间参数：每个房间可设**最大发卡数**（同时有效的客卡上限，留空=不限），到上限后拒绝发卡并提示
-- 卡号治理：**水位/预警线已移除**。卡号仍由内部按「日 + 时 + 本小时序号」生成并写入卡，
-  但产品不保存、不展示卡号；数据库 `issuance.card_no` 列保留但停止读写。
-- 到期提醒：按发卡时间估算客卡到期，可设**提前 N 分钟**提醒（默认 30），带**提示声**与顶栏铃铛
-- 设备（设置 → 设备，二级页签第一项）：探测串口、切换 COM、跑 40 项自检、看驱动指纹——**dev 模式同样可用**
-- 身份证读卡（TD-135）：开卡表单的「读取身份证」按钮连本机华视读卡服务的 WebSocket
-  （默认 `ws://127.0.0.1:9001`，**连上即推送、无需发命令**），自动填姓名/性别/民族/出生日期/住址/证件号。
-  它与发卡用的 125 kHz 读卡器是**两个独立设备**；服务没起/超时只弹提示，不影响手填发卡。
-  地址改 `src/idcard.ts` 的 `ID_CARD_WS_URL`，并在 `tauri.conf.json` 的 CSP `connect-src` 里同步放行。
-- 记录与审计：发卡流水、管理卡留痕、CSV 导出、诊断包
-
-**不做**（v1）：房态、入住登记、账务、报表、多门店、自动更新、手机端。这是发卡工具，不是 PMS。
-
-### 界面预览
-
-| 读卡（命中记录） | 读卡（未命中，卡片数据照常显示） |
-|---|---|
-| ![读卡](docs/screenshots/read-card.png) | ![读卡未命中](docs/screenshots/read-notfound.png) |
-
-| 发卡 | 发卡结果 |
-|---|---|
-| ![发卡](docs/screenshots/issue-card.png) | ![发卡结果](docs/screenshots/issue-result.png) |
-
-| 房间 | 管理卡 |
-|---|---|
-| ![房间](docs/screenshots/rooms.png) | ![管理卡](docs/screenshots/admin-cards.png) |
-
-> 截图是 `OCW_SIM=1` 的模拟设备模式（无读卡器时回放样本），所以顶部有黄色提示条。
-> 接真机时把环境变量去掉即可。
-
----
-
-## 3. 架构
+## 1. 架构
 
 ```
-React (WebView2)  ──Tauri IPC──▶  OpenCardWright.exe (x64)
-                                     ├─ ocw-store   SQLite（rusqlite bundled）
-                                     └─ ocw-device  Process.Start
-                                                      └─▶ runtime\PMSLockCard.exe (x86)
-                                                            └─▶ LC32RFRW.dll → 发卡器
+React 19 + antd 5 (WebView2)
+        │  Tauri IPC（src/api.ts 是唯一的 invoke 封装）
+        ▼
+OpenCardWright.exe (x64, Tauri 2 + Rust)
+   ├─ commands.rs      71 条 #[tauri::command]，含命令 × 角色矩阵
+   ├─ ocw-store        SQLite（rusqlite bundled），issuance 只追加
+   └─ ocw-device       Process.Start（GBK 解码 + JSON/文本解析 + 模拟设备）
+             │
+             ▼
+runtime\PMSLockCard.exe (x86, .NET 4.0，构建期从 sdk/ 现编)
+             │
+             ▼
+LC32RFRW.dll → 发卡器（125 kHz）
 ```
 
-**为什么不直接 FFI 驱动**：驱动是 32 位且版本极敏感；把卡格式留在已验证的 .NET 实现里，
-产品只做编排与治理。设备层是**子进程 + JSON**，崩溃可隔离、可超时杀、可替换。
+**为什么不直接 FFI 驱动**：驱动是 32 位且版本极敏感。把卡格式留在已验证的 .NET 实现里，
+产品只做编排与治理；设备层走**子进程 + JSON**，崩溃可隔离、可超时杀、可替换。
+代价是必须处理 GBK 输出（见 §5）。
+
+数据流要点：
+
+- 发卡：`cardno.rs` 算好时间戳卡号 → CLI `issue ... --serial` → 读回卡片 → 写 `issuance` → 审计。
+- 读卡：CLI `read --json` → `ocw-device` 解析 → 卡片数据（A 区）与记录查询（B 区）分开返回，
+  **数据库异常不能吞成「查不到」**。
+- 退房：持卡退房按卡号时间戳反查记录；无卡退房按记录 id；非本系统卡走「强制退房」。
 
 ---
 
-## 4. 开发环境
+## 2. 模块地图（改代码先定位）
+
+| 位置 | 职责 |
+|---|---|
+| `src/` | React 19 + antd 5；`api.ts` 是唯一的 Tauri invoke 封装；页面在 `pages/`，复用组件在 `components/` |
+| `src/utils/` | `validate.ts` / `password.ts` 双端校验文案、`reminder.ts`、`sound.ts` 提示音 |
+| `src/idcard.ts` | 身份证读卡 WebSocket（默认 `ws://127.0.0.1:9001`，CSP `connect-src` 要同步放行） |
+| `src-tauri/src/commands.rs` | 全部命令、DTO、错误码与**命令 × 角色矩阵**（测试机械校验） |
+| `src-tauri/src/rules.rs` | 时长边界（客卡 62 / 总控 63）、长有效期档位；**与 `src/api.ts` 的档位表必须同步** |
+| `src-tauri/src/cardno.rs` | 卡号时间戳编码（日 / 时 / 序号）、`CardNo.state` 原子读写与递推 |
+| `src-tauri/src/auth.rs` | 会话、角色（admin / frontdesk）、Argon2 口令 |
+| `src-tauri/src/room_import.rs` | 房号 INI / CSV 导入（坏行收集不致命，删房序号可复活） |
+| `src-tauri/src/demo_import.rs` | 仅 `debug_assertions`：空库时从 `data/NacreHis.json` 建 30 个房间，发布版不编译 |
+| `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 数据目录、自动备份、文件日志、诊断包 |
+| `src-tauri/crates/ocw-store/` | SQLite schema 与查询（房间 / 发卡 / 预定 / 审计 / 备份设置） |
+| `src-tauri/crates/ocw-device/` | CLI 子进程、GBK 解码、解析、模拟设备、离线构包器调用 |
+| `scripts/build-sdk.ps1` | 编译 `../sdk` → `resources/sdk`，跑 46 项自检门禁，编 `OCWCardBuild.exe` |
+| `build-release.ps1` | 一键正式版：WiX MSI → `app/output`，打印 SHA-256 |
+
+**备份必须走 SQLite 在线备份 API**：`ocw_store::backup_to` → `rusqlite::backup::Backup::run_to_completion`，
+逐页拷贝到完成（含 `-wal` 未 checkpoint 的数据，且不锁库），备份后把目标库设为 `journal_mode=DELETE`。
+**不要改成 `std::fs::copy`**——文件级拷贝会漏 WAL，恢复后少掉最后一段事务。
+
+---
+
+## 3. 开发环境
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
 | Windows | 10 / 11 x64 | 目标平台 |
 | Rust | stable（本机 1.99.1） | 需要 `x86_64-pc-windows-msvc` |
 | **MSVC 生成工具** | VS Build Tools 2022 + VCTools + Windows 11 SDK | **必需**：没有 `link.exe` 连 `cargo check` 都跑不了 |
-| Node.js | ≥ 20（本机 26.13） | 前端与 Tauri CLI |
-| pnpm | 12.x（本机 12.18） | 前端包管理；`pnpm-workspace.yaml` 的 `allowBuilds: esbuild` 不要删（否则 install 报 `ERR_PNPM_IGNORED_BUILDS`） |
+| Node.js | ≥ 20（本机 24.11.1） | 前端与 Tauri CLI |
+| pnpm | 10.x（本机 10.29.3） | `pnpm-workspace.yaml` 的 `allowBuilds: esbuild` 不能删，否则 install 报 `ERR_PNPM_IGNORED_BUILDS` |
 | .NET Framework | 4.8（系统自带） | 编译与运行 SDK 组件需要 `csc.exe` |
-| WebView2 Runtime | 已随 Win11 预装 | Tauri 依赖 |
+| WiX Toolset | **v3.14** | 只打 MSI 时需要（`candle.exe` / `light.exe`） |
+| WebView2 Runtime | 随 Win11 预装 | Tauri 依赖 |
+
+### 常用命令（在 `app/` 内）
 
 ```powershell
 pnpm install
-pnpm build:sdk      # 编译 ../sdk 并跑 selftest 门禁
-pnpm tauri dev
+pnpm build:sdk      # 编译 ../sdk → resources/sdk，跑 46 项门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
+pnpm dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
+pnpm tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译 + 重启
+pnpm build          # build:sdk + tsc --noEmit + vite build
+pnpm exec tsc --noEmit   # 只做前端类型检查
 ```
 
-打包（WiX Toolset v3）：
+### 测试（在 `src-tauri/` 内）
+
+```powershell
+cargo test --workspace                        # 全部；2026-11-10 实测 136 项全绿
+cargo test -p ocw-store                       # 只跑存储层（56）
+cargo test -p ocw-device --test sim_cardbuild # 单跑一个集成测试文件（5）
+cargo test -p ocw-store insert_room           # 按用例名子串单跑
+```
+
+136 项 = 解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 56 + 命令层 47。
+
+> 本机 `cargo` 不在 PATH，可用绝对路径 `C:\Users\Administrator\.cargo\bin\cargo.exe`；
+> 测试必须在 `app/src-tauri/` 内跑（仓库根没有 `Cargo.toml`）。
+
+---
+
+## 4. 打包发布
 
 ```powershell
 pnpm tauri build --bundles msi   # 由 Tauri 调用 WiX v3 生成 MSI
-```
 
-一键正式版（推荐）：在 `app/` 下运行
-
-```powershell
+# 一键正式版（推荐）
 pwsh -NoProfile -File build-release.ps1
-# 可选：
-# -OutputDir D:\delivery   指定交付目录（默认 app/output）
-# -SkipCopy                只构建，不复制交付副本
-# -WixBin "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+# 可选：-OutputDir D:\delivery  -SkipCopy  -WixBin "C:\Program Files (x86)\WiX Toolset v3.14\bin"
 ```
 
-前置条件：安装 **WiX Toolset v3**（需要 `candle.exe` / `light.exe`）。
-脚本会执行 `pnpm tauri build --bundles msi`，从
-`app/src-tauri/target/release/bundle/msi/` 收集 MSI 到 `app/output/`，
-输出 `OpenCardWright_<version>_x64.msi` 并打印 SHA-256。
+- 脚本执行 `pnpm tauri build --bundles msi`，从 `src-tauri/target/release/bundle/msi/` 取最新 MSI，
+  复制到 `app/output/OpenCardWright_<version>_x64.msi` 并打印 SHA-256。
+- 安装器是 **MSI（WiX v3）**，不再使用 Inno Setup / NSIS；安装页面语言由
+  `tauri.conf.json` 的 `bundle.windows.wix.language` 控制（当前 `zh-CN`）。
+- `productName = 门锁发卡台`；快捷方式、安装目录、卸载项均为中文。
+- 数据目录不随卸载删除：release 用 `%PROGRAMDATA%\OpenCardWright\`，
+  debug / `tauri dev` 用 `%PROGRAMDATA%\OpenCardWright-dev\`（`provision.rs::data_root()`）。
+- **不要用 `cargo build --release` 出发布版**：那是连 `localhost:5173` 的 dev 壳。
 
-- 安装器为 MSI（WiX v3），不再使用 Inno Setup / NSIS；
-- 安装页面语言由 `tauri.conf.json` 的 `bundle.windows.wix.language` 控制；
-- 数据目录 `%ProgramData%\OpenCardWright\` 不随卸载删除。
+### 版本号
 
-### 两个环境坑（本机已踩过，写在这里省时间）
+每次代码、行为或用户可见文档变动都要提构建号，**四处同步**：
+`package.json`、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.lock`，
+并在根 `CHANGELOG.md` 记录本版结论。
 
-**1. MSVC 报 `D8050`（命令行过长，与中文路径无关）**
-
-```
-cl: 命令行 error D8050 :无法执行 c1.dll: 未能将命令行放入调试记录中
-```
-
-真因：`libsqlite3-sys` 编 `sqlite3.c` 时命令行极长（`-Z7` 调试信息 + 一长串 `-D` 宏 + 输出路径），
-超过 `cl.exe` 的调试记录上限；**输出路径越长越容易触发**。2026-11-07 仓库改名成纯 ASCII
-（`D:\source-code\opencardwright`）后，默认 target 仍在 `app\src-tauri\target\debug\…` 这种长路径上，
-项目现在**不再覆盖** `CARGO_TARGET_DIR` / `DEBUG`，统一使用 Tauri/Cargo 默认的
-`app/src-tauri/target`。如果本机默认 target 仍触发 D8050，应作为本机环境问题单独处理，
-不要在仓库脚本里固定写死短路径。
-
-**2. `vite build` 报 `Access is denied`（esbuild 删临时文件失败）**
-
-安全软件会锁住 `%TEMP%` 下 esbuild 刚写的文件。把 TEMP 指到工作区内：
-
-```powershell
-$env:TEMP = "$PWD\.tmp"; $env:TMP = $env:TEMP
-pnpm exec vite build
-```
-
-**3. 打包需要 WiX Toolset v3**
-
-MSI target 需要 WiX v3 的 `candle.exe` / `light.exe`。安装 WiX Toolset v3.14 后，
-确保 `bin` 目录在 PATH，或用发布脚本的 `-WixBin` 指定。不再需要 NSIS 工具链。
-
-**4. 不要用 `cargo build --release` 出发布版**
-
-那样编出来的是 **dev 壳**：它会去连 `devUrl`（`localhost:5173`），窗口里显示
-`ERR_CONNECTION_REFUSED`，因为前端资源没有内嵌。发布/演示一律走：
-
-```powershell
-pnpm exec tauri build --no-bundle          # 只出可执行文件
-pnpm exec tauri build --bundles msi        # 出 WiX MSI 安装包
-```
-
-`Cargo.toml` 里已经补了 `custom-protocol` feature；若确实要手工 `cargo build --release`，
-必须加 `--features custom-protocol`。
-
-**5. 设备通信用的是 GBK，不是 UTF-8**
-
-`PMSLockCard.exe` 是 .NET Framework 程序，往管道写的是**控制台代码页**（中文 Windows 上是 GBK 936）。
-设备层因此先按 UTF-8 解、失败再退回 GBK；直接用 `read_to_string` 会在遇到中文时整体失败并返回空串，
-现场表现就是"设备没有任何输出"。新增设备输出解析时别忘了这条（`crates/ocw-device/src/cli.rs::decode`）。
-
-排查设备问题时可以用现成的探针：
-
-```powershell
-cargo run -p ocw-device --example probe -- `
-  "$env:ProgramData\OpenCardWright-dev\runtime\PMSLockCard.exe" `
-  "$env:ProgramData\OpenCardWright-dev\runtime\LockCard.ini" `
-  "$env:ProgramData\OpenCardWright-dev\runtime\IOServer\LC2000" 6 ports
-```
-
-> debug 构建的数据目录是 `OpenCardWright-dev\`（见 `provision.rs::data_root()`）；
-> 安装包才用 `OpenCardWright\`。上面这条是 `cargo run`，所以走 `-dev`。
-
-它会打印退出码、stdout/stderr 原文和解析结果。
+格式 `26.M.DDD`：主版本 = 年份−2000（MSI 要求主版本 ≤ 255），次版本 = 月份，
+补丁号 = 日×100 + 当日构建序号（11 月 9 日第 62 号 → `26.11.962`）。
 
 ---
 
-## 5. 目录
+## 5. 已知限制与踩坑
 
-```
-src-tauri/
-  src/                  Tauri 命令层与状态
-  crates/ocw-device/    CLI 适配、JSON/文本解析、模拟设备
-  crates/ocw-store/     SQLite schema 与查询
-  resources/sdk/        构建产物（gitignore）
-src/                    React 界面
-scripts/build-sdk.ps1   编译 SDK + selftest 门禁 + manifest
-fixtures/               CLI 输出样本（解析器测试用）
-```
+1. **MSVC 报 `D8050`（命令行过长，与中文路径无关）**：`libsqlite3-sys` 编 `sqlite3.c` 时命令行超长。
+   项目**不覆盖** `CARGO_TARGET_DIR` / `DEBUG`，统一用默认 `app/src-tauri/target`；
+   若本机默认 target 仍触发，按本机环境问题单独处理，不要写回仓库脚本。
+2. **`vite build` 报 `Access is denied`**：安全软件锁住 `%TEMP%` 下 esbuild 的临时文件。
+   把 TEMP 指到工作区内：`$env:TEMP = "$PWD\.tmp"; $env:TMP = $env:TEMP`。
+3. **设备输出是 GBK，不是 UTF-8**：`PMSLockCard.exe` 往管道写控制台代码页，
+   必须经 `ocw_device::cli::decode`；直接 `read_to_string` 遇中文会整体失败并返回空串。
+   排查可用 `cargo run -p ocw-device --example probe -- <exe> <ini> <driverDir> 6 ports`。
+4. **不要用 antd 的命令式弹窗**：`Modal.confirm` / `message.success` 依赖已被 React 19 移除的 API，
+   调用会**静默失效**。一律用受控 `<Modal open>` 或 `App.useApp()`。
+5. **HMR 会保留组件 state**：弹窗 / 抽屉的上次表单会残留，用自增计数当 `key` 强制重挂载。
+6. **改 Rust 源码前先停 dev**：`tauri dev` 编译时占住源文件，保存会报 `ReplaceFileW EIO (Win32 1175)`。
+7. **串口用「索引」不是 COM 号**：驱动按 `index + 1` 打开，**索引 2 = COM3**。
+   `pnpm tauri dev` 若报 `EBUSY ... ~RF*.TMP`，是编辑器临时文件被短锁，`vite.config.ts` 已忽略这些名字。
+8. **dev 时密码是 `Test12345`**：`import.meta.env.DEV` 下登录页预填，发布版为空。
+9. **dev 首次启动会自动导房**：空库时读 `data/NacreHis.json` 的 `Kf_fh`，建 30 个房间 + 房型 + 房态；
+   只在 `debug_assertions` 下编译，发布版不含。
+10. **模拟设备也走真实卡号**：`OCW_SIM=1` 下由 `cardno.rs` 算卡号、经 `--serial` 传给
+    `OCWCardBuild.exe` 离线构包，字节与真机一致；缺构包器时退回固定样本。
+11. **看日志，不要看截图猜**：前端 `console.error/warn` 与未捕获异常会经 `log_frontend`
+    转到后端日志（`[frontend][ERROR]`、`[guard]`、`[rust][PANIC]`）。
+12. **输入校验是双端的**：前端 `src/utils/validate.ts` / `password.ts`，后端
+    `commands.rs` 的 `require_*` 与 `auth.rs::validate_password`；**改一处必须改另一处**。
+13. **`-BundleDriver:$false`**：`scripts/build-sdk.ps1` 支持不打包驱动（改为首启导入），默认打包。
+14. **总控卡页1 有变体**：真机上见过 `5B EC F1 FF`，产品侧按 `B3 = 0xFF` 纠正回总控卡；
+    `sdk/` 未改动。
+15. **到期提醒是估算**：卡内只有时长码，没有绝对到期时间；产品按「发卡时间 + 时长」估算，
+    月码卡（>62/63 天）的到期日本身也是近似。
+16. **代码签名未做**（TD-504）。
 
 ---
 
-## 6. 已知限制（务必先读）
+## 6. 命令 × 角色对照表
 
-1. **打包需要 WiX Toolset v3**：MSI target 使用 `candle.exe` / `light.exe`，安装 WiX v3.14 并确保
-   `bin` 在 PATH，或使用 `build-release.ps1 -WixBin`。不再依赖 NSIS 下载器。
-2. **图标是占位**：`src-tauri/icons/icon.ico` 是脚本生成的纯色图，发布前应换成正式图标。
-3. **未实现**：诊断包、发卡记录页与 CSV 导出、首启向导、初始房间导入、文件日志轮转（逐条见 `../plan/待办清单.md`）。
-4. **前端代码分割**：页面已用 `React.lazy` 按页签拆分（TD-902）；主包约 918 KB（gzip 293 KB），antd 仍占大头。
-5. **驱动与应用同包**：若未来出现权利主张，构建时加 `-BundleDriver:$false` 改为首启导入。
-6. **总控卡页1 有变体**：SDK 只把 `5B EC F0 FF` 认作总控卡，但真机上见过 `5B EC F1 FF`
-   （低 4 位为 1，和钟点卡低4位 0/1 的未解规律同源）。产品侧按 `B3 = 0xFF` 纠正回总控卡，
-   并按总控编码换算时长；`sdk/` 未改动。
-7. **到期提醒是估算**：卡内只有时长码，没有绝对到期时间；锁实际从"首次刷卡"起算。
-   产品按**发卡时间 + 时长**计算，提醒可能比真实到期偏早；月码卡（>62/63 天）的到期日本身也是近似。
-8. **输入校验是双端的**：前端给即时提示（`src/utils/validate.ts`、`src/utils/password.ts`），
-   后端再校验一次（`commands.rs` 的 `require_text`/`require_login_name`/`require_room_no`、`auth.rs` 的 `validate_password`）。
-   密码规则的展示文案在 `src/utils/password.ts`，校验逻辑在 `src-tauri/src/auth.rs`，**改一处必须改另一处**。
-
----
-
-## 7. 开发约定（踩过的坑，别再踩）
-
-1. **不要用 antd 的命令式弹窗**：`Modal.confirm` / `message.success` 这类静态方法依赖
-   `ReactDOM.render`，而 React 19 已移除该 API —— 调用会**静默失效**（按钮点了毫无反应）。
-   一律用受控 `<Modal open=...>` 或 `App.useApp()`。管理卡页和房间页就是这么改过来的。
-2. **设备输出必须经 `ocw-device::cli::decode`**：CLI 写的是 GBK，直接 `read_to_string` 遇到中文会返回空串。
-3. **发布只能走 `tauri build`**：`cargo build --release` 出来的是 dev 壳（连 `localhost:5173`）。
-4. **时长边界改一处**：`src-tauri/src/rules.rs` 与 `src/api.ts` 的档位表必须同步。
-5. **别把窗口设成置顶**：截图/自动化脚本里用 `SetWindowPos(..., HWND_TOPMOST, ...)` 会把窗口黏在最前面，
-   用户只能强关。需要在前台截图时用 `SetForegroundWindow` 就够了，不要动 `WS_EX_TOPMOST`。
-6. **写库失败要能回滚**：多步写库（如发卡记录 + 身份信息）先做校验再写，避免半条记录。
-7. **改前端走 `pnpm tauri dev`**：Vite 会热更新（`[vite] hmr update ...`），不用重新打包；
-   只有改 Rust 才会自动重编译+重启（约 10 秒），此时会话失效需重新登录。
-8. **看日志，不要看截图猜**：前端 `console.error/warn`、未捕获异常会经 `log_frontend` 转到后端，
-   和后端日志一起打在终端（`[frontend][ERROR] ...`、`[guard] ...`、`[rust][PANIC] ...`）。
-9. **dev 时密码是 `Test12345`**：`import.meta.env.DEV` 下首启/登录页会预填，发布版为空。
-10. **串口用「索引」不是 COM 号**：驱动按 `index + 1` 打开串口，所以 **索引 2 = COM3**。
-    `pnpm tauri dev` 崩溃若报 `EBUSY ... ~RF*.TMP`，是编辑器保存的临时文件被 Windows 短锁，
-    `vite.config.ts` 已把这些临时名加进 watch ignore。
-11. **改 Rust 源码前先停 dev**：tauri dev 的 cargo 在编译时会短暂占住源文件，
-    这时保存会报 `ReplaceFileW EIO (Win32 1175)`。停掉 dev（或等编译结束）再改。
-12. **dev 构建会自动导入房间**：空库启动时读仓库里的 `data/NacreHis.json` 的 `Kf_fh`（客房房号表），
-    建 30 个房间 + 房型 + 房态。只在 `debug_assertions` 下编译，发布版不含这段。
-13. **模拟设备也会推进卡号**：`OCW_SIM` 下走 `OCWCardBuild.exe`（调用 SDK 的 `CardBuilder` + `CardNoStore`
-    离线构包），卡号、房号序号、原始字节都与真机一致，`CardNo.state` 照常自增；区别只是不真的写卡。
-    这个构包器由 `scripts/build-sdk.ps1` 从 `tools/CardBuild.cs` 编译，缺了它会退回固定样本。
-
-## 8. 命令 × 角色对照表
-
-后端 71 条 `#[tauri::command]` 的校验级别。**这张表是可执行的**：`commands.rs` 的
-`auth_matrix_matches_every_command` 会用 `include_str!` 扫源码逐条比对，删掉任何一处
-`require_admin` 都会让测试变红；新增命令必须先登记到测试里的 `MATRIX`。
+后端 **71 条** `#[tauri::command]`。这张表是**可执行的**：`commands.rs` 的
+`auth_matrix_matches_every_command` 会用 `include_str!` 扫源码逐条比对，
+删掉任何一处 `require_admin` 都会让测试变红；新增命令必须先登记到 `MATRIX`。
 
 | 级别 | 数量 | 命令 |
 |---|---|---|
-| 公开（无需登录） | 6 | `app_info` `auth_status` `initialize_admin` `login` `logout` `log_frontend` |
-| 登录即可（前台日常 + 只读） | 28 | `read_card` `list_rooms` `run_selftest` `probe_ports` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `get_checkout_hour` `expiring_cards` `list_issuances` `list_audits` `get_onboarding_status` `list_reservations` `list_reservation_records` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
+| 公开（无需登录） | 7 | `app_info` `auth_status` `initialize_admin` `login` `logout` `log_frontend` `probe_ports` |
+| 登录即可（前台日常 + 只读） | 29 | `read_card` `list_rooms` `run_selftest` `issue_guest` `list_room_types` `list_room_statuses` `set_room_status` `get_max_cards_default` `room_move_preview` `room_move_out` `checkout_room` `checkout_card` `force_checkout_card` `get_checkout_status` `change_own_password` `get_reminder_settings` `get_checkout_hour` `expiring_cards` `list_issuances` `list_guest_stays` `list_audits` `get_onboarding_status` `list_reservations` `list_reservation_records` `create_reservation` `update_reservation` `cancel_reservation` `hide_to_tray` `quit_app` |
 | 管理员 | 35 | `set_port` `create_room` `delete_room` `rename_room` `issue_install_card` `issue_admin_card` `list_departments` `create_department` `rename_department` `set_department_active` `create_room_type` `rename_room_type` `delete_room_type` `set_room_type` `set_room_max_cards` `set_max_cards_default` `update_room_status_style` `backup_database` `list_backups` `restore_database` `set_room_type_color` `set_checkout_status` `list_operators` `create_operator` `reset_operator_password` `set_operator_active` `set_reminder_settings` `set_checkout_hour` `get_backup_settings` `set_backup_settings` `import_backup_file` `export_diagnostics` `export_issuances_csv` `import_rooms` `complete_onboarding` |
 
 约定：
-- 错误码 **401 = 未登录**、**403 = 权限不足**，前端按 `code` 区分提示，不要只匹配文案。
-- 只读命令不要锁给管理员 —— 前台查房、读卡、看到期是日常动作。
-- 公开命令只有认证入口与启动信息；新增公开命令要在 PR 里说明理由。
 
-## 9. 许可
+- 错误码 **401 = 未登录**、**403 = 权限不足**、**409 = 达到发卡上限**；前端按 `code` 区分提示。
+- 只读命令不要锁给管理员——前台查房、读卡、看到期是日常动作。
+- 新增 / 改名命令必须同步本表；公开命令要在 PR 里说明理由。
 
-AGPL-3.0，见 `LICENSE`。商用部署、定制、实施服务不受限制；分发修改版须同样开源。
+---
+
+## 7. 业务铁律（改房间 / 卡片代码前必读）
+
+| 规则 | 原因 |
+|---|---|
+| 房间序号绑上锁后**永不复用** | 序号写进卡内页1（`5B EC` 之后的字节）；换成新序号后，旧卡不能再用于新房 |
+| 删房是**逻辑删除**（`room.active=0`） | 历史发卡记录要留档，序号仍占位，`list_rooms` 返回全量 |
+| 新增房间用到已删序号 = **复活那条记录改房名** | 否则撞 `room_index UNIQUE`；同时重置房态 / 发卡上限 / 安装卡记录 |
+| 有有效卡时**不许改名、不许删房** | 发卡、退房、改上限都按 `room_no` 对账 |
+| 「有效卡」口径 | `result='ok' AND card_no IS NOT NULL AND expires_at IS NOT NULL AND checked_out_at IS NULL AND expires_at > now` |
+| 发卡 / 续住可在**空净房 / 未满房 / 预定房**点 | 房态是人工维护的业务字段，只做前端拦截；预定房发卡时自动预填姓名 |
+| 持卡退房**只允许客卡** | 退房会擦卡（写零），管理卡放上去会被擦成空白；前后端都拦 |
+| 发卡上限 | 全局默认 2 张（`0` = 不限）+ 房间可覆盖（留空跟随全局）；达上限返回 409 |
+| 让旧卡失效 | 只发**挂失卡**（`页1[2]` 低 4 位 = 1），与「同房多发卡」是两套机制 |
+
+---
+
+## 8. 其它
+
+- **目录**：`src/` 前端、`src-tauri/` Rust、`scripts/build-sdk.ps1`、`build-release.ps1`、
+  `fixtures/`（样本说明，实际样本内联在 `ocw-device` 里）、`docs/使用手册.md`。
+- **构建产物**：`src-tauri/resources/sdk/`（gitignore）、`app/output/`（交付目录，gitignore）。
+- **未完成项**只认 [`../plan/待办清单.md`](../plan/待办清单.md)；本文件与根 README 只写现状。
+- **许可**：AGPL-3.0，见 `LICENSE`。商用部署、定制、实施服务不受限制；分发修改版须同样开源。

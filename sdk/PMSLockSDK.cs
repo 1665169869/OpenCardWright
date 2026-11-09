@@ -378,9 +378,11 @@ namespace PmsLockSdk
         }
 
         /// <summary>
-        /// 校时卡。值 = 16 × 当日分钟数 + 953（只含当日时/分）。
-        /// 页2[3] 由 <see cref="Suffix"/> 按年月生成；页2 首字节是**明文 `0x06`**
-        ///（IDA: `LOBYTE(v14[2]) = 6`，RWCardDemo 实测一致；早期照抄的 `0x14` 是加扰残留，见 TD-154）。
+        /// 校时卡。编码的是 YYMMDDHHmm（年月日时分）：
+        /// YYMM 在页2[3]（按年月生成）、DD 在卡号日段、HH:mm 在页1[2..3] 位域
+        ///（页1[2] = 16 × 分低4位 + 9；页1[3] = 分高4位 + 4×时）。
+        /// 页2 首字节是明文 0x06（IDA: LOBYTE(v14[2]) = 6；早期照抄的 0x14 是加扰残留）。
+        /// 旧拟合「16 × 当日分钟数 + 953」已废弃，只在个别样本下近似成立。
         /// </summary>
         public static void BuildTimeSync(int hour, int minute, int cardNo, out byte[] p1, out byte[] p2)
         {
@@ -773,16 +775,24 @@ namespace PmsLockSdk
         }
 
         public int IssueMaster(out CardInfo written)
-        { return IssueMaster(CardNoPolicy.Increment, -1, out written); }
+        { return IssueMaster(1, 0, CardNoPolicy.Increment, -1, out written); }
 
-        public int IssueMaster(CardNoPolicy policy, int explicitCardNo, out CardInfo written)
+        /// <summary>
+        /// 总控卡（指定有效期：hours &gt; 0 用小时，否则用 days）。
+        /// 作业流水号（卡号）规则与客卡完全一致，由调用方算好后传入。
+        /// </summary>
+        public int IssueMaster(int days, int hours, CardNoPolicy policy, int explicitCardNo, out CardInfo written)
         {
             byte[] p1, p2; int no;
             int rc = PrepareCardNo(explicitCardNo, out no);
             if (rc != LockResult.OK) { written = null; return rc; }
-            CardBuilder.BuildMaster(no, out p1, out p2);
+            CardBuilder.BuildMaster(days, hours, no, out p1, out p2);
             return WriteAndVerify(p1, p2, -1, out written);
         }
+
+        /// <summary>总控卡（默认卡号策略；未给时长，按 1 天发，保留旧调用方）</summary>
+        public int IssueMaster(CardNoPolicy policy, int explicitCardNo, out CardInfo written)
+        { return IssueMaster(1, 0, policy, explicitCardNo, out written); }
 
         public int IssueReset(out CardInfo written) { return IssueReset(CardNoPolicy.Increment, -1, out written); }
         public int IssueReset(CardNoPolicy policy, int explicitCardNo, out CardInfo written)

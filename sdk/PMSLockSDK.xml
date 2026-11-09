@@ -25,9 +25,43 @@
         <member name="T:PmsLockSdk.CardBuilder">
             <summary>卡内数据构造与解析（纯函数，可离线单测）</summary>
         </member>
+        <member name="F:PmsLockSdk.CardBuilder.Now">
+            <summary>
+            卡内「时间基准」。默认取本机当前时间；测试 / 离线构包可注入固定值，
+            这样 selftest 的黄金向量不会随真实日期漂移（TD-155）。
+            </summary>
+        </member>
+        <member name="M:PmsLockSdk.CardBuilder.TimestampCardNo(System.DateTime,System.Int32)">
+            <summary>
+            按发卡时刻生成卡号（TD-150，2026-11-08 实测破译）。
+            16 位 = 日(5) | 时(5) | 小时内序号(6)，与原厂「作业流水号 = 年月日时 + 小时内序号」对应。
+            例：11 日 12 点、该小时第 52 张 → (11&lt;&lt;11) | (12&lt;&lt;6) | 52 = <c>0x5B34</c>
+            （卡内按小端存：N_L=0x34、N_H=0x5B）。
+            </summary>
+        </member>
+        <member name="M:PmsLockSdk.CardBuilder.DecodeTimestampCardNo(System.Int32,System.Int32@,System.Int32@,System.Int32@)">
+            <summary>从卡号还原发卡日期/小时/序号（读卡显示用）。</summary>
+        </member>
+        <member name="M:PmsLockSdk.CardBuilder.NextStamp(System.Int32,System.DateTime,System.DateTime@,System.Int32@)">
+            <summary>
+            按原厂规则推进「发卡时刻 + 小时内序号」：
+            同一小时内序号 +1；满 63 次（序号超过 62）则时刻进位 1 小时、序号归 0；
+            当前时刻已经跨小时则直接用当前时刻、序号从 0 开始。
+            文档原文：「发卡序号为当前写卡时间的小时内的第几次写卡，超过 63 次则 fksj 小时 +1，序号复位为 0」。
+            </summary>
+            <summary>
+            按原厂规则推进「发卡时刻 + 本小时第 n 张」。
+            - 同一小时：n = 上次 + 1；满 63 张后进位到下一小时、n 归 1
+            - **进位产生的「未来小时」是下一次的基准**，不会退回当前小时（2026-11-08 修正）
+            - 跨小时/跨日：以当前时刻为基准，n 从 1 开始
+            <paramref name="nth"/> 取 **1–63**（卡内序号 = nth - 1）。
+            </summary>
+        </member>
         <member name="M:PmsLockSdk.CardBuilder.DurationDays(System.Int32)">
             <summary>
-            天数 → 时长码。1~63 天用 0x80|天数；超过 63 天用 0xC0|月数（1 月≈31 天，实测）。
+            天数 → 时长码。1~63 天用 0x80|天数；超过 63 天用 0xC0|月数。
+            **月按 30 天算**（2026-11-08 实测：锁按日历月执行，90 天→3 月、1095 天→36 月；
+            原来用 31 天会算出 35 月，实际少约一个月——见 TD-145）。
             </summary>
         </member>
         <member name="M:PmsLockSdk.CardBuilder.DurationHours(System.Int32,System.Boolean)">
@@ -38,8 +72,14 @@
         <member name="M:PmsLockSdk.CardBuilder.BuildGuestDay(System.Int32,System.Int32,System.Int32,System.Byte[]@,System.Byte[]@)">
             <summary>日租客卡页1/页2</summary>
         </member>
+        <member name="M:PmsLockSdk.CardBuilder.BuildGuestDay(System.Int32,System.Int32,System.Int32,System.Boolean,System.Byte[]@,System.Byte[]@)">
+            <summary>日租客卡；lost = 挂失卡（页1[2] 低 4 位 = 1，让该房间在用卡失效）。</summary>
+        </member>
         <member name="M:PmsLockSdk.CardBuilder.BuildGuestHour(System.Int32,System.Int32,System.Int32,System.Byte[]@,System.Byte[]@)">
-            <summary>钟点客卡页1/页2</summary>
+            <summary>钟点客卡</summary>
+        </member>
+        <member name="M:PmsLockSdk.CardBuilder.BuildGuestHour(System.Int32,System.Int32,System.Int32,System.Boolean,System.Byte[]@,System.Byte[]@)">
+            <summary>钟点客卡；lost = 挂失卡。</summary>
         </member>
         <member name="M:PmsLockSdk.CardBuilder.BuildGuestRaw(System.Int32,System.Int32,System.Int32,System.Int32,System.Byte[]@,System.Byte[]@)">
             <summary>允许手动指定低 4 位（用于对标未解规律）</summary>
@@ -63,10 +103,13 @@
             <summary>退房钟点设置卡</summary>
         </member>
         <member name="M:PmsLockSdk.CardBuilder.BuildTimeSync(System.Int32,System.Int32,System.Int32,System.Byte[]@,System.Byte[]@)">
-            <summary>
-            校时卡。值 = 16 × 当日分钟数 + 953，只含当日时/分，不含日期。
-            p2 首字节实测为 0x14（7 月样本为 0x13），含义未定，默认照抄。
-            </summary>
+             <summary>
+             校时卡。编码的是 YYMMDDHHmm（年月日时分）：
+             YYMM 在页2[3]（按年月生成）、DD 在卡号日段、HH:mm 在页1[2..3] 位域
+            （页1[2] = 16 × 分低4位 + 9；页1[3] = 分高4位 + 4×时）。
+             页2 首字节是明文 0x06（IDA: LOBYTE(v14[2]) = 6；早期照抄的 0x14 是加扰残留）。
+             旧拟合「16 × 当日分钟数 + 953」已废弃，只在个别样本下近似成立。
+             </summary>
         </member>
         <member name="M:PmsLockSdk.CardBuilder.BuildRaw(System.String,System.String,System.Byte[]@,System.Byte[]@)">
             <summary>直接按抓包字节写（校时卡等未解卡型）</summary>
@@ -74,17 +117,15 @@
         <member name="M:PmsLockSdk.CardBuilder.Parse(System.Byte[])">
             <summary>解析 28 字节卡数据</summary>
         </member>
+        <member name="P:PmsLockSdk.CardBuilder.Suffix">
+            <summary>
+            页2[3]：**年（高 4 位）+ 月（低 4 位）**。2026 年 11 月 = `0xAB`。
+            读卡侧的还原规则（原厂 `sub_1000260C`）：
+            `年 = 2000 + 16 × ⌊(当前年 − 2000) / 16⌋ + 高4位`，16 年一循环。
+            </summary>
+        </member>
         <member name="T:PmsLockSdk.RoomTable">
             <summary>房号 ↔ 序号映射（RoomIndex.ini）</summary>
-        </member>
-        <member name="T:PmsLockSdk.CardNoStore">
-            <summary>16 位卡号计数器（持久化，原子写）</summary>
-        </member>
-        <member name="M:PmsLockSdk.CardNoStore.Next">
-            <summary>取下一个卡号（并落盘）</summary>
-        </member>
-        <member name="M:PmsLockSdk.CardNoStore.EnsureAbove(System.Int32)">
-            <summary>保证后续发号大于等于 v（不改写文件）</summary>
         </member>
         <member name="T:PmsLockSdk.LockCardOptions">
             <summary>运行配置（LockCard.ini）</summary>
@@ -100,14 +141,41 @@
         <member name="M:PmsLockSdk.LockCardReader.ReadCard(PmsLockSdk.CardInfo@)">
             <summary>读卡并解析</summary>
         </member>
-        <member name="M:PmsLockSdk.LockCardReader.IssueTimeSync(System.Int32,System.Int32,PmsLockSdk.CardInfo@)">
-            <summary>校时卡：按当前/指定的时和分自动生成</summary>
+        <member name="M:PmsLockSdk.LockCardReader.IssueGuestDay(System.String,System.Int32,PmsLockSdk.CardNoPolicy,System.Int32,System.Boolean,PmsLockSdk.CardInfo@)">
+            <summary>日租客卡；lost = 挂失卡（页1[2] 低 4 位 = 1，让该房间在用卡失效）。</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueGuestDay(System.Int32,System.Int32,System.Int32,System.Boolean,PmsLockSdk.CardInfo@)">
+            <summary>日租客卡（直接给房间序号 1–254；CLI 不再传房号）。</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueGuestHour(System.String,System.Int32,PmsLockSdk.CardNoPolicy,System.Int32,System.Boolean,PmsLockSdk.CardInfo@)">
+            <summary>钟点客卡；lost = 挂失卡。</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueGuestHour(System.Int32,System.Int32,System.Int32,System.Boolean,PmsLockSdk.CardInfo@)">
+            <summary>钟点客卡（直接给房间序号 1–254；CLI 不再传房号）。</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueMaster(System.Int32,System.Int32,PmsLockSdk.CardNoPolicy,System.Int32,PmsLockSdk.CardInfo@)">
+            <summary>
+            总控卡（指定有效期：hours &gt; 0 用小时，否则用 days）。
+            作业流水号（卡号）规则与客卡完全一致，由调用方算好后传入。
+            </summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueMaster(PmsLockSdk.CardNoPolicy,System.Int32,PmsLockSdk.CardInfo@)">
+            <summary>总控卡（默认卡号策略；未给时长，按 1 天发，保留旧调用方）</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.IssueTimeSync(System.Int32,System.Int32,System.Int32,PmsLockSdk.CardInfo@)">
+            <summary>校时卡：时/分 + 卡号（卡号由 CLI 用「日期时间 + 序号」算好后传入）</summary>
         </member>
         <member name="M:PmsLockSdk.LockCardReader.IssueTimeSync(System.String,System.String,PmsLockSdk.CardInfo@)">
             <summary>校时卡：时间字段未解，需给出抓包得到的页1/页2</summary>
         </member>
         <member name="M:PmsLockSdk.LockCardReader.WriteRaw(System.String,System.String,PmsLockSdk.CardInfo@)">
             <summary>直接写任意 8 字节</summary>
+        </member>
+        <member name="M:PmsLockSdk.LockCardReader.PrepareCardNo(System.Int32,System.Int32@)">
+            <summary>
+            卡号由调用方传入（CLI/SDK 不再自增、不碰 `CardNo.state`）。
+            1–0xFFFF 之外一律 `ErrCardNo`。
+            </summary>
         </member>
     </members>
 </doc>

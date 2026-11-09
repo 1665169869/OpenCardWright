@@ -31,7 +31,7 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      # 门禁 1：编译 ../sdk 并跑 27 条黄金向量（纯字节，不需要硬件）
+      # 门禁 1：编译 ../sdk 并跑 46 项自检（纯字节，不需要硬件）
       - name: Build SDK + selftest gate
         run: pnpm build:sdk
 

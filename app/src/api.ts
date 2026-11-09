@@ -754,9 +754,6 @@ export const api = {
 //   小时段 0x40|小时 —— 客卡 1–62、总控 1–63
 //   超过简单段只能走固定档位（月码 0xC0|月数）
 
-/** 长有效期卡（天数进入月码段）发卡前必须原样输入的确认词，与后端 rules.rs 保持一致 */
-export const LONG_CONFIRM_WORD = '顶高水位'
-
 export const GUEST_MAX_DAYS = 62
 export const MASTER_MAX_DAYS = 63
 export const GUEST_MAX_HOURS = 62
@@ -837,7 +834,8 @@ export function formatMinute(iso: string | null | undefined): string {
  * 全系统只有这一个地方拼这句话 —— 读卡页、退房弹窗、发卡结果、顶栏提醒都用它，
  * 避免各处"有的显示发卡时间、有的显示到期时间、有的只有时长"。
  *
- * 为什么要标"估算"：卡内只有时长码，没有绝对到期时刻，锁实际从**首次刷卡**起算；
+ * 为什么要标"估算"：锁按**卡内发卡时间**计算到期（日租 = 发卡日 + N 天的退房钟点、
+ * 钟点 = 发卡时刻 + N 小时），前提是锁内时间已用校时卡校准、退房钟点已用退房钟点卡设置；
  * 这里显示的到期时刻是按**发卡时间 + 时长**推算的。无到期时间返回 null，调用方不渲染。
  */
 export function formatExpiry(expiresAt: string | null | undefined): string | null {

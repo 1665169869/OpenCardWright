@@ -1432,7 +1432,7 @@ export default function RoomManager({
             room={issueRoom}
             onIssued={() => {
               void reload()
-              // 发卡会推进卡号水位，顶栏必须跟着刷新，否则"发的卡号"和"显示的水位"对不上
+              // 发卡/退房会改变房间状态，顶栏与房间列表必须跟着刷新
               onRoomsChanged?.()
             }}
             defaultDays={

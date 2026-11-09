@@ -79,7 +79,7 @@ pub struct IssuanceRecord {
     pub error_code: Option<i64>,
     pub created_at: String,
     /// 到期时间（UTC ISO8601）。按发卡时间 + days/hours 推算的估算值
-    /// （卡内只有时长码，锁实际从首次刷卡起算）。凡 days/hours>0 的卡型都有值，
+    /// （锁按卡内发卡时间计算；日租另受锁内退房钟点影响）。凡 days/hours>0 的卡型都有值，
     /// 复位/清除/安装卡等无时长卡型为 NULL。
     pub expires_at: Option<String>,
     // 客人身份信息（只存库，不写卡；全部可空）
@@ -1614,8 +1614,9 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
     // 不再按开卡时刻顺延 —— 18:00 开 1 天卡 → 次日 12:00 到期，而非次日 18:00。
     // 中国无夏令时、localtime 偏移固定（见 logging.rs 注释）；钟点卡 / 管理卡 / 复位仍走
     // expiry_modifier 顺延原逻辑，历史数据（backfill）不回溯，卡内时长码与锁的判定不受影响。
-    // 已知风险：05:00 开 1 天卡时库显示次日 12:00，而锁按刷入 +1 天（日界 docs【待定】）
-    // 可能次日 05:00 已失效 —— 软件比锁宽松最多 7 小时；18:00 开卡则库比锁严 6 小时（安全方向）。
+    // 已知差异：若锁内退房钟点与设置项不一致（没刷退房钟点卡、或设置改过但没重刷），
+    // 库里的到期会与锁不同；锁内时间未用校时卡校准时，到期判定也会漂移。
+    // 设置项只影响产品展示与统计，不改变卡内字节。
     let guest_checkout_hour = if new.kind == "日租客卡" && new.days > 0 {
         Some(
             get_setting(conn, "checkoutHour")?
@@ -1654,8 +1655,9 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
 
 /// 带时长的卡型的过期偏移量（`+90 days` / `+3 hours`）。无时长（0/0）的卡型一律 None。
 ///
-/// 注意：这是按**发卡时间**算的估算值 —— 卡内只有时长码，没有绝对到期时间，
-/// 而锁实际是从"首次刷卡"起算（见 docs/TEMIC门锁卡技术规格.md §11.1）。
+/// 注意：这是按**发卡时间**算的估算值 —— 锁按卡内发卡时间计算到期：
+/// 日租卡到发卡日 + N 天的锁内退房钟点，钟点卡到发卡时刻 + N 小时
+///（见 docs/TEMIC门锁卡技术规格.md §11.1）。
 pub fn expiry_modifier(days: i64, hours: i64) -> Option<String> {
     if days > 0 {
         Some(format!("+{days} days"))

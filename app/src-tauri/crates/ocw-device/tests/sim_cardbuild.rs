@@ -200,9 +200,9 @@ fn admin_bytes_match_known_vectors() {
     let install = hex(vec!["--type", "install"], Some(15));
     assert_eq!(&install[8..16], "46F20001", "安装卡页2 应固定为 46F20001");
 
-    // 校时卡 10:48 → v = 16*(648)+953 = 0x2C39，低字节在前
+    // 校时卡 10:48 → 页1 位域：p1[2]=16*(48&0xF)+9=0x09，p1[3]=(48>>4)+4*10=0x2B
     let ts = hex(vec!["--type", "timesync", "--hour", "10", "--minute", "48"], None);
-    assert!(ts.starts_with("5BEC392C"), "校时卡页1 应为 5BEC392C，实际 {ts}");
+    assert!(ts.starts_with("5BEC092B"), "校时卡页1 应为 5BEC092B，实际 {ts}");
 
     let _ = fs::remove_dir_all(&dir);
 }

@@ -709,8 +709,8 @@ pub async fn issue_admin_card(
 
     blocking(move || {
         let mut args = request.to_args()?;
-        // 需要卡号的管理卡统一用卡号时间戳（日/时/序号），与客卡同一套编码；
-        // 固定号会低于门锁水位，不能再使用。
+        // 需要作业流水号的管理卡统一用「日 / 时 / 序号」编码，与客卡同一套算法；
+        // 不再使用固定号。
         if admin_card_needs_timestamp(&request) {
             let at = admin_card_timestamp_at(&request);
             let card_no =
@@ -1038,8 +1038,8 @@ pub async fn issue_guest(
             }
         }
 
-        // 3) 水位闸门已移除（2026-11-08）：卡号改成「时刻 + 本小时序号」后不会再触顶
-        //    （旧逻辑是卡号逼近 0xFF00 时拒发），`CardNo.state` 保留仅用于算「本小时第几张」。
+        // 3) `CardNo.state` 只用于算「本小时第几张」；作业流水号 = 日 / 时 / 序号，
+        //    不再有卡号闸门（旧逻辑是卡号逼近 0xFF00 时拒发，2026-11-08 已移除）。
 
         // 4) 写卡前统一先读卡：确认卡在机器上，并记录原卡信息
         pre_read_card(&device)?;

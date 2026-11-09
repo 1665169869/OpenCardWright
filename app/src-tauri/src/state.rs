@@ -11,7 +11,7 @@ use crate::auth::Session;
 /// 设备后端。真实机器走 `Cli`（子进程），CI/无驱动环境走 `Sim`。
 ///
 /// `Sim` 也带运行时目录：发客卡时会调用 `OCWCardBuild.exe` 离线构包并推进 `CardNo.state`，
-/// 所以模拟环境下的卡号与水位也会像真机一样自增。
+/// 所以模拟环境下的作业流水号也像真机一样按「日 / 时 / 序号」推进。
 #[derive(Clone)]
 pub enum Device {
     Cli(CliDevice),

@@ -29,8 +29,9 @@
 | `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、起始卡号模板（构建时不复制，运行时由产品侧 `cardno.rs` 维护） | 状态文件是现场数据 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
 | `vendor/125k-sdk-v4.2/` | 原厂 SDK 开发模块留档（IDA / dumpbin 分析材料） | 只读；结论进 `docs/` |
-| `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链 | 见第 9 节 |
-| `app/docs/使用手册.md`、`CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
+| `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链（`scripts/build-sdk.ps1` → `pnpm` → `build-release.ps1`） | 见第 9 节 |
+| `app/docs/使用手册.md`、根 `CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
+| `app/build-release.ps1`、`app/.github/workflows/ci.yml` | 一键 MSI 发布（需 WiX Toolset v3）、CI 四道门禁（selftest / cargo test / cargo check / 前端） | 发布链变了要同步 |
 | `app/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder`；**卡号必须由 `--serial` 传入**，不再自增） | 随 SDK 接口同步 |
 | `plan/` | 建设方案（v0.1 作废留档、v0.2 已批准）、`待办清单.md`（索引）、`已完成.md`（摘要）与 `td-xxx.md`（条目详情） | 方案改结论要留痕；待办清单每轮更新，见第 10 节 |
 
@@ -96,29 +97,25 @@ PMSLockCard.exe selftest
 
 ```
 页1 = 5B EC | ((序号 & 0x0F) << 4 | 低4位) | (序号 >> 4)
-页2 = 时长码 | 卡号低 | 卡号高 | **年月**（高 4 位 = `(年−2000) & 0x0F`、低 4 位 = 月；还原时 `年 = 2000 + 16×⌊(当前年−2000)/16⌋ + 高4位`，**16 年一循环**。**不是常量**：2026-11 写 `0xAB`、2027-11 写 `0xBB`，已实测。见 `docs/TEMIC门锁卡技术规格.md` §4.4.2）
+页2 = 时长码 | 卡号低 | 卡号高 | **年月**（高 4 位 = `(年−2000) & 0x0F`、低 4 位 = 月；还原时 `年 = 2000 + 16×⌊(当前年−2000)/16⌋ + 高4位`，**16 年一循环**。**不是常量**：2026-11 写 `0xAB`、2027-11 写 `0xBB`，已实测。见 `docs/TEMIC门锁卡技术规格.md` §4.2）
 ```
 
 | 项 | 规则 |
 |---|---|
-| 时长码（天） | `0x80 ｜ 天数`（1–63）；`>63` 天走 `0xC0 ｜ round(天数/31)` |
+| 时长码（天） | `0x80 ｜ 天数`（1–63）；`>63` 天走 `0xC0 ｜ round(天数/30)` |
 | 时长码（小时） | 客卡 `0x40 ｜ (小时+1)`；总控卡 `0x40 ｜ 小时`（差 1，实测） |
 | 总控卡页1 | `5B EC F0 FF` |
-| 安装卡页2 | 固定 `46 F2 00 01`，**不含**卡号 |
-| 校时卡 | `值 = 16 × 当日分钟数 + 953`（小端）；页2 首字节 **`0x06`**（明文，IDA: `LOBYTE(v14[2]) = 6`）；页1[2] 必须满足 `& 0x09 == 0x09`，否则读卡返回错误 4 |
-| 卡号 | **时间戳编码**：`(日 << 11) | (时 << 6) | 小时内序号`（序号 0–62；满 63 张则小时 +1、序号归 0）。产品侧只用于写卡，**不落库、不展示**（数据库列保留但停止读写） |
-| CLI 时间源 | `issue --datetime "YYYY-MM-DD HH:mm"`（`--at` 同义）驱动 `CardBuilder.Now`（`页2[3]` 年月）；**卡号 = `日<<11 ｜ 时<<6 ｜ seq`** 由 CLI 用同一个时间 + `--seq` 算出，天然同源。CLI 不再维护任何卡号计数器；`--serial` 可显式指定卡号 |
+| 安装卡页2 | 固定 `46 F2 00 01`，**不含**作业流水号 |
+| 校时卡 | 编码的是 **`YYMMDDHHmm`**（年月日时分）：`YYMM` 在 `页2[3]`、`DD` 在卡号日段、`HH:mm` 在页1 位域（`页1[2] = 16 × (分 & 0x0F) + 9`、`页1[3] = (分 >> 4) + ((4 × 时) & 0x7C)`）；页2 首字节 **`0x06`**（明文，IDA: `LOBYTE(v14[2]) = 6`）；页1[2] 必须满足 `& 0x09 == 0x09`，否则读卡返回错误 4。旧公式 `16×当日分钟+953` 已废弃 |
+| 作业流水号 | **10 位十进制 `YYMMDDHHII`**（年 2 + 月 2 + 日 2 + 时 2 + 小时内序号 2；如 `2611081100` = 2026-11-08 11 时第 00 号）。写卡时拆两处：`页2[3]` 存 `YYMM`（高 4 位年、低 4 位月），16 位卡号存 `DDHHII` = `(日 & 0x1F) << 11 ｜ (时 & 0x1F) << 6 ｜ 序号(0–62)`；满 63 张则小时 +1、序号归 0。客卡 / 总控 / 复位 / 清除 / 退房钟点 / 校时共用；产品侧只用于写卡，**不落库、不展示**（数据库列保留但停止读写） |
+| CLI 时间源 | `issue --datetime "YYYY-MM-DD HH:mm"`（`--at` 同义）驱动 `CardBuilder.Now`（`页2[3]` 的 `YYMM`）；**`DDHHII` = `日<<11 ｜ 时<<6 ｜ seq`** 用同一个时间 + `--seq` 算出，两段天然同源。CLI 不再维护计数器；`--serial` 可显式指定 `DDHHII` 部分 |
 | 挂失 | `页1[2]` **低 4 位** = 1 即挂失（`BuildGuestDay/Hour(..., lost)`）；原 `LowNibble`（`天数&3==1`）已删除，那会让 1 天卡/钟点卡被误标挂失 |
 | 时长码·月 | 超 63 天走 `0xC0 \| 月数`，**按 30 天/月换算**（90→3 月、1095→**36 月**）；锁按日历月执行 |
-| 发卡数量 | **全局默认 2 张**（「设置 → 发卡数量」可改，`0` = 不限）+ **房间可单独覆盖**（留空跟随全局、`0` = 不限、`n` = 具体张数）。有效卡张数达上限时发卡直接返回 409。同房多张卡各用新卡号，**不复用首卡卡号** |
+| 到期语义 | **锁按卡内发卡时间计算，不依赖首次刷卡**：日租卡 = 发卡日 + N 天的**退房钟点**（由退房钟点卡写进锁，如 12 点 → 次日 12:00）；钟点卡 = 发卡时刻（小时级）+ N 小时。前提：锁内时间已用校时卡校准、退房钟点已用退房钟点卡设置；卡内没有分钟 |
+| 发卡数量 | **全局默认 2 张**（「设置 → 发卡数量」可改，`0` = 不限）+ **房间可单独覆盖**（留空跟随全局、`0` = 不限、`n` = 具体张数）。有效卡张数达上限时发卡直接返回 409。同房多张卡各用新的作业流水号，**不复用首卡流水号** |
 | 让旧卡失效 | 只能发**挂失卡**（`页1[2]` 低 4 位 = 1）；与「同房多发卡」是两套独立机制 |
-| 卡号字节序 | 16 位、低字节在前；`N_H << 8 ｜ N_L` |
-| 锁的判定 | 每个房间 × 每种卡型各自维护高水位：大于→开并更新，等于→开，小于→拒 |
-| 日租 / 钟点 | 两套高水位**互不影响** |
-| 复位卡 | 清空该房间卡记录（高水位归零），且不受卡号大小限制 |
-| 总控卡 vs 高水位 | **【待定】** 现场线索称总控卡可能不受客房高水位限制，未做受控实验；验证方法见 `docs/TEMIC门锁卡技术规格.md` §11.6。不要据此放宽卡号保护 |
-| 水位/预警线 | **彻底移除**（2026-11-08）：`card_no_status` / `set_water_warn_at` / `reset_water_mark` 命令、前端 API、`setting.waterWarnAt` 读写全部删除；`setting.startCardNo` 也不再读取。`CardNo.state` 仅内部计数器；**锁侧高水位机制完全不变** |
-| 退房匹配 | 持卡退房：卡号解码出日/时/序号，结合卡内房号 + 卡型反查 `issuance`；无卡退房：按记录 id 关闭。**同号卡复用已取消**，每张卡独立卡号 |
+| 卡号字节序 | `DDHHII` 16 位、低字节在前；`N_H << 8 ｜ N_L` |
+| 退房匹配 | 持卡退房：`页2[3]` 取 `YYMM`、卡号解出 `DDHHII`，拼回完整作业流水号后结合房号 + 卡型反查 `issuance`；无卡退房：按记录 id 关闭。**同号复用已取消**，每张卡独立流水号 |
 | 读卡退房范围 | **只允许客卡**（日租/钟点）。持卡退房会擦卡（写零），若把总控/复位/安装/校时卡放上去会被擦成空白；后端 `checkout_card` 与前端 `CheckoutCardModal` 都会拦 |
 | 备份完整性 | 备份走 `ocw_store::backup_to` → `rusqlite::backup::Backup::run_to_completion`（SQLite 在线备份 API）：**逐页拷贝到完成 = 全量**，含 `-wal` 里未 checkpoint 的数据，且不锁库。**不要改成 `std::fs::copy`**——文件级拷贝会漏 WAL，恢复后少掉最后一段事务 |
 | 恢复账号 | 恢复整库后按 `login` 合并：当前已有账号保留密码 / 角色 / 启用状态；备份新增账号导入但停用；当前独有账号补回（部门置空）。`RestoreResult` 返回房间 / 发卡 / 预定 / 账号数与账号处理计数；合并失败不回滚整库，可用 `.bak` 回滚 |
@@ -129,9 +126,6 @@ PMSLockCard.exe selftest
 
 ## 6. 现场风险（不要为了验证而做的事）
 
-- **不要跳卡号**：卡号是锁的高水位依据。手工把 `CardNo.state` 跳到未来小时（如 `0x4700`）会把该房间
-  高水位顶到未来，之后正常发卡长期被拒，只能用复位卡恢复。
-- **1095 天卡刷一次门会把该房间高水位顶到 3 年后**，之后正常卡全废，只能用复位卡恢复。
 - 复位卡本身不设防：任何持卡人都能让旧卡复活，测试/演示时不要留在现场。
 - 清除卡、安装卡**尚未在锁上验证过真实效果**（字节已与原厂一致）；刷清除卡可能让锁变"未安装"。
 - `lockcode_temic`（`Xt_cs` 表）只被原厂高层 `tem_*_sdk` 使用，本方案不用，但换机/迁移时要保持一致。
@@ -145,30 +139,28 @@ PMSLockCard.exe selftest
 |---|---|
 | `SDK使用说明.md` 顶部把 `vendor\` 说成主用方案 | 已删；现只说本 SDK 是唯一实现 |
 | 自检样本数写成 19 | 已改为 **27**（README / SDK使用说明 / 技术规格 §12 一致） |
-| `PMSLockSDK.cs` 头注释写"机制待定" | 已改为实测结论（按卡型高水位） |
+| `PMSLockSDK.cs` 头注释写"机制待定" | 已改为按作业流水号写入 |
+| 旧逆向结论「锁按房间 × 卡型比较高水位」 | **已废止**（2026-11-10）：现行模型只有作业流水号（`YYMMDDHHII`，10 位）；`docs/` 相关段落标【已废止】，产品不再有水位表述 |
 | 技术规格残留早期"校时卡（未解）"推导 | 已删除，只保留 §5.3 实测公式 |
 | `发卡调用链逆向.md` §8 曾提供 `VendorBridge.exe` | 已标注为历史记录，仓库不再提供该工具 |
 
 **仍存在的不一致（无害）**：
 
-- `app/README.md` §1 的 M3/M4/M5 状态表是历史快照，部分 ⬜ 实际已完成；其中的
-  「40/40 门禁」「120 项测试」也是历史数字（当前 46/46 与 130）。判断“还差什么”只看
-  `plan/待办清单.md`，不要据此开工。
 - `RoomIndex.ini` 有两份（`data/` 与 `sdk/`）；运行时读 `sdk/` 侧（`LockCard.ini` 用相对路径），
   增删房间要两份同步。
 - `sdk/PMSLockSDK.cs` 头注释仍是旧格式（写死 `0xAB`、31 天/月、递增发号、`CardNo.state`），
   2026-11-08 重构未同步；**以代码与 `docs/` 为准**。
 - `sdk/PMSLockCard.cs` 头注释的用法仍是 `issue --room 220`（实际按 `--room-index`），
   时间源是 `--datetime` / `--at`。
-- `app/scripts/build-sdk.ps1` 与 `app/tools/CardBuild.cs` 的注释仍提 `CardNoStore` /「27 条黄金向量」，
-  不影响构建，但别照着注释理解现状。
+- `app/scripts/build-sdk.ps1` 与 `app/tools/CardBuild.cs` 的注释仍提 `CardNoStore` /「27 条黄金向量」
+  （实际 `selftest` 已是 46 项），不影响构建，但别照着注释理解现状。
 - `plan/待办清单.md` 正文完成记录里的数字滞后（TD-150 仍写 39 项 / 126 项测试）；
   判定完成看 §1 索引与代码实跑。
 
 ## 8. 环境注记
 
 - 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用；2026-11-07 起前端包管理改用
-  **pnpm 12**（2026-11-08 实测 12.18.0，`pnpm build:sdk` 46/46 通过）。`app/pnpm-workspace.yaml` 的
+  **pnpm**（2026-11-10 实测 10.29.3，`pnpm build:sdk` 46/46 通过）。`app/pnpm-workspace.yaml` 的
   `allowBuilds: esbuild` 不能删，否则 `pnpm install` 会以 `ERR_PNPM_IGNORED_BUILDS` 失败。
   若某会话 `pwsh` 启动失败（`0xC0000142` DLL 初始化失败），先确认能否编译，
   不要把“没跑过命令”当成验证通过。
@@ -204,8 +196,8 @@ PMSLockCard.exe selftest
 | 能否修改 `sdk/` | **默认只读**。2026-11-08 的卡号/挂失/年月重构直接改过 `sdk/*.cs`；确需改设备行为时，必须同步 `selftest` 向量与 `docs/`，产品适配层能解决的不要动 SDK |
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
 | 回归口径 | `sdk` 自带的 46 项自检；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
-| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build` |
-| 编译环境坑 | MSVC `D8050` 是 **命令行过长**（`sqlite3.c`），不是中文路径；项目使用 Cargo/Tauri 默认 target，不覆盖 `CARGO_TARGET_DIR` / `DEBUG`。详见 `app/README.md` §4 |
+| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build --bundles msi`（或发布脚本 `build-release.ps1`） |
+| 编译环境坑 | MSVC `D8050` 是 **命令行过长**（`sqlite3.c`），不是中文路径；项目使用 Cargo/Tauri 默认 target，不覆盖 `CARGO_TARGET_DIR` / `DEBUG`。详见 `app/README.md` §5 |
 
 新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准，不要套用本文件的 csc 构建命令。
 
@@ -213,7 +205,7 @@ PMSLockCard.exe selftest
 
 | 位置（相对 `app/`） | 职责 |
 |---|---|
-| `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/` |
+| `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/`，校验与提示音在 `utils/`；`idcard.ts` 是身份证读卡 WebSocket |
 | `src-tauri/src/commands.rs` | 全部 `#[tauri::command]`：发卡 / 退房 / 房间 / 管理卡 / 备份 / 诊断 / 登录，以及命令 × 角色矩阵 |
 | `src-tauri/src/rules.rs` | 时长边界（客卡 62 / 总控 63）、长有效期档位与确认词；**与 `src/api.ts` 的档位表必须同步** |
 | `src-tauri/src/cardno.rs` | 卡号时间戳编码（日/时/序号）、`CardNo.state` 原子读写与递推；卡号由产品侧算好后传给 CLI |
@@ -221,6 +213,8 @@ PMSLockCard.exe selftest
 | `src-tauri/crates/ocw-store/` | SQLite schema 与查询（rusqlite bundled）；`issuance` 只追加，序号唯一 |
 | `src-tauri/crates/ocw-device/` | 启动 `PMSLockCard.exe` 子进程、GBK 解码、解析、模拟设备 |
 | `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 运行目录 + 首启卡号、自动备份、文件日志、诊断包。**备份走 SQLite 在线备份 API**（`ocw_store::backup_to` → `rusqlite::backup::Backup::run_to_completion`），逐页拷贝到完成，**是全量备份**（含 `-wal` 里未 checkpoint 的数据）且不锁库；备份后把目标库设为 `journal_mode=DELETE`，避免「db + db-wal 两个文件才算完整」。**不要改成 `std::fs::copy`**——那会漏掉 WAL 中未刷盘的事务 |
+| `src-tauri/src/room_import.rs` | 房号 INI / CSV 导入（坏行收集不致命、删房序号可复活） |
+| `src-tauri/src/demo_import.rs` | 仅 `debug_assertions`：空库时从 `data/NacreHis.json` 的 `Kf_fh` 建 30 个房间，发布版不编译 |
 
 产品工作区常用命令（在 `app/` 内）：
 
@@ -231,22 +225,25 @@ pnpm dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
 pnpm tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
 pnpm build          # build:sdk + tsc --noEmit + vite build
 pnpm exec tsc --noEmit       # 只做前端类型检查
-pnpm setup:nsis     # 打包前预置 NSIS 工具链（本机联网下载会超时）
-pnpm tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出的是 dev 壳）
+pnpm tauri build --bundles msi   # 出 WiX MSI 安装包；不要用 cargo build --release（出的是 dev 壳）
+pwsh -NoProfile -File build-release.ps1   # 一键正式版：MSI → app/output，并打印 SHA-256
 ```
+
+打包前置条件：**WiX Toolset v3**（`candle.exe` / `light.exe`），用 `-WixBin` 或 PATH 指定。
+NSIS / Inno Setup 已废弃，`pnpm setup:nsis` 与相关脚本都不存在了。
 
 测试在 `src-tauri/` 内跑，几种粒度都常用：
 
 ```powershell
-cargo test --workspace                                   # 全部；2026-11-09 实测 130 项全绿
-cargo test -p ocw-store                                  # 只跑存储层（51）
+cargo test --workspace                                   # 全部；2026-11-10 实测 136 项全绿
+cargo test -p ocw-store                                  # 只跑存储层（56）
 cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件（5）
 cargo test -p ocw-store insert_room                      # 按用例名子串单跑
 ```
 
 > 2026-11-06 起 `real_selftest_is_all_green_and_parses` 已改用 `ocw_device::cli::decode`，
-> GBK 红灯已修复；2026-11-09 实测 `cargo test --workspace` 130 项全绿
-> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 51 + 命令层 46）。
+> GBK 红灯已修复；2026-11-10 实测 `cargo test --workspace` 136 项全绿
+> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 56 + 命令层 47）。
 > 编译警告已清零（2026-11-08 删除了 `cardno.rs` 的未用方法、`provision.rs` 的
 > `apply_start_card_no`、`rules.rs` 的 `needs_long_confirm`；并修正了 `commands.rs`
 > 的 `#[test]` 属性错位——`auth_matrix_matches_every_command` 此前实际没跑，现在会校验）。
@@ -270,7 +267,7 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 
 | 规则 | 原因 |
 |---|---|
-| 房间序号绑上锁后**永不复用** | 序号写进卡内页1，锁按「房间 × 卡型」记高水位；换号即旧卡失效 |
+| 房间序号绑上锁后**永不复用** | 序号写进卡内页1（`5B EC` 之后的字节）；换成新序号后，旧卡不能再用于新房 |
 | 删房是**逻辑删除**（`room.active=0`） | 历史发卡记录要留档，序号仍占位，`list_rooms` 返回全量 |
 | 新增房间用到已删序号 = **复活那条记录改房名**，不插新行 | 否则撞 `room_index UNIQUE`；同时重置房态/发卡上限/安装卡记录 |
 | 有有效卡时**不许改名、不许删房** | 发卡、退房、改上限全按 `room_no` 对账，改名会让在场卡对不上号 |
@@ -284,10 +281,10 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 - npm 时代 `pnpm install` 会重写 `package-lock.json` 的 `libc` 元数据产生无意义 diff；2026-11-07 起改用
   **pnpm**（`pnpm-lock.yaml`），此坑基本消失；若 lock 出现无意义 diff，`git checkout -- app/pnpm-lock.yaml` 还原。
 
-产品侧高频踩坑（详见 `app/README.md` §7）：设备 CLI 输出是 GBK，必须经
+产品侧高频踩坑（详见 `app/README.md` §5）：设备 CLI 输出是 GBK，必须经
 `ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。
 
-- 新增/改名 Tauri 命令必须同步 `app/README.md` §8 的「命令 × 角色」表；
+- 新增/改名 Tauri 命令必须同步 `app/README.md` §6 的「命令 × 角色」表；
   `commands.rs` 的 `auth_matrix_matches_every_command` 会机械校验，漏登记即红。
 - 时长边界改一处不算完：`src-tauri/src/rules.rs` 与 `src/api.ts` 的档位表必须同步。
 
@@ -307,7 +304,7 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 | 索引优先 | `plan/待办清单.md` §1 索引是状态权威；`td-xxx.md` 的现状/完成记录里的项数/hash/测试数可能滞后，动手前用 `git log` 与实跑复核 |
 | 每轮收口 | 一轮开发结束、**提交之前**，把本轮没做完的项写进对应 `td-xxx.md`，「状态 / 现状 / 验收标准」三样齐全；完成后摘要移入 `已完成.md`，详情留在/写入 `td-xxx.md`；没有新增就把状态改准 |
 | 进度不再写方案 | `plan/…建设方案-v0.2.md` §15 只记已完成与偏差，不再追加「未实现」；新需求一律进待办清单（索引 + `td-xxx.md`） |
-| 其它文档只写结论 | `app/README.md` 面向使用者写「现在能不能用」，`CHANGELOG.md` 面向版本写「这版有什么」，都只放指针、不复制条目 |
+| 其它文档只写结论 | `app/docs/使用手册.md` 面向使用者写「现在能不能用」，`CHANGELOG.md` 面向版本写「这版有什么」，`app/README.md` 面向开发者写构建与踩坑，都只放指针、不复制条目 |
 | 不引入外部跟踪 | 不用 GitHub Issues 或在线看板：另一台电脑可能没网、没 gh 登录 |
 | 来源可追溯 | 每条待办在清单 §7「来源登记表」有出处；登记前先查表，避免同一需求登记两次 |
 | 待拍板显式化 | 需要用户决定的（有效期怎么存、音色怎么来、某功能是否废弃）必须写进条目「待拍板」并给建议默认，不许自行假设 |

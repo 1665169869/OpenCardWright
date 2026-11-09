@@ -3,13 +3,20 @@
 //
 //  用法：
 //    PMSLockCard.exe read [--json]
-//    PMSLockCard.exe issue --room 220 --days 1 [--serial 2448] [--json]
-//    PMSLockCard.exe issue --room 220 --hours 3
-//    PMSLockCard.exe issue --type master|reset|clear|checkout --hour 12
-//    PMSLockCard.exe issue --type install --room 220
-//    PMSLockCard.exe issue --raw --p1 5BEC492B --p2 13BF22AB
+//    PMSLockCard.exe issue --type guest --room-index 15 --seq 3 --datetime "2026-11-09 14:30" --days 1
+//    PMSLockCard.exe issue --type guest --room-index 15 --seq 4 --datetime "2026-11-09 14:30" --hours 3
+//    PMSLockCard.exe issue --type master --serial 4B86 --days 30     （hours 优先于 days）
+//    PMSLockCard.exe issue --type reset|clear --serial 4B87
+//    PMSLockCard.exe issue --type checkout --hour 12 --serial 4B89
+//    PMSLockCard.exe issue --type timesync --serial 4B8A --datetime "2026-11-09 15:30"
+//    PMSLockCard.exe issue --type install --room-index 15           （安装卡不需要卡号）
+//    PMSLockCard.exe issue --type raw --p1 5BEC492B --p2 13BF22AB
 //    PMSLockCard.exe selftest
 //    PMSLockCard.exe ports
+//
+//  作业流水号（卡号）= (日 & 0x1F) << 11 | (时 & 0x1F) << 6 | 小时内序号(0-62)，
+//  与客卡/N客卡计算逻辑完全一致；可用 --serial 显式指定，或用
+//  --room-index + --seq + --datetime 三件套由 CLI 算出。
 //
 //  退出码：0 成功 / 1 参数 / 2 驱动或串口 / 3 无卡 / 4 写入失败
 //          5 回读校验失败 / 6 卡号无效 / 7 不支持
@@ -198,7 +205,9 @@ static class Program
                 case "hour":
                     rc = r.IssueGuestHour(room, o.Hours <= 0 ? 1 : o.Hours, policy, cardNo, out info);
                     break;
-                case "master": rc = r.IssueMaster(policy, cardNo, out info); break;
+                case "master":
+                    rc = r.IssueMaster(o.Days <= 0 ? 1 : o.Days, o.Hours, policy, cardNo, out info);
+                    break;
                 case "reset": rc = r.IssueReset(policy, cardNo, out info); break;
                 case "clear": rc = r.IssueClear(policy, cardNo, out info); break;
                 case "install": rc = r.IssueInstall(room, out info); break;
@@ -508,15 +517,17 @@ static class Program
     {
         Console.WriteLine("PMSLockCard — TEMIC 门锁卡工具");
         Console.WriteLine("  read [--json]");
-        Console.WriteLine("  issue --room 220 --days 1     [--serial 2448] [--json] [--reuse]");
-        Console.WriteLine("  issue --room 220 --hours 3");
-        Console.WriteLine("  issue --type master|reset|clear");
-        Console.WriteLine("  issue --type install --room 220");
-        Console.WriteLine("  issue --type checkout --hour 12");
-        Console.WriteLine("  issue --raw --p1 5BEC492B --p2 13BF22AB");
+        Console.WriteLine("  issue --type guest --room-index 15 --seq 3 --datetime \"2026-11-09 14:30\" --days 1");
+        Console.WriteLine("  issue --type guest --room-index 15 --seq 4 --datetime \"2026-11-09 14:30\" --hours 3");
+        Console.WriteLine("  issue --type master --serial 4B86 --days 30     （hours 优先于 days）");
+        Console.WriteLine("  issue --type reset|clear --serial 4B87");
+        Console.WriteLine("  issue --type checkout --hour 12 --serial 4B89");
+        Console.WriteLine("  issue --type timesync --serial 4B8A --datetime \"2026-11-09 15:30\"");
+        Console.WriteLine("  issue --type install --room-index 15           （安装卡不需要卡号）");
+        Console.WriteLine("  issue --type raw --p1 5BEC492B --p2 13BF22AB");
         Console.WriteLine("  selftest                       纯字节自检（不需读卡器）");
         Console.WriteLine("  ports                          扫描可用串口");
-        Console.WriteLine("  其它: --port N  --dir 驱动目录  --ini 配置文件");
+        Console.WriteLine("  其它: --port N  --dir 驱动目录  --ini 配置文件  --lost 挂失卡");
     }
 }
 

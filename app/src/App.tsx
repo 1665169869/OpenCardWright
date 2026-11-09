@@ -363,7 +363,7 @@ export default function App() {
         style={{
           background: '#fff',
           borderBottom: '1px solid #f0f0f0',
-          // 顶栏固定：内容滚动时水位 / 到期提醒 / 角色始终可见（TD-108）
+          // 顶栏固定：内容滚动时到期提醒、设备状态与角色始终可见（TD-108）
           position: 'sticky',
           top: 0,
           zIndex: 10,
