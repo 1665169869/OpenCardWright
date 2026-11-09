@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Button, Descriptions, Empty, Modal, Select, Space, Tag, Typography } from 'antd'
-import { LeftOutlined, RightOutlined } from '@ant-design/icons'
+import { LeftOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
 import {
   api,
@@ -36,14 +36,17 @@ const BLOCK_COLORS = [
 const blockColor = (id: number): string =>
   BLOCK_COLORS[Math.abs(Math.trunc(id)) % BLOCK_COLORS.length]
 
-/** 每房最新有效客卡的入住信息（TD-120）：色块日期 + 点击详情所需字段 */
+/** 每房一段入住信息；同一房间可有多段（含已退房历史）。 */
 type GuestSpan = {
+  id: number
   start: string
   end: string
   guestName: string | null
   kind: string
   days: number
   hours: number
+  plannedEnd: string
+  checkedOut: boolean
   expiresAt: string
 }
 
@@ -76,6 +79,7 @@ export default function RoomCalendar({
   roomTypes,
   statuses,
   onReserve,
+  onNewReservation,
   onEdit,
 }: {
   /** 全量在用房间；日历用自己的房型筛选，不跟随房间页（TD-204） */
@@ -84,6 +88,8 @@ export default function RoomCalendar({
   roomTypes: RoomType[]
   /** 房态定义（label / 颜色），房号列直接显示当前房态 tag */
   statuses: RoomStatus[]
+  /** 顶部「新增预定」：不依赖具体房间，弹窗内选择房间 */
+  onNewReservation: () => void
   /** 空白格点击：预定该房该天 */
   onReserve: (room: Room, date: string) => void
   /** 色块点击：改期 / 取消 */
@@ -108,7 +114,7 @@ export default function RoomCalendar({
   /** 入住时段（TD-116）：每房最新一张有效客卡的 [发卡日本地, 到期日本地] + 详情字段（TD-120）。
    *  数据来自 list_issuances（与记录页同一口径），按房取 createdAt 最新一条。
    *  声明提前到 days 之前：溢出天数计算要用它。 */
-  const [guestSpans, setGuestSpans] = useState<Record<string, GuestSpan>>({})
+  const [guestSpans, setGuestSpans] = useState<Record<string, GuestSpan[]>>({})
   /** 入住详情（TD-120）：点入住色块弹出；纯展示无操作 */
   const [stayDetail, setStayDetail] = useState<{ roomNo: string; span: GuestSpan } | null>(null)
 
@@ -132,7 +138,7 @@ export default function RoomCalendar({
       if (edge > farthest) farthest = edge
     }
     for (const r of list) if (r.status === 'booked') scan(r.checkOut)
-    for (const v of Object.values(guestSpans)) scan(v.end)
+    for (const spans of Object.values(guestSpans)) for (const v of spans) scan(v.end)
     // 溢出 = 超出「前导 1 格 + 当月 n 格」的部分
     const spill = Math.max(0, farthest - (n + 1))
     return Math.max(1, Math.min(7, spill))
@@ -155,7 +161,7 @@ export default function RoomCalendar({
   useEffect(() => {
     let alive = true
     api
-      .listReservations(from, queryTo)
+      .listReservations(leadDay, queryTo)
       .then((r) => {
         if (alive) setList(r)
       })
@@ -174,105 +180,83 @@ export default function RoomCalendar({
 
   useEffect(() => {
     let alive = true
-    // dayjs 默认按本地时区显示：带 Z 的 ISO 串 format 出来就是本地日期
-    const localDay = (iso: string) => dayjs(iso).format('YYYY-MM-DD')
-    // 归属日（TD-125）：凌晨 00:00–05:59 办理入住归属前一晚（夜审惯例）。
-    // 只影响日历展示 —— created_at / expires_at 数据不动（TD-126 后 end 已是退房日）。
-    const ownedDay = (iso: string) => {
-      const d = dayjs(iso)
-      return (d.hour() < 6 ? d.subtract(1, 'day') : d).format('YYYY-MM-DD')
-    }
-    const load = async () => {
-      try {
-        const [d, h] = await Promise.all([
-          api.listIssuances({ kind: '日租客卡', page: 1, pageSize: 200 }),
-          api.listIssuances({ kind: '钟点客卡', page: 1, pageSize: 200 }),
-        ])
+    api
+      .listGuestStays(leadDay, queryTo)
+      .then((rows) => {
         if (!alive) return
-        const now = Date.now()
-        const best: Record<string, GuestSpan & { at: string }> = {}
-        for (const r of [...d.rows, ...h.rows]) {
-          if (
-            !r.roomNo ||
-            r.result !== 'ok' ||
-            r.checkedOutAt !== null ||
-            !r.expiresAt ||
-            Date.parse(r.expiresAt) <= now
-          ) {
-            continue
-          }
-          const cur = best[r.roomNo]
-          if (!cur || r.createdAt > cur.at) {
-            best[r.roomNo] = {
-              start: ownedDay(r.createdAt),
-              end: localDay(r.expiresAt),
-              guestName: r.guestName,
-              kind: r.kind,
-              days: r.days,
-              hours: r.hours,
-              expiresAt: r.expiresAt,
-              at: r.createdAt,
-            }
-          }
+        const grouped: Record<string, GuestSpan[]> = {}
+        for (const s of rows) {
+          ;(grouped[s.roomNo] ??= []).push({
+            id: s.id,
+            start: s.start,
+            end: s.end,
+            guestName: s.guestName,
+            kind: s.kind,
+            days: s.days,
+            hours: s.hours,
+            plannedEnd: s.plannedEnd,
+            checkedOut: s.checkedOut,
+            expiresAt: s.plannedEnd,
+          })
         }
-        // 多出的 at 字段（排序用）对消费方无影响
-        setGuestSpans(best)
-      } catch {
+        setGuestSpans(grouped)
+      })
+      .catch(() => {
         // 拉取失败不挡日历：只是没有入住色块
-      }
-    }
-    void load()
+      })
     return () => {
       alive = false
     }
-  }, [reloadToken])
+  }, [leadDay, queryTo, reloadToken])
 
   const resOf = (roomNo: string) =>
     list.filter((r) => r.roomNo === roomNo)
 
   /** 该房**今天**是否有有效预定（TD-114 状态 tag）：
    *  用日历已拉的当月 list 判定，不新增查询。 */
-  const bookedToday = (room: Room) =>
-    list.some(
-      (r) =>
-        r.roomNo === room.roomNo &&
-        r.status === 'booked' &&
-        r.checkIn <= today &&
-        r.checkOut > today,
-    )
+  /** 间夜列 D = [D 12:00, D+1 12:00)；所有预定归属/色块共用。 */
+  const nightStart = (d: dayjs.Dayjs) => d.hour(12).minute(0).second(0).millisecond(0)
+  const nightOverlap = (start: dayjs.Dayjs, end: dayjs.Dayjs, col: dayjs.Dayjs) =>
+    start.isBefore(nightStart(col).add(1, 'day')) && end.isAfter(nightStart(col))
+
+  const bookedToday = (room: Room) => {
+    return list.some((r) => {
+      if (r.roomNo !== room.roomNo || r.status !== 'booked') return false
+      const start = dayjs(`${r.checkIn}T${r.checkInTime}`)
+      const end = dayjs(`${r.checkOut}T${r.checkOutTime}`)
+      return nightOverlap(start, end, dayjs(today))
+    })
+  }
+
+  /** 半格占用框：入住日从右半格起，退房日到左半格止。
+   *  [s, e] 是占用的连续列区间，e 为开区间终点；
+   *  5→6 一格显示为 5 右半 + 6 左半，5→7 为 5 右半 + 6 整格 + 7 左半。 */
+  const occupancyBox = (s: number, e: number, sameDay = false) =>
+    sameDay
+      ? { left: s * COL_W + 2, width: COL_W / 2 - 4 }
+      : {
+          left: s * COL_W + COL_W / 2 + 2,
+          width: (e - s) * COL_W - 4,
+        }
 
   /** 色块在视窗内的连续坐标（单位=格，可带 0.5 半格）：
    *  终点 = 退房日格子的**中点**（TD-110 半格错位：张三 6→7 只画到 7 号格左半），
    *  起点 = 入住日格子左缘（前序退房日衔接时改中点，见下方 startHalf）。
    *  2026-11-06 用户要求退房日当天也显示，但相邻预定不能在同一列叠放。 */
   const spanOf = (r: Reservation): [number, number] | null => {
-    // 退房日 +1 天；与视窗 [leadDay, to) 相交才画（TD-123：左界含前导列）
-    const checkoutNext = dayjs(r.checkOut).add(1, 'day').format('YYYY-MM-DD')
-    if (r.checkIn >= to || checkoutNext <= leadDay) return null
-
-    // 起点：入住日 < 前导列从 0 起；否则列 index = diff(month) + 1（前导列偏移，TD-123），
-    // 衔接时退半格
-    let startPos = 0
-    if (r.checkIn >= from) {
-      startPos = dayjs(r.checkIn).diff(month, 'day') + 1
-      // 衔接半格（TD-110）：同房前序预定退房日 = 本条入住日（张三 7 号退、李四 7 号入），
-      // 本条从该格中点起画，前条占左半、本条占右半，同日退+入不叠放。
-      const handover = list.some(
-        (o) =>
-          o.id !== r.id &&
-          o.roomNo === r.roomNo &&
-          o.status === 'booked' &&
-          o.checkOut === r.checkIn,
-      )
-      if (handover) startPos += 0.5
-    }
-
-    // 终点：退房日跨月（checkoutNext > 次月1日）画到本月右缘；
-    // 退房日在视窗内则落在退房日格的中点（含退房日 = 月末的情况）
-    const endPos =
-      checkoutNext > to ? days.length : dayjs(checkoutNext).diff(month, 'day') + 1 - 0.5
-
-    return startPos < endPos ? [startPos, endPos] : null
+    // 间夜列定义：日期 D 的列 = [D 12:00, D+1 12:00)；入住/退房时间都不能省略。
+    const start = dayjs(`${r.checkIn}T${r.checkInTime}`)
+    const end = dayjs(`${r.checkOut}T${r.checkOutTime}`)
+    if (!end.isAfter(start)) return null
+    let startPos = -1
+    let endPos = -1
+    days.forEach((d, idx) => {
+      if (nightOverlap(start, end, d)) {
+        if (startPos < 0) startPos = idx
+        endPos = idx + 1
+      }
+    })
+    return startPos >= 0 && startPos < endPos ? [startPos, endPos] : null
   }
 
   /** 入住色块坐标（TD-116/123）：区间 [归属日, 到期日]（含到期日当天，锁按首刷起算），
@@ -283,8 +267,11 @@ export default function RoomCalendar({
     const endNext = dayjs(span.end).add(1, 'day').format('YYYY-MM-DD')
     if (span.start >= to || endNext <= leadDay) return null
     const startPos = span.start >= from ? dayjs(span.start).diff(month, 'day') + 1 : 0
-    const endPos = endNext > to ? days.length : dayjs(endNext).diff(month, 'day') + 1
-    return startPos < endPos ? [startPos, endPos] : null
+    // 退房/到期日也画左半格：终点用退房日，而不是退房日的次日。
+    const endPos = span.end >= to ? days.length : dayjs(span.end).diff(month, 'day') + 1
+    if (startPos < endPos) return [startPos, endPos]
+    // 同一天入住/到期：只占当天一格，避免首尾两个半格叠在一起。
+    return startPos < days.length ? [startPos, startPos + 1] : null
   }
 
   const gridWidth = days.length * COL_W
@@ -302,6 +289,9 @@ export default function RoomCalendar({
           下月
         </Button>
         <Button onClick={() => setMonth(dayjs().startOf('month'))}>回到今天</Button>
+        <Button type="primary" icon={<PlusOutlined />} onClick={onNewReservation}>
+          新增预定
+        </Button>
         <Select
           value={typeFilter === 'all' ? 'all' : typeFilter === 'none' ? 'none' : String(typeFilter)}
           onChange={(v) => setTypeFilter(v === 'all' || v === 'none' ? v : Number(v))}
@@ -521,29 +511,30 @@ export default function RoomCalendar({
 
                     {/* 入住色块（TD-116/120）：有效客卡的发卡日 → 到期日，浅绿垫底；
                         点击弹入住详情；预定色块 zIndex 更高在上层，两者互不干扰 */}
-                    {(() => {
-                      const span = guestSpans[room.roomNo]
-                        ? guestSpanOf(guestSpans[room.roomNo])
-                        : null
+                    {(guestSpans[room.roomNo] ?? []).map((g) => {
+                      const span = guestSpanOf(g)
                       if (!span) return null
                       const [s, e] = span
-                      const g = guestSpans[room.roomNo]
                       return (
                         <div
-                          title={`${room.roomNo} 入住中 · ${g.start} → ${g.end}（点击查看入住详情）`}
+                          key={g.id}
+                          title={`${room.roomNo} ${g.checkedOut ? '历史入住' : '入住中'} · ${g.start} → ${g.end}（点击查看入住详情）`}
                           onClick={(ev) => {
                             ev.stopPropagation()
                             setStayDetail({ roomNo: room.roomNo, span: g })
                           }}
                           style={{
                             position: 'absolute',
-                            left: s * COL_W + 2,
-                            width: (e - s) * COL_W - 4,
+                            ...occupancyBox(s, e, g.start === g.end),
                             top: 4,
                             height: ROW_H - 8,
                             borderRadius: 4,
-                            background: 'rgba(82, 196, 26, 0.16)',
-                            border: '1px solid rgba(82, 196, 26, 0.45)',
+                            background: g.checkedOut
+                              ? 'rgba(0, 0, 0, 0.05)'
+                              : 'rgba(82, 196, 26, 0.16)',
+                            border: g.checkedOut
+                              ? '1px dashed rgba(0, 0, 0, 0.25)'
+                              : '1px solid rgba(82, 196, 26, 0.45)',
                             cursor: 'pointer',
                             zIndex: 0,
                             overflow: 'hidden',
@@ -551,31 +542,31 @@ export default function RoomCalendar({
                             fontSize: 13,
                             lineHeight: `${ROW_H - 8}px`,
                             padding: '0 48px 0 8px',
-                            color: '#389e0d',
+                            color: g.checkedOut ? '#8c8c8c' : '#389e0d',
                             ...truncMask(e, days.length),
                           }}
                         >
-                          {/* 角标（TD-117）：右上角小号「入住中」 */}
-                          <span
-                            style={{
-                              position: 'absolute',
-                              top: 2,
-                              right: 2,
-                              fontSize: 10,
-                              lineHeight: '14px',
-                              padding: '0 4px',
-                              borderRadius: 3,
-                              background: 'rgba(82, 196, 26, 0.35)',
-                              color: '#fff',
-                            }}
-                          >
-                            入住中
-                          </span>
-                          {/* 有客人姓名就只显示姓名（用户要求）；没姓名才显示入住日期区间 */}
+                          {!g.checkedOut ? (
+                            <span
+                              style={{
+                                position: 'absolute',
+                                top: 2,
+                                right: 2,
+                                fontSize: 10,
+                                lineHeight: '14px',
+                                padding: '0 4px',
+                                borderRadius: 3,
+                                background: 'rgba(82, 196, 26, 0.35)',
+                                color: '#fff',
+                              }}
+                            >
+                              入住中
+                            </span>
+                          ) : null}
                           {g.guestName ? g.guestName : `入住 ${shortRange(g.start, g.end)}`}
                         </div>
                       )
-                    })()}
+                    })}
 
                     {/* 预定色块：绝对定位跨格，点击改期 / 取消 */}
                     {resOf(room.roomNo).map((r) => {
@@ -599,15 +590,14 @@ export default function RoomCalendar({
                                   onEdit(r)
                                 }
                           }
-                          title={`${room.roomNo} · ${r.checkIn} → ${r.checkOut}${
+                          title={`${room.roomNo} · ${r.checkIn} ${r.checkInTime} → ${r.checkOut} ${r.checkOutTime}${
                             r.guestName ? ` · ${r.guestName}` : ''
                           }${r.note ? ` · 备注：${r.note}` : ''}${
                             locked ? '（已结束，不可修改）' : '（点击改期 / 取消）'
                           }`}
                           style={{
                             position: 'absolute',
-                            left: s * COL_W + 2,
-                            width: (e - s) * COL_W - 4,
+                            ...occupancyBox(s, e, r.checkIn === r.checkOut),
                             top: 4,
                             height: ROW_H - 8,
                             borderRadius: 4,

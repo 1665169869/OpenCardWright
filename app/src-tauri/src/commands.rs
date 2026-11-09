@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 
 use crate::cardno;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -83,7 +83,12 @@ pub struct AppInfo {
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum RecordLookup {
-    Found { latest: IssuanceRecord, count: u32 },
+    Found {
+        latest: IssuanceRecord,
+        count: u32,
+        /// raw = 按卡内数据匹配；timestamp = 回退按卡号时间戳匹配
+        matched_by: String,
+    },
     NotFound,
     NotApplicable { reason: String },
     Failed { message: String },
@@ -170,6 +175,27 @@ fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLook
         }
     };
 
+    // 卡内原始数据是业务上的“卡内容凭据”，优先于卡号时间戳。
+    if !card.raw_hex.trim().is_empty() {
+        match ocw_store::find_issuance_by_raw(&conn, &card.raw_hex, kind, room_no.as_deref()) {
+            Ok(Some(m)) if m.active => {
+                return RecordLookup::Found {
+                    latest: m.latest,
+                    count: m.count,
+                    matched_by: "raw".into(),
+                }
+            }
+            Ok(_) => {
+                // 有同内容记录但都不再有效：继续走时间戳兜底，再决定 NotFound。
+            }
+            Err(e) => {
+                return RecordLookup::Failed {
+                    message: e.to_string(),
+                }
+            }
+        }
+    }
+
     let (day, hour, seq) = crate::cardno::decode(card_no);
     match ocw_store::find_issuance_by_stamp(
         &conn,
@@ -179,7 +205,11 @@ fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLook
         hour,
         seq,
     ) {
-        Ok(Some(latest)) if latest.result == "ok" => RecordLookup::Found { latest, count: 1 },
+        Ok(Some(latest)) if latest.result == "ok" => RecordLookup::Found {
+            latest,
+            count: 1,
+            matched_by: "timestamp".into(),
+        },
         Ok(_) => RecordLookup::NotFound,
         Err(e) => RecordLookup::Failed {
             message: e.to_string(),
@@ -534,6 +564,30 @@ pub enum AdminCardRequest {
     Blank,
 }
 
+/// 管理卡里需要写时间戳卡号的类型：总控/复位/清除/退房钟点/校时。
+fn admin_card_needs_timestamp(req: &AdminCardRequest) -> bool {
+    matches!(
+        req,
+        AdminCardRequest::Master { .. }
+            | AdminCardRequest::Reset
+            | AdminCardRequest::Clear
+            | AdminCardRequest::Checkout { .. }
+            | AdminCardRequest::TimeSync { .. }
+    )
+}
+
+/// 校时卡指定 `at` 时，卡号与页2[3] 年月都用这个时刻；其他管理卡用当前时间。
+fn admin_card_timestamp_at(req: &AdminCardRequest) -> chrono::DateTime<Local> {
+    if let AdminCardRequest::TimeSync { at: Some(s), .. } = req {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+            if let Some(dt) = Local.from_local_datetime(&naive).single() {
+                return dt;
+            }
+        }
+    }
+    Local::now()
+}
+
 impl AdminCardRequest {
     fn label(&self) -> &'static str {
         match self {
@@ -591,15 +645,10 @@ impl AdminCardRequest {
                 a.push("--hour".into());
                 a.push(hour.to_string());
             }
-            Self::TimeSync { hour, minute, at } => {
+            Self::TimeSync { hour, minute, .. } => {
                 a.push("--type".into());
                 a.push("timesync".into());
-                if let Some(at) = at {
-                    // 指定年月日+时分：CLI 的 `--at` 会同时驱动 `CardBuilder.Now`（页2[3] 年月）
-                    // 与卡号（时间戳编码），两者同源
-                    a.push("--at".into());
-                    a.push(at.clone());
-                } else if let (Some(h), Some(m)) = (hour, minute) {
+                if let (Some(h), Some(m)) = (hour, minute) {
                     if *h > 23 || *m > 59 {
                         return Err(CommandError::new(1, "时间不合法", "小时 0–23，分钟 0–59"));
                     }
@@ -660,10 +709,10 @@ pub async fn issue_admin_card(
 
     blocking(move || {
         let mut args = request.to_args()?;
-        // 总控卡写时间戳卡号（日/时/序号），读卡时才能按卡号反查发卡记录。
-        // 其他管理卡仍只按卡型识别，不消耗卡号。
-        if matches!(&request, AdminCardRequest::Master { .. }) {
-            let at = chrono::Local::now();
+        // 需要卡号的管理卡统一用卡号时间戳（日/时/序号），与客卡同一套编码；
+        // 固定号会低于门锁水位，不能再使用。
+        if admin_card_needs_timestamp(&request) {
+            let at = admin_card_timestamp_at(&request);
             let card_no =
                 cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_at(at);
             args.push("--serial".into());
@@ -1499,7 +1548,9 @@ pub async fn create_reservation(
     state: State<'_, AppState>,
     room_no: String,
     check_in: String,
+    check_in_time: Option<String>,
     check_out: String,
+    check_out_time: Option<String>,
     guest_name: Option<String>,
     note: Option<String>,
 ) -> Result<ocw_store::Reservation, CommandError> {
@@ -1510,7 +1561,9 @@ pub async fn create_reservation(
         let input = ocw_store::ReservationInput {
             room_no,
             check_in,
+            check_in_time,
             check_out,
+            check_out_time,
             guest_name,
             note,
         };
@@ -1519,7 +1572,10 @@ pub async fn create_reservation(
             &conn,
             "create_reservation",
             Some(&r.room_no),
-            Some(&format!("{}→{}", r.check_in, r.check_out)),
+            Some(&format!(
+                "{} {}→{} {}",
+                r.check_in, r.check_in_time, r.check_out, r.check_out_time
+            )),
             "ok",
             Some(me.operator_id),
         );
@@ -1535,7 +1591,9 @@ pub async fn update_reservation(
     id: i64,
     room_no: String,
     check_in: String,
+    check_in_time: Option<String>,
     check_out: String,
+    check_out_time: Option<String>,
     guest_name: Option<String>,
     note: Option<String>,
 ) -> Result<ocw_store::Reservation, CommandError> {
@@ -1546,7 +1604,9 @@ pub async fn update_reservation(
         let input = ocw_store::ReservationInput {
             room_no,
             check_in,
+            check_in_time,
             check_out,
+            check_out_time,
             guest_name,
             note,
         };
@@ -1555,7 +1615,10 @@ pub async fn update_reservation(
             &conn,
             "update_reservation",
             Some(&r.room_no),
-            Some(&format!("{}→{}", r.check_in, r.check_out)),
+            Some(&format!(
+                "{} {}→{} {}",
+                r.check_in, r.check_in_time, r.check_out, r.check_out_time
+            )),
             "ok",
             Some(me.operator_id),
         );
@@ -2054,9 +2117,11 @@ pub async fn checkout_card(
     let me = require_login(&state)?;
     let skip_device = no_device.unwrap_or(false);
     let device = state.device();
+    let db = state.db.clone();
 
-    // (房号, 卡型, 日, 时, 序号)：持卡退房时用于按时间戳反查记录
-    let mut stamp: Option<(String, &'static str, u16, u16, u16)> = None;
+    // 持卡退房先完成 raw / 时间戳匹配，再擦卡；避免 TD-212 的“先擦后查失败”。
+    let mut matched_id: Option<i64> = None;
+    let mut matched_by = "timestamp";
     if !skip_device {
         let card_no = card_no.ok_or_else(|| CommandError::new(1, "没有读到卡号", "重新读卡"))?;
         let on_card = device.read_card()?;
@@ -2083,9 +2148,43 @@ pub async fn checkout_card(
             CommandError::new(1, "卡片没有房号", "确认卡是本系统发的；手上没卡请改用无卡退房")
         })?;
         let (day, hour, seq) = cardno::decode(card_no);
-        stamp = Some((room_no, kind, day, hour, seq));
 
-        // 持卡退房（TD-124）：先擦卡、后改库；模拟设备没有真实读写闭环，只做尽力擦卡。
+        // 1) 优先按卡内原始数据匹配；同一 raw_hex 取最新有效记录。
+        let raw_match = {
+            let conn = lock_db(&db)?;
+            ocw_store::find_issuance_by_raw(&conn, &on_card.raw_hex, kind, Some(&room_no))?
+        };
+        if let Some(m) = raw_match {
+            if m.active {
+                matched_id = Some(m.latest.id);
+                matched_by = "raw";
+            }
+        }
+        // 2) 旧记录 raw_hex 为空时回退时间戳；仍要求记录有效。
+        if matched_id.is_none() {
+            let legacy = {
+                let conn = lock_db(&db)?;
+                ocw_store::find_issuance_by_stamp(&conn, Some(&room_no), kind, day, hour, seq)?
+            };
+            if let Some(r) = legacy {
+                let active = {
+                    let conn = lock_db(&db)?;
+                    ocw_store::issuance_is_active(&conn, r.id)?
+                };
+                if active {
+                    matched_id = Some(r.id);
+                }
+            }
+        }
+        if matched_id.is_none() && issuance_id.is_none() {
+            return Err(CommandError::new(
+                1,
+                "没有找到这张卡的有效发卡记录",
+                "卡内数据没有匹配到本机记录；请确认是否本系统发出，或改用「无卡退房」",
+            ));
+        }
+
+        // 持卡退房（TD-124）：匹配成功后再擦卡；模拟设备只做尽力擦卡。
         if device.is_sim() {
             let _ = device.erase_card();
         } else {
@@ -2101,25 +2200,15 @@ pub async fn checkout_card(
         }
     }
 
-    let db = state.db.clone();
     blocking(move || {
         let conn = lock_db(&db)?;
         let dirty = ocw_store::checkout_status(&conn)?;
         let id = if let Some(id) = issuance_id {
             id
         } else {
-            let (room_no, kind, day, hour, seq) = stamp.ok_or_else(|| {
+            matched_id.ok_or_else(|| {
                 CommandError::new(1, "没有可退的记录", "重新读卡或改用无卡退房")
-            })?;
-            ocw_store::find_issuance_by_stamp(&conn, Some(&room_no), kind, day, hour, seq)?
-                .ok_or_else(|| {
-                    CommandError::new(
-                        1,
-                        "没有找到这张卡的发卡记录",
-                        "可能不是本系统发的卡，改用无卡退房",
-                    )
-                })?
-                .id
+            })?
         };
         let Some((room_no, remaining)) = ocw_store::checkout_issuance(&conn, id, &dirty)? else {
             return Err(CommandError::new(
@@ -2133,7 +2222,7 @@ pub async fn checkout_card(
             "checkout_card",
             Some(&room_no),
             Some(&format!(
-                "remaining={remaining} erased={}",
+                "remaining={remaining} erased={} matchedBy={matched_by}",
                 if skip_device { 0 } else { 1 }
             )),
             "ok",
@@ -3064,6 +3153,21 @@ pub async fn list_issuances(
 }
 
 #[tauri::command]
+pub async fn list_guest_stays(
+    state: State<'_, AppState>,
+    from: String,
+    to: String,
+) -> Result<Vec<ocw_store::GuestStay>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::list_guest_stays(&conn, &from, &to)?)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn list_audits(
     state: State<'_, AppState>,
     action: Option<String>,
@@ -3513,6 +3617,39 @@ mod tests {
         let req: AdminCardRequest = serde_json::from_str(r#"{"kind":"master","days":63}"#).unwrap();
         assert_eq!(args(req), vec!["--type", "master", "--days", "63"]);
     }
+
+    #[test]
+    fn admin_management_cards_use_timestamp_card_numbers() {
+        let cases = [
+            AdminCardRequest::Reset,
+            AdminCardRequest::Clear,
+            AdminCardRequest::Checkout { hour: 12 },
+            AdminCardRequest::TimeSync {
+                hour: None,
+                minute: None,
+                at: None,
+            },
+        ];
+        for req in cases {
+            assert!(
+                admin_card_needs_timestamp(&req),
+                "{req:?} 应由 issue_admin_card 追加时间戳卡号"
+            );
+            let args = req.to_args().unwrap();
+            assert!(
+                !args.windows(2).any(|w| w[0] == "--serial"),
+                "to_args 不应再写固定卡号: {args:?}"
+            );
+        }
+        assert!(!admin_card_needs_timestamp(&AdminCardRequest::Install {
+            room_no: "220".into()
+        }));
+        assert!(!admin_card_needs_timestamp(&AdminCardRequest::Blank));
+        assert!(!admin_card_needs_timestamp(&AdminCardRequest::Raw {
+            p1: "00000000".into(),
+            p2: "00000000".into()
+        }));
+    }
     // ---------------- 角色鉴权：命令 × 角色矩阵 ----------------
 
     /// 命令应具备的校验级别。
@@ -3554,6 +3691,7 @@ mod tests {
         ("get_checkout_hour", Level::Login),
         ("expiring_cards", Level::Login),
         ("list_issuances", Level::Login),
+        ("list_guest_stays", Level::Login),
         ("list_audits", Level::Login),
         ("get_onboarding_status", Level::Login),
         ("list_reservations", Level::Login),
@@ -3691,8 +3829,8 @@ mod tests {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (35, 28, 7));
-        assert_eq!(command_bodies().len(), 70, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (35, 29, 7));
+        assert_eq!(command_bodies().len(), 71, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {

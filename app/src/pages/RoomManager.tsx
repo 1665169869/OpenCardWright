@@ -554,7 +554,14 @@ export default function RoomManager({
     try {
       const [today, tomorrow] = localDays()
       const list = await api.listReservations(today, tomorrow, roomNo)
-      return list.filter((r) => r.status === 'booked')
+      const colStart = `${today}T12:00`
+      const colEnd = `${tomorrow}T12:00`
+      return list.filter(
+        (r) =>
+          r.status === 'booked' &&
+          `${r.checkIn}T${r.checkInTime}` < colEnd &&
+          `${r.checkOut}T${r.checkOutTime}` > colStart,
+      )
     } catch {
       return []
     }
@@ -565,8 +572,15 @@ export default function RoomManager({
   const cancelTodaysReservations = async (roomNos: string[]) => {
     const [today, tomorrow] = localDays()
     const all = await api.listReservations(today, tomorrow)
+    const colStart = `${today}T12:00`
+    const colEnd = `${tomorrow}T12:00`
     for (const r of all) {
-      if (r.status === 'booked' && roomNos.includes(r.roomNo)) {
+      if (
+        r.status === 'booked' &&
+        roomNos.includes(r.roomNo) &&
+        `${r.checkIn}T${r.checkInTime}` < colEnd &&
+        `${r.checkOut}T${r.checkOutTime}` > colStart
+      ) {
         await api.cancelReservation(r.id)
       }
     }
@@ -643,6 +657,7 @@ export default function RoomManager({
   const [reserveInitialDate, setReserveInitialDate] = useState<string | null>(null)
   /** 每次打开 +1 当 key，强制重挂载弹窗（HMR 会保留组件 state） */
   const [reserveSession, setReserveSession] = useState(0)
+  const [reserveOpen, setReserveOpen] = useState(false)
   /** 房间格子视图 / 房态日历（TD-203） */
   const [viewMode, setViewMode] = useState<'rooms' | 'calendar'>('rooms')
 
@@ -650,15 +665,26 @@ export default function RoomManager({
     setReserveEditing(null)
     setReserveInitialDate(date ?? null)
     setReserveTarget(room)
+    setReserveOpen(true)
+    setReserveSession((n) => n + 1)
+  }
+  /** 日历顶部「新增预定」：不预设房间，弹窗内选择。 */
+  const openNewReserve = () => {
+    setReserveEditing(null)
+    setReserveTarget(null)
+    setReserveInitialDate(null)
+    setReserveOpen(true)
     setReserveSession((n) => n + 1)
   }
   const openEditReserve = (r: Reservation) => {
     setReserveEditing(r)
     setReserveTarget(null)
     setReserveInitialDate(null)
+    setReserveOpen(true)
     setReserveSession((n) => n + 1)
   }
   const closeReserve = () => {
+    setReserveOpen(false)
     setReserveTarget(null)
     setReserveEditing(null)
     setReserveInitialDate(null)
@@ -917,6 +943,7 @@ export default function RoomManager({
               rooms={liveRooms}
               roomTypes={roomTypes}
               statuses={statuses}
+              onNewReservation={openNewReserve}
               onReserve={(room, date) => openReserve(room, date)}
               onEdit={openEditReserve}
             />
@@ -1371,7 +1398,8 @@ export default function RoomManager({
       {/* 预定：新建（房间卡片按钮）/ 改期取消（日历色块点开） */}
       <ReservationModal
         key={`reserve-${reserveSession}`}
-        open={reserveTarget !== null || reserveEditing !== null}
+        open={reserveOpen}
+        rooms={liveRooms}
         room={reserveTarget}
         editing={reserveEditing}
         initialDate={reserveInitialDate}

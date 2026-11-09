@@ -174,10 +174,18 @@ PMSLockCard.exe selftest
   不要把“没跑过命令”当成验证通过。
 - **`cargo` 不在 PATH**（PowerShell / cmd 都找不到）：本机绝对路径
   `C:\Users\Administrator\.cargo\bin\cargo.exe`。测试要在 `app/src-tauri/` 内跑（仓库根没有 `Cargo.toml`）。
-- **`D8050` 与中文路径无关**：真因是 `libsqlite3-sys` 编 `sqlite3.c` 时命令行过长。`app/` 内所有
-  cargo 构建/测试都设 `CARGO_TARGET_DIR=C:\ocw-target` + `DEBUG=false`（见 `app/README.md` §4）。
+- **`D8050` 与中文路径无关**：真因是 `libsqlite3-sys` 编 `sqlite3.c` 时命令行过长。项目现在
+  **不再覆盖** `CARGO_TARGET_DIR` / `DEBUG`，统一使用 Tauri/Cargo 默认的 `app/src-tauri/target`。
+  若本机默认 target 仍触发 D8050，作为本机环境问题单独处理，不要写回仓库脚本。
 - 驱动版本敏感：结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
+- **版本号**：每次有代码、行为或用户可见文档变动，都要提升 `app` 的构建号，并同步
+  `app/package.json`、`app/src-tauri/Cargo.toml`、`app/src-tauri/tauri.conf.json`、
+  `app/src-tauri/Cargo.lock`，同时在 `CHANGELOG.md` 记录本版结论。
+  当前格式 `26.M.DDD`：主版本 = 年份−2000（MSI/WiX 要求主版本 ≤ 255，`2026.x` 会报
+  `app version major number cannot be greater than 255`），次版本 = 月份，
+  补丁号 = **日×100 + 当日构建序号**（如 11 月 9 日第 62 号 → `26.11.962`），每月进次版本。
+  不要只改一个位置；版本号不一致会导致安装包、关于页和 Cargo 产物对不上。
 - 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
   **未明确要求不得提交**：除非用户当轮明确说要「提交 / commit / 推送」，否则只改工作区、在回复里列出改动，
   **不要 `git add` / `git commit` / `git push`**；需要提交时先给 `git status` 摘要等用户点头。
@@ -197,7 +205,7 @@ PMSLockCard.exe selftest
 | `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
 | 回归口径 | `sdk` 自带的 46 项自检；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
 | 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build` |
-| 编译环境坑 | MSVC `D8050` 是 **命令行过长**（`sqlite3.c`），不是中文路径：所有 cargo 构建/测试都设 `CARGO_TARGET_DIR=C:\ocw-target` + `DEBUG=false`。详见 `app/README.md` §4 |
+| 编译环境坑 | MSVC `D8050` 是 **命令行过长**（`sqlite3.c`），不是中文路径；项目使用 Cargo/Tauri 默认 target，不覆盖 `CARGO_TARGET_DIR` / `DEBUG`。详见 `app/README.md` §4 |
 
 新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准，不要套用本文件的 csc 构建命令。
 
@@ -230,8 +238,6 @@ pnpm tauri build    # 出 NSIS 安装包；不要用 cargo build --release（出
 测试在 `src-tauri/` 内跑，几种粒度都常用：
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 短路径，避免 D8050（命令行过长）
-$env:DEBUG = 'false'                      # 让 cc-rs 不传 /Z7
 cargo test --workspace                                   # 全部；2026-11-09 实测 130 项全绿
 cargo test -p ocw-store                                  # 只跑存储层（51）
 cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件（5）

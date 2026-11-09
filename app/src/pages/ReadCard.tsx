@@ -72,10 +72,14 @@ function RecordBanner({ lookup }: { lookup: RecordLookup }) {
         <Alert
           type="success"
           showIcon
-          message={`已找到发卡记录（该卡共 ${lookup.count} 条记录）`}
+          message={`已找到发卡记录（同卡数据共 ${lookup.count} 条记录）`}
           description={
             <>
               <Space size="large" wrap>
+                <span>
+                  匹配方式：
+                  {lookup.matchedBy === 'raw' ? '按卡内数据匹配' : '按时间戳匹配'}
+                </span>
                 <span>发放时间：{formatTime(lookup.latest.createdAt)}</span>
                 {formatExpiry(lookup.latest.expiresAt) ? (
                   <span>{formatExpiry(lookup.latest.expiresAt)}</span>

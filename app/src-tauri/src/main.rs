@@ -220,6 +220,7 @@ fn main() {
             commands::import_backup_file,
             commands::export_diagnostics,
             commands::list_issuances,
+            commands::list_guest_stays,
             commands::list_audits,
             commands::export_issuances_csv,
             commands::import_rooms,

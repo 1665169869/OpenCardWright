@@ -1,13 +1,12 @@
 {
   "name": "opencardwright",
   "private": true,
-  "version": "2026.11.9+0057",
+  "version": "26.11.962",
   "type": "module",
   "description": "Open-source card issuing console for 125 kHz hotel door locks",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "build:sdk": "pwsh -NoProfile -File scripts/build-sdk.ps1",
-    "setup:nsis": "pwsh -NoProfile -File scripts/setup-nsis.ps1",
     "dev": "pnpm build:sdk && vite",
     "build": "pnpm build:sdk && tsc --noEmit && vite build",
     "preview": "vite preview",

@@ -1,6 +1,6 @@
 [package]
 name = "opencardwright"
-version = "2026.11.9+0057"
+version = "26.11.962"
 edition = "2021"
 rust-version = "1.77"
 license = "AGPL-3.0-or-later"

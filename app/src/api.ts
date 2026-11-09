@@ -105,7 +105,13 @@ export const GENDERS = ['男', '女'] as const
 
 /** 读卡页 B 区：记录查询的四种结果。数据库报错绝不能落到 notFound。 */
 export type RecordLookup =
-  | { status: 'found'; latest: IssuanceRecord; count: number }
+  | {
+      status: 'found'
+      latest: IssuanceRecord
+      count: number
+      /** raw = 按卡内数据匹配；timestamp = 按卡号时间戳匹配 */
+      matchedBy: 'raw' | 'timestamp'
+    }
   | { status: 'notFound' }
   | { status: 'notApplicable'; reason: string }
   | { status: 'failed'; message: string }
@@ -166,7 +172,9 @@ export interface Reservation {
   id: number
   roomNo: string
   checkIn: string
+  checkInTime: string
   checkOut: string
+  checkOutTime: string
   guestName: string | null
   note: string | null
   /** booked = 有效；checked_in = 已入住；cancelled = 已取消（保留记录） */
@@ -178,6 +186,20 @@ export interface Reservation {
 }
 
 /** 记录页预定查询条件（TD-167）：包含已取消 / 已入住；日期为入住日 YYYY-MM-DD */
+/** 日历入住时段（含已退房历史，TD-215/日历总览）。 */
+export interface GuestStay {
+  id: number
+  roomNo: string
+  guestName: string | null
+  kind: string
+  days: number
+  hours: number
+  start: string
+  end: string
+  plannedEnd: string
+  checkedOut: boolean
+}
+
 export interface ReservationFilter {
   roomNo?: string | null
   guestName?: string | null
@@ -513,14 +535,18 @@ export const api = {
   createReservation: (input: {
     roomNo: string
     checkIn: string
+    checkInTime?: string
     checkOut: string
+    checkOutTime?: string
     guestName?: string | null
     note?: string | null
   }) =>
     invoke<Reservation>('create_reservation', {
       roomNo: input.roomNo,
       checkIn: input.checkIn,
+      checkInTime: input.checkInTime ?? '12:00',
       checkOut: input.checkOut,
+      checkOutTime: input.checkOutTime ?? '12:00',
       guestName: input.guestName ?? null,
       note: input.note ?? null,
     }),
@@ -530,7 +556,9 @@ export const api = {
     input: {
       roomNo: string
       checkIn: string
+      checkInTime?: string
       checkOut: string
+      checkOutTime?: string
       guestName?: string | null
       note?: string | null
     },
@@ -539,7 +567,9 @@ export const api = {
       id,
       roomNo: input.roomNo,
       checkIn: input.checkIn,
+      checkInTime: input.checkInTime ?? '12:00',
       checkOut: input.checkOut,
+      checkOutTime: input.checkOutTime ?? '12:00',
       guestName: input.guestName ?? null,
       note: input.note ?? null,
     }),
@@ -577,6 +607,9 @@ export const api = {
   /** 用备份覆盖当前库（管理员）：先只读校验，再把当前库另存为 .before-restore-*.bak */
   restoreDatabase: (path: string) => invoke<RestoreResult>('restore_database', { path }),
   /** 发卡记录（登录即可，前台也要查） */
+  /** 日历入住时段：含已退房历史，按本地日期区间相交查询 */
+  listGuestStays: (from: string, to: string) =>
+    invoke<GuestStay[]>('list_guest_stays', { from, to }),
   listIssuances: (f: LogFilter) =>
     invoke<Page<IssuanceRow>>('list_issuances', {
       roomNo: f.roomNo ?? null,

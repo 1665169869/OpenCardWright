@@ -9,6 +9,7 @@ app/src-tauri/target/
 # 前端构建与打包产物
 app/dist/
 app/release/
+app/output/
 # Vite 依赖预构建缓存
 app/.vite/
 

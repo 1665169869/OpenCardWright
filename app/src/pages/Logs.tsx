@@ -630,8 +630,16 @@ function ReservationTab() {
             width: 110,
             render: (v: string | null) => v ?? '—',
           },
-          { title: '入住日', dataIndex: 'checkIn', width: 110 },
-          { title: '退房日', dataIndex: 'checkOut', width: 110 },
+          {
+            title: '入住',
+            width: 150,
+            render: (_: unknown, r: Reservation) => `${r.checkIn} ${r.checkInTime}`,
+          },
+          {
+            title: '退房',
+            width: 150,
+            render: (_: unknown, r: Reservation) => `${r.checkOut} ${r.checkOutTime}`,
+          },
           {
             title: '晚数',
             width: 70,

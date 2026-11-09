@@ -63,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_issuance_created ON issuance (created_at DESC);
 -- 记录页的筛选常用列（v7 内追加即可：迁移每次启动都会执行本文件，索引对读方透明）
 CREATE INDEX IF NOT EXISTS idx_issuance_room ON issuance (room_no);
 CREATE INDEX IF NOT EXISTS idx_issuance_kind ON issuance (kind);
+CREATE INDEX IF NOT EXISTS idx_issuance_raw_hex ON issuance (raw_hex);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,9 +137,11 @@ INSERT OR IGNORE INTO room_status (key, label, icon, color, sort_order) VALUES
 -- 同一房间的有效预定不允许日期重叠；取消保留记录（status='cancelled' + cancelled_at）。
 CREATE TABLE IF NOT EXISTS reservation (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    room_no      TEXT NOT NULL,
-    check_in     TEXT NOT NULL,
-    check_out    TEXT NOT NULL,
+    room_no       TEXT NOT NULL,
+    check_in      TEXT NOT NULL,
+    check_in_time TEXT NOT NULL DEFAULT '12:00',
+    check_out     TEXT NOT NULL,
+    check_out_time TEXT NOT NULL DEFAULT '12:00',
     guest_name   TEXT,
     note         TEXT,
     status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled', 'checked_in')),

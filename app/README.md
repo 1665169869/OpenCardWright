@@ -136,19 +136,30 @@ pnpm build:sdk      # 编译 ../sdk 并跑 selftest 门禁
 pnpm tauri dev
 ```
 
-打包：
+打包（WiX Toolset v3）：
 
 ```powershell
-pnpm tauri build    # 产出 NSIS 安装包
+pnpm tauri build --bundles msi   # 由 Tauri 调用 WiX v3 生成 MSI
 ```
 
-- 产物由 `CARGO_TARGET_DIR` 决定（本机 `C:\ocw-target\release\bundle\nsis\`——中文仓库路径的编译限制见下方坑 1）；
-- `app/output/` 存放构建产出的副本（该目录不入库，见 `.gitignore`）；
-- 构建产物为中文名 `门锁发卡台_2026.11.9+0057_x64-setup.exe`；**交付/安装时复制为纯 ASCII 文件名**
-  （如 `C:\ocw-setup\setup.exe`）再运行，避免中文文件名触发 NSIS
-  `Error writing temporary file. Make sure your temp folder is valid.`
-- `productName=门锁发卡台`：快捷方式、开始菜单、安装目录、卸载项与安装页面均为中文。
-  旧 ASCII `productName=OpenCardWright` 版本的安装目录不同，**先卸载旧版再装新版**。
+一键正式版（推荐）：在 `app/` 下运行
+
+```powershell
+pwsh -NoProfile -File build-release.ps1
+# 可选：
+# -OutputDir D:\delivery   指定交付目录（默认 app/output）
+# -SkipCopy                只构建，不复制交付副本
+# -WixBin "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+```
+
+前置条件：安装 **WiX Toolset v3**（需要 `candle.exe` / `light.exe`）。
+脚本会执行 `pnpm tauri build --bundles msi`，从
+`app/src-tauri/target/release/bundle/msi/` 收集 MSI 到 `app/output/`，
+输出 `OpenCardWright_<version>_x64.msi` 并打印 SHA-256。
+
+- 安装器为 MSI（WiX v3），不再使用 Inno Setup / NSIS；
+- 安装页面语言由 `tauri.conf.json` 的 `bundle.windows.wix.language` 控制；
+- 数据目录 `%ProgramData%\OpenCardWright\` 不随卸载删除。
 
 ### 两个环境坑（本机已踩过，写在这里省时间）
 
@@ -161,14 +172,9 @@ cl: 命令行 error D8050 :无法执行 c1.dll: 未能将命令行放入调试�
 真因：`libsqlite3-sys` 编 `sqlite3.c` 时命令行极长（`-Z7` 调试信息 + 一长串 `-D` 宏 + 输出路径），
 超过 `cl.exe` 的调试记录上限；**输出路径越长越容易触发**。2026-11-07 仓库改名成纯 ASCII
 （`D:\source-code\opencardwright`）后，默认 target 仍在 `app\src-tauri\target\debug\…` 这种长路径上，
-**实测照样 D8050**——所以这两条环境变量在 `app/` 内所有 cargo 构建/测试都要设：
-
-```powershell
-$env:CARGO_TARGET_DIR = 'C:\ocw-target'   # 产物放到短路径
-$env:DEBUG = 'false'                       # 让 cc-rs 不再传 /Z7
-```
-
-CI 跑在 `windows-latest` 的短路径下，不受影响。
+项目现在**不再覆盖** `CARGO_TARGET_DIR` / `DEBUG`，统一使用 Tauri/Cargo 默认的
+`app/src-tauri/target`。如果本机默认 target 仍触发 D8050，应作为本机环境问题单独处理，
+不要在仓库脚本里固定写死短路径。
 
 **2. `vite build` 报 `Access is denied`（esbuild 删临时文件失败）**
 
@@ -179,19 +185,10 @@ $env:TEMP = "$PWD\.tmp"; $env:TMP = $env:TEMP
 pnpm exec vite build
 ```
 
-**3. `tauri build` 打包阶段 `failed to bundle project: timeout: global`**
+**3. 打包需要 WiX Toolset v3**
 
-tauri-cli 自带的 NSIS 下载器在本机会超时（同样的 URL 用 PowerShell 下只要两秒）。
-先预置工具链缓存，再打包：
-
-```powershell
-pnpm setup:nsis            # 下载 nsis-3.13 + nsis_tauri_utils.dll，按 Tauri 期望的层级摆好并校验 SHA1
-pnpm tauri build           # 之后不再联网取 NSIS
-```
-
-> 目录层级是坑：工具链要解到 `%LOCALAPPDATA%\tauri\NSIS\` 下**直接一层**
-> （`makensis.exe`、`NSIS.exe`、`Bin\` 就在 `NSIS\` 里），不是 `NSIS\nsis-3.13\`。
-> 摆错会被判定"缺文件"后删掉重下。脚本里写死了 tauri-bundler v2 的 13 项必需文件与两个 SHA1。
+MSI target 需要 WiX v3 的 `candle.exe` / `light.exe`。安装 WiX Toolset v3.14 后，
+确保 `bin` 目录在 PATH，或用发布脚本的 `-WixBin` 指定。不再需要 NSIS 工具链。
 
 **4. 不要用 `cargo build --release` 出发布版**
 
@@ -199,8 +196,8 @@ pnpm tauri build           # 之后不再联网取 NSIS
 `ERR_CONNECTION_REFUSED`，因为前端资源没有内嵌。发布/演示一律走：
 
 ```powershell
-pnpm exec tauri build --no-bundle   # 只出可执行文件，不打包
-pnpm exec tauri build               # 出安装包
+pnpm exec tauri build --no-bundle          # 只出可执行文件
+pnpm exec tauri build --bundles msi        # 出 WiX MSI 安装包
 ```
 
 `Cargo.toml` 里已经补了 `custom-protocol` feature；若确实要手工 `cargo build --release`，
@@ -245,9 +242,8 @@ fixtures/               CLI 输出样本（解析器测试用）
 
 ## 6. 已知限制（务必先读）
 
-1. **打包要先预置 NSIS**：`pnpm tauri build` 的 NSIS 阶段会用 tauri-cli 自带下载器，
-   在本机会 `timeout: global`。先跑一次 `pnpm setup:nsis`（幂等，已就绪会秒退），之后打包不再联网。
-   实测产物 `OpenCardWright_2026.11.9+0057_x64-setup.exe` 2.60 MiB，静默安装后 `resources/sdk` 完整携带驱动。
+1. **打包需要 WiX Toolset v3**：MSI target 使用 `candle.exe` / `light.exe`，安装 WiX v3.14 并确保
+   `bin` 在 PATH，或使用 `build-release.ps1 -WixBin`。不再依赖 NSIS 下载器。
 2. **图标是占位**：`src-tauri/icons/icon.ico` 是脚本生成的纯色图，发布前应换成正式图标。
 3. **未实现**：诊断包、发卡记录页与 CSV 导出、首启向导、初始房间导入、文件日志轮转（逐条见 `../plan/待办清单.md`）。
 4. **前端代码分割**：页面已用 `React.lazy` 按页签拆分（TD-902）；主包约 918 KB（gzip 293 KB），antd 仍占大头。

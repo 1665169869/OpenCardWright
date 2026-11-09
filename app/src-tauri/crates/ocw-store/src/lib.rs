@@ -121,6 +121,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v8(conn)?;
     apply_v9(conn)?;
     apply_v10(conn)?;
+    apply_v11(conn)?;
+    apply_v12(conn)?;
     Ok(())
 }
 
@@ -140,7 +142,7 @@ pub struct BackupInfo {
 }
 
 /// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// 把当前库**在线备份**到指定文件。
 ///
@@ -408,6 +410,33 @@ fn apply_v10(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v11 → v12：按卡内原始数据（raw_hex）匹配发卡记录，补查询索引。
+fn apply_v12(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_issuance_raw_hex ON issuance (raw_hex);
+         INSERT OR IGNORE INTO schema_version (version) VALUES (12);",
+    )?;
+    Ok(())
+}
+
+/// v10 → v11：预定增加入住/退房时间（HH:mm），默认 12:00 / 12:00。
+/// 旧数据按整夜保留原显示；新库 schema.sql 已含列时只登记版本。
+fn apply_v11(conn: &Connection) -> Result<()> {
+    let cols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('reservation') WHERE name = 'check_in_time'",
+        [],
+        |r| r.get(0),
+    )?;
+    if cols == 0 {
+        conn.execute_batch(
+            "ALTER TABLE reservation ADD COLUMN check_in_time TEXT NOT NULL DEFAULT '12:00';
+             ALTER TABLE reservation ADD COLUMN check_out_time TEXT NOT NULL DEFAULT '12:00';",
+        )?;
+    }
+    conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (11)", [])?;
+    Ok(())
+}
+
 fn apply_v9(conn: &Connection) -> Result<()> {
     let ddl: Option<String> = conn
         .query_row(
@@ -489,13 +518,25 @@ const ROOM_SELECT: &str = "SELECT r.room_no, r.room_index, r.building, r.floor, 
                              FROM room r LEFT JOIN room_type t ON t.id = r.room_type_id";
 
 pub fn list_rooms(conn: &Connection) -> Result<Vec<Room>> {
-    let sql = format!("{ROOM_SELECT} ORDER BY r.room_index");
+    let sql = format!("{ROOM_SELECT}");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], row_to_room)?;
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
     }
+    // TD-213：房号优先，纯数字按数值排；非数字按字符串排；同房号再按序号。
+    out.sort_by(|a, b| {
+        let an = a.room_no.parse::<u64>().ok();
+        let bn = b.room_no.parse::<u64>().ok();
+        match (an, bn) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.room_no.cmp(&b.room_no),
+        }
+        .then_with(|| a.room_index.cmp(&b.room_index))
+    });
     Ok(out)
 }
 
@@ -751,7 +792,9 @@ pub struct Reservation {
     pub id: i64,
     pub room_no: String,
     pub check_in: String,
+    pub check_in_time: String,
     pub check_out: String,
+    pub check_out_time: String,
     pub guest_name: Option<String>,
     pub note: Option<String>,
     pub status: String,
@@ -766,7 +809,9 @@ pub struct Reservation {
 pub struct ReservationInput {
     pub room_no: String,
     pub check_in: String,
+    pub check_in_time: Option<String>,
     pub check_out: String,
+    pub check_out_time: Option<String>,
     pub guest_name: Option<String>,
     pub note: Option<String>,
 }
@@ -776,20 +821,22 @@ fn row_to_reservation(r: &Row<'_>) -> rusqlite::Result<Reservation> {
         id: r.get(0)?,
         room_no: r.get(1)?,
         check_in: r.get(2)?,
-        check_out: r.get(3)?,
-        guest_name: r.get(4)?,
-        note: r.get(5)?,
-        status: r.get(6)?,
-        operator_name: r.get(7)?,
-        created_at: r.get(8)?,
-        updated_at: r.get(9)?,
-        cancelled_at: r.get(10)?,
+        check_in_time: r.get(3)?,
+        check_out: r.get(4)?,
+        check_out_time: r.get(5)?,
+        guest_name: r.get(6)?,
+        note: r.get(7)?,
+        status: r.get(8)?,
+        operator_name: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+        cancelled_at: r.get(12)?,
     })
 }
 
-const RESERVATION_SELECT: &str = "SELECT r.id, r.room_no, r.check_in, r.check_out, r.guest_name, \
-                                         r.note, r.status, o.display_name, r.created_at, r.updated_at, \
-                                         r.cancelled_at \
+const RESERVATION_SELECT: &str = "SELECT r.id, r.room_no, r.check_in, r.check_in_time, r.check_out, \
+                                         r.check_out_time, r.guest_name, r.note, r.status, \
+                                         o.display_name, r.created_at, r.updated_at, r.cancelled_at \
                                     FROM reservation r LEFT JOIN operator o ON o.id = r.operator_id";
 
 fn is_valid_date(s: &str) -> bool {
@@ -825,9 +872,48 @@ fn today_local(conn: &Connection) -> Result<String> {
     Ok(conn.query_row("SELECT date('now','localtime')", [], |r| r.get(0))?)
 }
 
-fn reservation_covers_today(conn: &Connection, check_in: &str, check_out: &str) -> Result<bool> {
+fn tomorrow_local(conn: &Connection, today: &str) -> Result<String> {
+    Ok(conn.query_row("SELECT date(?1, '+1 day')", params![today], |r| r.get(0))?)
+}
+
+/// `HH:mm`，24 小时制，固定 5 字符。
+fn is_valid_time(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 5 || b[2] != b':' {
+        return false;
+    }
+    if !b
+        .iter()
+        .enumerate()
+        .all(|(i, c)| i == 2 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let hour: u32 = s[0..2].parse().unwrap_or(99);
+    let minute: u32 = s[3..5].parse().unwrap_or(99);
+    hour < 24 && minute < 60
+}
+
+fn reservation_start(check_in: &str, check_in_time: &str) -> String {
+    format!("{check_in}T{check_in_time}")
+}
+
+fn reservation_end(check_out: &str, check_out_time: &str) -> String {
+    format!("{check_out}T{check_out_time}")
+}
+
+fn reservation_covers_today(
+    conn: &Connection,
+    check_in: &str,
+    check_in_time: &str,
+    check_out: &str,
+    check_out_time: &str,
+) -> Result<bool> {
     let today = today_local(conn)?;
-    Ok(check_in <= today.as_str() && check_out > today.as_str())
+    let tomorrow = tomorrow_local(conn, &today)?;
+    let start = reservation_start(check_in, check_in_time);
+    let end = reservation_end(check_out, check_out_time);
+    Ok(start < format!("{tomorrow}T00:00") && end > format!("{today}T00:00"))
 }
 
 /// 校验日期、房号与同房区间重叠。`allow_past_check_in` 用于改期：
@@ -852,23 +938,28 @@ fn validate_reservation(
     if !is_valid_date(&input.check_in) || !is_valid_date(&input.check_out) {
         return Err(StoreError::Invalid("日期格式应为 YYYY-MM-DD".into()));
     }
-    if input.check_out <= input.check_in {
+    let check_in_time = input.check_in_time.as_deref().unwrap_or("12:00");
+    let check_out_time = input.check_out_time.as_deref().unwrap_or("12:00");
+    if !is_valid_time(check_in_time) || !is_valid_time(check_out_time) {
+        return Err(StoreError::Invalid("时间格式应为 HH:mm".into()));
+    }
+    let start = reservation_start(&input.check_in, check_in_time);
+    let end = reservation_end(&input.check_out, check_out_time);
+    if end <= start {
         return Err(StoreError::Invalid(
-            "退房日期必须晚于入住日期（退房日不含）".into(),
+            "退房时间必须晚于入住时间（退房时间不占房）".into(),
         ));
     }
     let today = today_local(conn)?;
     if !allow_past_check_in && input.check_in < today {
         return Err(StoreError::Invalid("入住日期不能早于今天".into()));
     }
-    if input.check_out <= today {
-        return Err(StoreError::Invalid("退房日期必须晚于今天".into()));
-    }
 
     let mut sql = String::from(
         "SELECT COUNT(*) FROM reservation
           WHERE room_no = ?1 AND status = 'booked'
-            AND check_in < ?2 AND check_out > ?3",
+            AND (check_in || 'T' || check_in_time) < ?2
+            AND (check_out || 'T' || check_out_time) > ?3",
     );
     if exclude_id.is_some() {
         sql.push_str(" AND id != ?4");
@@ -876,14 +967,11 @@ fn validate_reservation(
     let mut stmt = conn.prepare(&sql)?;
     let count: i64 = if let Some(id) = exclude_id {
         stmt.query_row(
-            params![input.room_no, input.check_out, input.check_in, id],
+            params![input.room_no, end, start, id],
             |r| r.get(0),
         )?
     } else {
-        stmt.query_row(
-            params![input.room_no, input.check_out, input.check_in],
-            |r| r.get(0),
-        )?
+        stmt.query_row(params![input.room_no, end, start], |r| r.get(0))?
     };
     if count > 0 {
         return Err(StoreError::Invalid("该房间在这个日期区间已有预定".into()));
@@ -904,11 +992,15 @@ fn sync_room_status_for_reservation(
     was_covering_today: bool,
 ) -> Result<()> {
     let today = today_local(conn)?;
+    let tomorrow = tomorrow_local(conn, &today)?;
+    let today_start = format!("{today}T00:00");
+    let tomorrow_start = format!("{tomorrow}T00:00");
     let covering: i64 = conn.query_row(
         "SELECT COUNT(*) FROM reservation
           WHERE room_no = ?1 AND status = 'booked'
-            AND check_in <= ?2 AND check_out > ?2",
-        params![room_no, today],
+            AND (check_in || 'T' || check_in_time) < ?2
+            AND (check_out || 'T' || check_out_time) > ?3",
+        params![room_no, tomorrow_start, today_start],
         |r| r.get(0),
     )?;
     let Some(room) = find_room(conn, room_no)? else {
@@ -942,7 +1034,9 @@ pub fn list_reservations(
         return Err(StoreError::Invalid("查询日期区间不合法".into()));
     }
     let mut sql = format!(
-        "{RESERVATION_SELECT} WHERE r.status = 'booked' AND r.check_in < ?1 AND r.check_out > ?2"
+        "{RESERVATION_SELECT} WHERE r.status IN ('booked','checked_in') \
+         AND (r.check_in || 'T' || r.check_in_time) < (date(?1, '+1 day') || 'T12:00') \
+         AND (r.check_out || 'T' || r.check_out_time) > (date(?2, '-1 day') || 'T12:00')"
     );
     if room_no.is_some() {
         sql.push_str(" AND r.room_no = ?3");
@@ -959,6 +1053,34 @@ pub fn list_reservations(
         out.push(row?);
     }
     Ok(out)
+}
+
+/// TD-206：客人姓名分词。jieba 切成词后去重、限 8 个；全空时回退原文。
+fn guest_name_tokens(name: &str) -> Vec<String> {
+    static JIEBA: std::sync::OnceLock<jieba_rs::Jieba> = std::sync::OnceLock::new();
+    let jieba = JIEBA.get_or_init(jieba_rs::Jieba::new);
+    let mut out: Vec<String> = Vec::new();
+    for token in jieba.cut(name, true) {
+        let token = token.trim();
+        if token.is_empty()
+            || token
+                .chars()
+                .all(|c| c.is_whitespace() || c.is_ascii_punctuation())
+        {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == token) {
+            out.push(token.to_string());
+        }
+        if out.len() >= 8 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        vec![name.to_string()]
+    } else {
+        out
+    }
 }
 
 /// 记录页的预定查询条件（TD-167）。与日历用的 `list_reservations` 不同：
@@ -1009,8 +1131,17 @@ pub fn search_reservations(
         vals.push(Value::Text(room.to_string()));
     }
     if let Some(name) = f.guest_name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND r.guest_name LIKE '%' || ? || '%'");
-        vals.push(Value::Text(name.to_string()));
+        // TD-206：jieba 分词后按词 OR 匹配；分词为空时回退原文整串。
+        let tokens = guest_name_tokens(name);
+        where_sql.push_str(" AND (");
+        for (i, token) in tokens.iter().enumerate() {
+            if i > 0 {
+                where_sql.push_str(" OR ");
+            }
+            where_sql.push_str("r.guest_name LIKE '%' || ? || '%'");
+            vals.push(Value::Text(token.clone()));
+        }
+        where_sql.push(')');
     }
     if let Some(status) = f.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if !matches!(status, "booked" | "checked_in" | "cancelled") {
@@ -1057,13 +1188,18 @@ pub fn create_reservation(
     operator_id: Option<i64>,
 ) -> Result<Reservation> {
     validate_reservation(conn, input, None, false)?;
+    let check_in_time = input.check_in_time.as_deref().unwrap_or("12:00");
+    let check_out_time = input.check_out_time.as_deref().unwrap_or("12:00");
     conn.execute(
-        "INSERT INTO reservation (room_no, check_in, check_out, guest_name, note, operator_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO reservation
+           (room_no, check_in, check_in_time, check_out, check_out_time, guest_name, note, operator_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             input.room_no.as_str(),
             input.check_in.as_str(),
+            check_in_time,
             input.check_out.as_str(),
+            check_out_time,
             input.guest_name.as_deref(),
             input.note.as_deref(),
             operator_id
@@ -1086,17 +1222,29 @@ pub fn update_reservation(
         return Err(StoreError::Invalid("已取消的预定不能改期".into()));
     }
     validate_reservation(conn, input, Some(id), true)?;
-    let old_covers_today = reservation_covers_today(conn, &old.check_in, &old.check_out)?;
+    let old_covers_today = reservation_covers_today(
+        conn,
+        &old.check_in,
+        &old.check_in_time,
+        &old.check_out,
+        &old.check_out_time,
+    )?;
+    let check_in_time = input.check_in_time.as_deref().unwrap_or("12:00");
+    let check_out_time = input.check_out_time.as_deref().unwrap_or("12:00");
     conn.execute(
         "UPDATE reservation
-            SET room_no = ?2, check_in = ?3, check_out = ?4, guest_name = ?5, note = ?6,
+            SET room_no = ?2, check_in = ?3, check_in_time = ?4,
+                check_out = ?5, check_out_time = ?6,
+                guest_name = ?7, note = ?8,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           WHERE id = ?1",
         params![
             id,
             input.room_no.as_str(),
             input.check_in.as_str(),
+            check_in_time,
             input.check_out.as_str(),
+            check_out_time,
             input.guest_name.as_deref(),
             input.note.as_deref()
         ],
@@ -1115,7 +1263,13 @@ pub fn cancel_reservation(conn: &Connection, id: i64) -> Result<Reservation> {
     if old.status != "booked" {
         return Ok(old);
     }
-    let was_covering_today = reservation_covers_today(conn, &old.check_in, &old.check_out)?;
+    let was_covering_today = reservation_covers_today(
+        conn,
+        &old.check_in,
+        &old.check_in_time,
+        &old.check_out,
+        &old.check_out_time,
+    )?;
     conn.execute(
         "UPDATE reservation
             SET status = 'cancelled',
@@ -1141,7 +1295,8 @@ pub fn check_in_reservations(conn: &Connection, room_no: &str, today: &str) -> R
         "UPDATE reservation
             SET status = 'checked_in', updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
           WHERE room_no = ?1 AND status = 'booked'
-            AND check_in <= ?2 AND check_out > ?2",
+            AND (check_in || 'T' || check_in_time) < (date(?2, '+1 day') || 'T00:00')
+            AND (check_out || 'T' || check_out_time) > (?2 || 'T00:00')",
         params![room_no, today],
     )?;
     Ok(n)
@@ -1617,6 +1772,82 @@ pub fn find_issuance_by_stamp(
             row_to_issuance,
         )
         .optional()?)
+}
+
+/// 卡内原始数据的匹配结果。
+#[derive(Debug, Clone)]
+pub struct RawIssuanceMatch {
+    pub latest: IssuanceRecord,
+    /// 同一 raw_hex + 卡型 + 房号下的全部记录数（含已退房/失败）。
+    pub count: u32,
+    /// latest 是否仍有效（result='ok' 且未退房）。
+    pub active: bool,
+}
+
+fn normalize_raw_hex(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+/// 按卡内 28 字节原始数据（raw_hex）匹配发卡记录。
+///
+/// 这是业务语义上的“卡内容凭据”：同一 raw_hex 视为同一张卡，不区分物理克隆。
+/// 排序优先取仍有效的最新记录；没有有效记录时返回最新一条，由调用方判断。
+pub fn find_issuance_by_raw(
+    conn: &Connection,
+    raw_hex: &str,
+    kind: &str,
+    room_no: Option<&str>,
+) -> Result<Option<RawIssuanceMatch>> {
+    use rusqlite::types::Value;
+
+    let raw = normalize_raw_hex(raw_hex);
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let mut where_sql = String::from(" WHERE raw_hex = ?1 AND kind = ?2");
+    let mut vals: Vec<Value> = vec![Value::Text(raw), Value::Text(kind.to_string())];
+    if let Some(room) = room_no {
+        where_sql.push_str(" AND room_no = ?");
+        vals.push(Value::Text(room.to_string()));
+    }
+
+    let count: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM issuance{where_sql}"),
+        rusqlite::params_from_iter(vals.iter()),
+        |r| r.get(0),
+    )?;
+    if count == 0 {
+        return Ok(None);
+    }
+
+    let sql = format!(
+        "SELECT {ISSUANCE_COLUMNS} FROM issuance{where_sql} \
+         ORDER BY CASE WHEN result = 'ok' AND checked_out_at IS NULL THEN 0 ELSE 1 END, \
+                  created_at DESC, id DESC LIMIT 1"
+    );
+    let latest = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(vals.iter()),
+        row_to_issuance,
+    )?;
+    let active = issuance_is_active(conn, latest.id)?;
+    Ok(Some(RawIssuanceMatch {
+        latest,
+        count: count as u32,
+        active,
+    }))
+}
+
+/// 记录是否仍有效（发卡成功且未退房）。
+pub fn issuance_is_active(conn: &Connection, id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT (result = 'ok' AND checked_out_at IS NULL) FROM issuance WHERE id = ?1",
+        params![id],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )?)
 }
 
 /// 按主键取一条发卡记录。发卡命令刚写入后用它取回 expires_at 等完整字段。
@@ -2282,6 +2513,62 @@ fn limit_offset(page: i64, page_size: i64) -> (i64, i64) {
     (size, (page - 1) * size)
 }
 
+/// 日历入住时段（含已退房历史）：按本地日期区间返回所有相交客卡记录。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestStay {
+    pub id: i64,
+    pub room_no: String,
+    pub guest_name: Option<String>,
+    pub kind: String,
+    pub days: i64,
+    pub hours: i64,
+    pub start: String,
+    pub end: String,
+    pub planned_end: String,
+    pub checked_out: bool,
+}
+
+pub fn list_guest_stays(conn: &Connection, from: &str, to: &str) -> Result<Vec<GuestStay>> {
+    if !is_valid_date(from) || !is_valid_date(to) || to <= from {
+        return Err(StoreError::Invalid("入住时段日期区间不合法".into()));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, room_no, guest_name, kind, days, hours,
+                date(created_at, '-6 hours', 'localtime') AS start,
+                date(COALESCE(checked_out_at, expires_at), 'localtime') AS end,
+                date(expires_at, 'localtime') AS planned_end,
+                checked_out_at IS NOT NULL AS checked_out
+           FROM issuance
+          WHERE result = 'ok'
+            AND room_no IS NOT NULL
+            AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
+            AND date(created_at, '-6 hours', 'localtime') < ?2
+            AND date(COALESCE(checked_out_at, expires_at), 'localtime') >= ?1
+          ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map(params![from, to], |r| {
+        Ok(GuestStay {
+            id: r.get(0)?,
+            room_no: r.get(1)?,
+            guest_name: r.get(2)?,
+            kind: r.get(3)?,
+            days: r.get(4)?,
+            hours: r.get(5)?,
+            start: r.get(6)?,
+            end: r.get(7)?,
+            planned_end: r.get(8)?,
+            checked_out: r.get::<_, i64>(9)? != 0,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// 发卡记录列表：房号前缀 / 卡号 / 卡型 / 时间范围 + 分页，按时间倒序。
 pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<IssuanceRow>> {
     use rusqlite::types::Value;
@@ -2289,28 +2576,28 @@ pub fn list_issuances(conn: &Connection, f: &IssuanceFilter) -> Result<Page<Issu
     let mut where_sql = String::from(" WHERE 1 = 1");
     let mut vals: Vec<Value> = Vec::new();
     if let Some(room) = f.room_no.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND room_no LIKE ? || '%'");
+        where_sql.push_str(" AND i.room_no LIKE ? || '%'");
         vals.push(Value::Text(room.to_string()));
     }
     if let Some(kind) = f.kind.as_ref().filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND kind = ?");
+        where_sql.push_str(" AND i.kind = ?");
         vals.push(Value::Text(kind.to_string()));
     }
     if let Some(from) = f.from.as_ref().filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND created_at >= ?");
+        where_sql.push_str(" AND i.created_at >= ?");
         vals.push(Value::Text(from.to_string()));
     }
     if let Some(to) = f.to.as_ref().filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND created_at < ?");
+        where_sql.push_str(" AND i.created_at < ?");
         vals.push(Value::Text(to.to_string()));
     }
     // 入住记录视图（TD-118）：未输入身份信息（NULL / 空白）的发卡不进入入住记录
     if f.guest_only {
-        where_sql.push_str(" AND guest_name IS NOT NULL AND TRIM(guest_name) != ''");
+        where_sql.push_str(" AND i.guest_name IS NOT NULL AND TRIM(i.guest_name) != ''");
     }
 
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM issuance{where_sql}"),
+        &format!("SELECT COUNT(*) FROM issuance i{where_sql}"),
         rusqlite::params_from_iter(vals.iter()),
         |r| r.get(0),
     )?;
@@ -2483,6 +2770,29 @@ mod tests {
         assert_eq!(insert_room(&conn, "202", None, None, None, None).unwrap().room_index, 1);
         assert_eq!(insert_room(&conn, "203", None, None, None, None).unwrap().room_index, 2);
         cleanup(conn, path);
+    }
+
+    #[test]
+    fn list_rooms_sorts_by_room_no_then_index() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "10", Some(2), None, None, None).unwrap();
+        insert_room(&conn, "2", Some(0), None, None, None).unwrap();
+        insert_room(&conn, "A10", Some(3), None, None, None).unwrap();
+        insert_room(&conn, "A2", Some(1), None, None, None).unwrap();
+        let nos: Vec<String> = list_rooms(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.room_no)
+            .collect();
+        assert_eq!(nos, vec!["2", "10", "A10", "A2"], "数字房号按数值，非数字按字符串");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn jieba_name_tokens_keep_chinese_words() {
+        let tokens = guest_name_tokens("张三 丰");
+        assert!(tokens.iter().any(|t| t == "丰"), "分词应保留姓名片段: {tokens:?}");
+        assert!(!tokens.is_empty());
     }
 
     #[test]
@@ -2811,7 +3121,9 @@ mod tests {
                 &ReservationInput {
                     room_no: room.into(),
                     check_in: ci.into(),
+                    check_in_time: None,
                     check_out: co.into(),
+                    check_out_time: None,
                     guest_name: Some(name.into()),
                     note: None,
                 },
@@ -2934,7 +3246,9 @@ mod tests {
             &ReservationInput {
                 room_no: "801".into(),
                 check_in: today.clone(),
+                check_in_time: None,
                 check_out: tomorrow.clone(),
+                check_out_time: None,
                 guest_name: Some("张三".into()),
                 note: None,
             },
@@ -2946,7 +3260,9 @@ mod tests {
             &ReservationInput {
                 room_no: "801".into(),
                 check_in: day3.clone(),
+                check_in_time: None,
                 check_out: day4.clone(),
+                check_out_time: None,
                 guest_name: None,
                 note: None,
             },
@@ -3248,7 +3564,9 @@ mod tests {
         let make = |check_in: &str, check_out: &str| ReservationInput {
             room_no: "801".into(),
             check_in: check_in.into(),
+            check_in_time: None,
             check_out: check_out.into(),
+            check_out_time: None,
             guest_name: Some("张三".into()),
             note: None,
         };
@@ -3304,6 +3622,200 @@ mod tests {
         let list = list_reservations(&conn, &today, &day_after, Some("801")).unwrap();
         assert_eq!(list.len(), 1, "取消的 A / B 不在列表里，只剩改期后的 C");
         assert_eq!(list[0].id, c.id);
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn reservation_time_interval_edges() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "801", None, None, None, None).unwrap();
+        insert_room(&conn, "802", None, None, None, None).unwrap();
+        insert_room(&conn, "803", None, None, None, None).unwrap();
+        insert_room(&conn, "804", None, None, None, None).unwrap();
+        let day = |offset: &str| -> String {
+            conn.query_row(
+                "SELECT date('now','localtime', ?1)",
+                params![offset],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mk = |room: &str, ci: &str, cit: Option<&str>, co: &str, cot: Option<&str>| {
+            ReservationInput {
+                room_no: room.into(),
+                check_in: ci.into(),
+                check_in_time: cit.map(str::to_string),
+                check_out: co.into(),
+                check_out_time: cot.map(str::to_string),
+                guest_name: None,
+                note: None,
+            }
+        };
+
+        let a = create_reservation(
+            &conn,
+            &mk("801", &day("+5 days"), None, &day("+7 days"), None),
+            None,
+        )
+        .unwrap();
+        assert_eq!((a.check_in_time.as_str(), a.check_out_time.as_str()), ("12:00", "12:00"));
+
+        let early = create_reservation(
+            &conn,
+            &mk("802", &day("+0 day"), Some("02:00"), &day("+0 day"), Some("12:00")),
+            None,
+        )
+        .unwrap();
+        assert_eq!((early.check_in_time.as_str(), early.check_out_time.as_str()), ("02:00", "12:00"));
+
+        assert!(
+            create_reservation(
+                &conn,
+                &mk("803", &day("+0 day"), Some("12:00"), &day("+0 day"), Some("12:00")),
+                None
+            )
+            .is_err(),
+            "同日期同时间的零时长预定必须拒绝"
+        );
+
+        let boundary_a = create_reservation(
+            &conn,
+            &mk("804", &day("+1 day"), Some("12:00"), &day("+2 days"), Some("12:00")),
+            None,
+        )
+        .unwrap();
+        let boundary_b = create_reservation(
+            &conn,
+            &mk("804", &day("+2 days"), Some("12:00"), &day("+3 days"), Some("12:00")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(boundary_b.check_in, day("+2 days"), "12:00 边界可紧邻续住");
+        assert!(
+            create_reservation(
+                &conn,
+                &mk("804", &day("+2 days"), Some("11:00"), &day("+3 days"), Some("12:00")),
+                None
+            )
+            .is_err(),
+            "11:00 入住与 12:00 边界有重叠"
+        );
+        let _ = (a.id, boundary_a.id);
+
+        let multi = create_reservation(
+            &conn,
+            &mk("801", &day("+10 days"), Some("14:00"), &day("+12 days"), Some("12:00")),
+            None,
+        )
+        .unwrap();
+        let listed = list_reservations(&conn, &day("+10 days"), &day("+12 days"), Some("801"))
+            .unwrap();
+        assert!(listed.iter().any(|r| r.id == multi.id), "多晚预定应按日期区间返回");
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn v11_adds_reservation_times_with_default_12() {
+        let (conn, path) = temp_db();
+        // 模拟 v10：reservation 表已存在但没有时间列，且已有业务数据。
+        conn.execute_batch(
+            "DROP TABLE reservation;
+             CREATE TABLE reservation (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_no      TEXT NOT NULL,
+                check_in     TEXT NOT NULL,
+                check_out    TEXT NOT NULL,
+                guest_name   TEXT,
+                note         TEXT,
+                status       TEXT NOT NULL DEFAULT 'booked' CHECK (status IN ('booked', 'cancelled', 'checked_in')),
+                operator_id  INTEGER REFERENCES operator (id),
+                created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                cancelled_at TEXT
+             );
+             INSERT INTO reservation (room_no, check_in, check_out, guest_name)
+             VALUES ('801', '2026-11-10', '2026-11-12', '旧预定');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (ci, ci_time, co, co_time, name): (String, String, String, String, String) = conn
+            .query_row(
+                "SELECT check_in, check_in_time, check_out, check_out_time, guest_name
+                   FROM reservation",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!((ci.as_str(), ci_time.as_str()), ("2026-11-10", "12:00"));
+        assert_eq!((co.as_str(), co_time.as_str()), ("2026-11-12", "12:00"));
+        assert_eq!(name, "旧预定");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('reservation') WHERE name = 'check_in_time'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn find_issuance_by_raw_prefers_latest_active_and_counts() {
+        let (conn, path) = temp_db();
+        let mk = |raw: &str, result: &str| {
+            record_issuance(
+                &conn,
+                &NewIssuance {
+                    room_no: Some("801"),
+                    kind: "日租客卡",
+                    days: 1,
+                    hours: 0,
+                    raw_hex: Some(raw),
+                    operator_id: None,
+                    reader_id: None,
+                    result,
+                    error_code: None,
+                    idempotency_key: None,
+                    duration_ms: None,
+                },
+            )
+            .unwrap()
+        };
+        let raw = "5BECF100810424AB";
+        let a = mk(raw, "ok");
+        let b = mk(raw, "ok");
+        let hit = find_issuance_by_raw(&conn, raw, "日租客卡", Some("801"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.latest.id, b, "同 raw 的多条记录取最新一条");
+        assert_eq!(hit.count, 2);
+        assert!(hit.active);
+
+        conn.execute(
+            "UPDATE issuance SET checked_out_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?1",
+            params![b],
+        )
+        .unwrap();
+        let hit = find_issuance_by_raw(&conn, raw, "日租客卡", Some("801"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.latest.id, a, "最新记录退房后回退到上一条有效记录");
+        assert_eq!(hit.count, 2);
+        assert!(hit.active);
+
+        assert!(find_issuance_by_raw(&conn, " ", "日租客卡", Some("801"))
+            .unwrap()
+            .is_none());
+        assert!(find_issuance_by_raw(&conn, raw, "日租客卡", Some("802"))
+            .unwrap()
+            .is_none());
 
         cleanup(conn, path);
     }
@@ -3812,6 +4324,18 @@ mod tests {
         let all = list_issuances(&conn, &IssuanceFilter::default()).unwrap();
         assert_eq!(all.total, 5);
         assert_eq!(all.rows.len(), 5);
+
+        // 带时间范围的查询会 JOIN operator；created_at 必须用 i. 限定。
+        let ranged = list_issuances(
+            &conn,
+            &IssuanceFilter {
+                from: Some("1970-01-01T00:00:00Z".into()),
+                to: Some("2999-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ranged.total, 5);
 
         let only = list_issuances(
             &conn,

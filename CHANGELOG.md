@@ -3,7 +3,73 @@
 本文件记录 OpenCardWright 产品工作区（`opencardwright/`）的对外变更。
 卡格式与锁行为的结论变更不记在这里，见 `docs/`。
 
+## 26.11.962 — 2026-11-09
+
+### 修复：MSI 打包报「app version major number cannot be greater than 255」
+
+- 根因：WiX/MSI 的产品版本号主版本上限 255，旧版本号 `2026.11.9+NNNN` 主版本 2026 超限；
+  Rust/MSVC 编译本身无问题，失败发生在 `tauri build` 的 MSI 打包阶段。
+- 版本号格式改为 `26.M.DDD`：主版本 = 年份−2000，次版本 = 月份，
+  补丁号 = 日×100 + 当日构建序号（11 月 9 日第 62 号 → `26.11.962`），保证 MSI
+  ProductVersion 随每次发版严格递增，升级覆盖不受影响。
+- 同步 `package.json` / `Cargo.toml` / `tauri.conf.json` / `Cargo.lock`；
+  版本规则已更新到 `AGENTS.md`。
+
+## 2026.11.9+0061 — 2026-11-09
+
+### 安装包改用 WiX Toolset v3
+
+- 移除 Inno Setup 的 `app/installer/opencardwright.iss` 与旧 NSIS 安装配置。
+- Tauri `bundle.targets` 改为 `msi`，由 WiX Toolset v3 生成 MSI。
+- `app/build-release.ps1` 改为查找 `candle.exe` / `light.exe`，收集
+  `app/src-tauri/target/release/bundle/msi/*.msi` 到 `app/output`。
+- MSI 作为新的安装器，不再迁移旧 Inno/NSIS 安装。
+
+## 2026.11.9+0060 — 2026-11-09
+
+### 构建使用 Cargo 默认 target
+
+- 移除项目脚本对 `CARGO_TARGET_DIR` / `DEBUG` 的覆盖，统一使用 Tauri/Cargo 默认的
+  `app/src-tauri/target`。
+- `app/output` 仍是最终交付目录，安装包与 release 副本继续集中在该目录并保持 git 忽略。
+- Inno 安装器作为新安装器使用，**不再迁移旧 NSIS 安装**；旧版由用户自行卸载。
+
+## 2026.11.9+0059 — 2026-11-09
+
+### 安装包改用 Inno Setup
+
+- 正式版由 `pnpm tauri build --no-bundle` + `app/installer/opencardwright.iss` 生成。
+- 固定 Inno `AppId`，后续版本原地覆盖升级，不再要求手动卸载旧版。
+- 旧 NSIS（`OpenCardWright` / `门锁发卡台`）由 Inno 安装前自动迁移；安装前关闭旧进程，
+  保留 `%ProgramData%\OpenCardWright\` 数据。
+- `app/build-release.ps1` 改为查找 `ISCC.exe` 并调用 Inno 编译。
+
+## 2026.11.9+0058 — 2026-11-09
+
+### 版本号维护规则
+
+- 新增强制规则：每次代码、行为或用户可见文档变动都提升构建号，并同步
+  `app/package.json`、`app/src-tauri/Cargo.toml`、`app/src-tauri/tauri.conf.json`、
+  `app/src-tauri/Cargo.lock` 与 `CHANGELOG.md`。
+- 本版包含此前的日历历史入住、半格占用、预定表单优化、jieba 姓名查询、房间排序和
+  NSIS 升级钩子等未发布改动。
+
 ## 2026.11.9+0057 — 2026-11-09
+
+### 管理卡使用时间戳卡号（修复错误 9）
+
+- 复位卡、清除卡、退房钟点卡、校时卡改为与客卡/总控卡同一套卡号规则：
+  `(日 << 11) | (时 << 6) | 小时内序号`，由 `CardNoState` 递推。
+- `issue_admin_card` 统一追加 `--serial` 与 `--at`，不再使用固定卡号；修复 CLI 默认
+  `Serial=-1` 导致 SDK `PrepareCardNo` 返回 `ErrCardNo(9)` 的问题。
+- 校时卡指定 `at` 时，卡号与页2[3] 年月使用同一个时刻。
+
+### 预定间夜列与凌晨房（TD-211）
+
+- 房态日历每列改为一个间夜：`[当天 12:00, 次日 12:00)`；预定色块按入住/退房完整时间与列区间求交集。
+- 凌晨 0–12 点入住、当天 12:00 退房的凌晨房归到前一天的间夜列；12:00 边界不占下一列。
+- 预定表单增加入住/退房时间（默认 12:00），记录页与日历提示显示完整日期时间。
+- 数据库 `reservation` 增加 `check_in_time` / `check_out_time`，旧预定迁移后默认 `12:00 / 12:00`。
 
 ### 一级导航改为左侧栏（2026-11-09）
 
