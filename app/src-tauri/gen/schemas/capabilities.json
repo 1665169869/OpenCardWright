@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"OpenCardWright 默认能力：只允许自身窗口调用本地命令","local":true,"windows":["main"],"permissions":["core:default"]}}
