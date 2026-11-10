@@ -141,7 +141,7 @@ export function CheckoutCardModal({
     }
   }
 
-  /** 强制退房：按房间直接写入退房数据（用户已在二次确认里确认过） */
+  /** 强制退房：按房间关闭有效卡 + 把卡擦成空白卡（用户已在二次确认里确认过） */
   const forceCheckout = async () => {
     if (cardNo === null || roomNo === null) return
     setBusy(true)
@@ -149,8 +149,13 @@ export function CheckoutCardModal({
     try {
       const res = await api.forceCheckoutCard(roomNo)
       setForceOpen(false)
+      const eraseText = res.erased
+        ? '，卡已擦成空白卡'
+        : res.eraseError
+          ? `，未擦卡（${res.eraseError}）`
+          : ''
       onDone(
-        `${res.roomNo} 房：非本系统卡，已强制退房（关闭 ${res.cardsClosed} 张有效卡，房态已按设置转换）`,
+        `${res.roomNo} 房：非本系统卡，已强制退房（关闭 ${res.cardsClosed} 张有效卡${eraseText}，房态已按设置转换）`,
       )
       onClose()
     } catch (e) {
@@ -227,7 +232,8 @@ export function CheckoutCardModal({
                   description={
                     <>
                       这张卡在本地没有发卡记录。点「强制退房」会先弹二次确认，
-                      确认后<b>直接写入退房数据</b>：关闭 {roomNo} 房当前全部有效卡，并把房态改为退房后房态。
+                      确认后<b>关闭该房全部有效卡，并把卡擦成空白卡</b>（卡要放在读卡器上）；
+                      擦卡失败不会阻断退房，但会明确提示原因。
                     </>
                   }
                 />
@@ -266,18 +272,22 @@ export function CheckoutCardModal({
             description="这张卡在本地没有发卡记录，无法按卡号退房。"
           />
           <div>
-            继续将<b>直接写入退房数据</b>：
+            继续将<b>强制退房</b>：
             <ul style={{ margin: '6px 0 0', paddingInlineStart: 20 }}>
               <li>
                 把 <b>{roomNo ?? '—'} 房</b>当前全部有效卡
                 {targetRoom ? `（${targetRoom.activeCards} 张）` : ''}标记为已退房
               </li>
+              <li>
+                把读卡器上的这张卡<b>擦成空白卡</b>（卡要放好；失败不会阻断退房，会在结果里说明）
+              </li>
               <li>房态改为设置里的「退房后房态」</li>
-              <li>审计日志记一条「强制退房」，注明来自卡号</li>
+              <li>审计日志记一条「强制退房」，注明卡号与是否擦卡</li>
             </ul>
           </div>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            门锁里的这张卡不会因此立刻失效，需要另写一张「退房钟点卡」到锁上刷一次。
+            擦卡写的是全零 8 字节，与原厂「退房回收卡」是否完全等价仍待实测（TD-143）；
+            擦卡失败时这张卡仍可能开门，需要再擦一次或改用其它方式处理。
           </Text>
         </Space>
       </Modal>

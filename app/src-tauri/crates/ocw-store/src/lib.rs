@@ -123,6 +123,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     apply_v10(conn)?;
     apply_v11(conn)?;
     apply_v12(conn)?;
+    apply_v13(conn)?;
     Ok(())
 }
 
@@ -142,7 +143,7 @@ pub struct BackupInfo {
 }
 
 /// 本程序能读到的最高 schema 版本。恢复时用来拒绝「来自更新版本的备份」。
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// 把当前库**在线备份**到指定文件。
 ///
@@ -419,6 +420,31 @@ fn apply_v12(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v12 → v13：客卡作废（TD-218）。
+///
+/// 挂失卡写卡成功后，同房仍有效的旧客卡会在 `invalidated_at` 打时间戳，
+/// `invalid_reason` 记原因（当前只有 `lost`）。与 `checked_out_at` 区分语义：
+/// 退房是客人离开，作废是卡被挂失顶掉；两者都不计入「有效卡」。
+fn apply_v13(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "issuance",
+        "invalidated_at",
+        "ALTER TABLE issuance ADD COLUMN invalidated_at TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "issuance",
+        "invalid_reason",
+        "ALTER TABLE issuance ADD COLUMN invalid_reason TEXT",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_issuance_invalidated ON issuance (invalidated_at);
+         INSERT OR IGNORE INTO schema_version (version) VALUES (13);",
+    )?;
+    Ok(())
+}
+
 /// v10 → v11：预定增加入住/退房时间（HH:mm），默认 12:00 / 12:00。
 /// 旧数据按整夜保留原显示；新库 schema.sql 已含列时只登记版本。
 fn apply_v11(conn: &Connection) -> Result<()> {
@@ -507,12 +533,14 @@ const ROOM_SELECT: &str = "SELECT r.room_no, r.room_index, r.building, r.floor, 
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
                                       AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
+                                      AND i.invalidated_at IS NULL \
                                       AND i.kind IN ('日租客卡','钟点客卡') \
                                       AND i.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')), \
                                   (SELECT MAX(i.expires_at) FROM issuance i \
                                     WHERE i.room_no = r.room_no AND i.result = 'ok' \
                                       AND i.expires_at IS NOT NULL \
                                       AND i.checked_out_at IS NULL \
+                                      AND i.invalidated_at IS NULL \
                                       AND i.kind IN ('日租客卡','钟点客卡') \
                                       AND i.expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) \
                              FROM room r LEFT JOIN room_type t ON t.id = r.room_type_id";
@@ -595,10 +623,48 @@ pub fn count_active_cards(conn: &Connection, room_no: &str) -> Result<i64> {
             AND result = 'ok'
             AND expires_at IS NOT NULL
             AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
             AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![room_no],
         |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// 作废某房间仍有效的客卡（TD-218 挂失卡）。
+///
+/// 由 `issue_guest` 在**挂失卡写卡成功后**调用：
+/// - 同房、客卡、未退房、未过期、未作废的旧记录打上 `invalidated_at` + `invalid_reason='lost'`；
+/// - 新发的挂失卡本身打 `invalid_reason='lost_card'`（`invalidated_at` 同样置上），
+///   这样它保留发卡记录与审计，但**不计入**有效卡数（TD-218 要求 activeCards 归零）。
+///
+/// 返回被作废的**旧卡**张数（不含挂失卡本人）。
+pub fn invalidate_guest_cards(
+    conn: &Connection,
+    room_no: &str,
+    new_card_id: i64,
+) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE issuance
+            SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                invalid_reason = 'lost'
+          WHERE room_no = ?1
+            AND id != ?2
+            AND result = 'ok'
+            AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
+            AND expires_at IS NOT NULL
+            AND kind IN ('日租客卡','钟点客卡')
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        params![room_no, new_card_id],
+    )?;
+    conn.execute(
+        "UPDATE issuance
+            SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                invalid_reason = 'lost_card'
+          WHERE id = ?1",
+        params![new_card_id],
     )?;
     Ok(n)
 }
@@ -616,6 +682,7 @@ pub fn latest_active_guest_card(
           WHERE room_no = ?1
             AND result = 'ok'
             AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
             AND expires_at IS NOT NULL
             AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
@@ -640,7 +707,8 @@ pub fn checkout_issuance(
         .query_row(
             "SELECT room_no FROM issuance
               WHERE id = ?1 AND result = 'ok' AND room_no IS NOT NULL
-                AND checked_out_at IS NULL AND expires_at IS NOT NULL
+                AND checked_out_at IS NULL AND invalidated_at IS NULL
+                AND expires_at IS NOT NULL
                 AND kind IN ('日租客卡','钟点客卡')",
             params![id],
             |r| r.get(0),
@@ -654,7 +722,7 @@ pub fn checkout_issuance(
     let n = conn.execute(
         "UPDATE issuance
             SET checked_out_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-          WHERE id = ?1 AND checked_out_at IS NULL",
+          WHERE id = ?1 AND checked_out_at IS NULL AND invalidated_at IS NULL",
         params![id],
     )?;
     if n == 0 {
@@ -662,8 +730,18 @@ pub fn checkout_issuance(
     }
 
     let remaining = count_active_cards(conn, &room_no)?;
+    // TD-214：退房后重算房态。
+    // - 剩余 0：转退房默认态，但维修 / 其他等人工状态不覆盖；
+    // - 仍有卡且当前是「已满房」：回退「未满房」；
+    // - 其余（空净 / 预定 / 未满 / 人工态）：不动。
+    let current = find_room(conn, &room_no)?.map(|r| r.status);
+    let manual = matches!(current.as_deref(), Some("maintenance") | Some("other"));
     if remaining == 0 {
-        set_room_status(conn, &room_no, dirty_status)?;
+        if !manual {
+            set_room_status(conn, &room_no, dirty_status)?;
+        }
+    } else if current.as_deref() == Some("occupied_full") {
+        set_room_status(conn, &room_no, "occupied_partial")?;
     }
     Ok(Some((room_no, remaining)))
 }
@@ -763,6 +841,7 @@ pub fn checkout_room(conn: &Connection, room_no: &str, dirty_status: &str) -> Re
           WHERE room_no = ?1
             AND result = 'ok'
             AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
             AND expires_at IS NOT NULL
             AND kind IN ('日租客卡','钟点客卡')
             AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
@@ -776,12 +855,18 @@ pub fn checkout_room(conn: &Connection, room_no: &str, dirty_status: &str) -> Re
           WHERE room_no = ?1
             AND result = 'ok'
             AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
             AND expires_at IS NOT NULL
             AND kind IN ('日租客卡','钟点客卡')
             AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
         params![room_no],
     )?;
-    set_room_status(conn, room_no, dirty_status)?;
+    // TD-214：与单卡退房同一套重算逻辑 —— 批量退完后剩余必为 0，
+    // 维修 / 其他等人工状态不覆盖。
+    let current = find_room(conn, room_no)?.map(|r| r.status);
+    if !matches!(current.as_deref(), Some("maintenance") | Some("other")) {
+        set_room_status(conn, room_no, dirty_status)?;
+    }
     Ok(n)
 }
 
@@ -1658,6 +1743,34 @@ pub fn record_issuance(conn: &Connection, new: &NewIssuance<'_>) -> Result<i64> 
 /// 注意：这是按**发卡时间**算的估算值 —— 锁按卡内发卡时间计算到期：
 /// 日租卡到发卡日 + N 天的锁内退房钟点，钟点卡到发卡时刻 + N 小时
 ///（见 docs/TEMIC门锁卡技术规格.md §11.1）。
+/// 按新的退房钟点重算**仍有效**的日租客卡到期时间（TD-126 补充）。
+///
+/// 只动未退房、未作废、未过期、有到期时间的日租客卡：
+/// - 已结束的记录保持原样 —— 审计用的历史到期时间不能被改写；
+/// - 已过期的卡不「复活」—— 把钟点改晚也不会让过期卡重新计入有效卡。
+///
+/// 公式与 `record_issuance` 完全一致：本地「开卡日 + N 天」的 HH:00 转 UTC。
+/// 返回被重算的张数。
+pub fn recalc_guest_day_expiry(conn: &Connection, hour: i64) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE issuance
+            SET expires_at = strftime(
+                '%Y-%m-%dT%H:%M:%SZ',
+                strftime('%Y-%m-%d', created_at, '+' || days || ' days', 'localtime')
+                    || printf(' %02d:00:00', ?1),
+                'utc')
+          WHERE kind = '日租客卡'
+            AND days > 0
+            AND result = 'ok'
+            AND checked_out_at IS NULL
+            AND invalidated_at IS NULL
+            AND expires_at IS NOT NULL
+            AND expires_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+        params![hour],
+    )?;
+    Ok(n)
+}
+
 pub fn expiry_modifier(days: i64, hours: i64) -> Option<String> {
     if days > 0 {
         Some(format!("+{days} days"))
@@ -1706,6 +1819,7 @@ pub fn expiring_cards(conn: &Connection, within_minutes: i64) -> Result<Vec<Expi
            LEFT JOIN room r ON r.room_no = i.room_no
           WHERE i.id IN (SELECT id FROM latest)
             AND i.checked_out_at IS NULL
+            AND i.invalidated_at IS NULL
             AND i.expires_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')
             AND i.expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '+' || ?1 || ' minutes')
           ORDER BY i.expires_at",
@@ -1827,7 +1941,7 @@ pub fn find_issuance_by_raw(
 
     let sql = format!(
         "SELECT {ISSUANCE_COLUMNS} FROM issuance{where_sql} \
-         ORDER BY CASE WHEN result = 'ok' AND checked_out_at IS NULL THEN 0 ELSE 1 END, \
+         ORDER BY CASE WHEN result = 'ok' AND checked_out_at IS NULL AND invalidated_at IS NULL THEN 0 ELSE 1 END, \
                   created_at DESC, id DESC LIMIT 1"
     );
     let latest = conn.query_row(
@@ -1846,7 +1960,7 @@ pub fn find_issuance_by_raw(
 /// 记录是否仍有效（发卡成功且未退房）。
 pub fn issuance_is_active(conn: &Connection, id: i64) -> Result<bool> {
     Ok(conn.query_row(
-        "SELECT (result = 'ok' AND checked_out_at IS NULL) FROM issuance WHERE id = ?1",
+        "SELECT (result = 'ok' AND checked_out_at IS NULL AND invalidated_at IS NULL) FROM issuance WHERE id = ?1",
         params![id],
         |r| r.get::<_, i64>(0).map(|v| v != 0),
     )?)
@@ -2528,7 +2642,9 @@ pub struct GuestStay {
     pub start: String,
     pub end: String,
     pub planned_end: String,
-    pub checked_out: bool,
+    /// 入住状态（TD-215 补充）：`active` / `checked_out` / `invalidated` / `expired`。
+    /// 过期未退房的记录不能再显示成「入住中」。
+    pub status: String,
 }
 
 pub fn list_guest_stays(conn: &Connection, from: &str, to: &str) -> Result<Vec<GuestStay>> {
@@ -2538,16 +2654,21 @@ pub fn list_guest_stays(conn: &Connection, from: &str, to: &str) -> Result<Vec<G
     let mut stmt = conn.prepare(
         "SELECT id, room_no, guest_name, kind, days, hours,
                 date(created_at, '-6 hours', 'localtime') AS start,
-                date(COALESCE(checked_out_at, expires_at), 'localtime') AS end,
+                date(COALESCE(checked_out_at, invalidated_at, expires_at), 'localtime') AS end,
                 date(expires_at, 'localtime') AS planned_end,
-                checked_out_at IS NOT NULL AS checked_out
+                CASE
+                    WHEN checked_out_at IS NOT NULL THEN 'checked_out'
+                    WHEN invalidated_at IS NOT NULL THEN 'invalidated'
+                    WHEN expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now') THEN 'expired'
+                    ELSE 'active'
+                END AS status
            FROM issuance
           WHERE result = 'ok'
             AND room_no IS NOT NULL
             AND expires_at IS NOT NULL
             AND kind IN ('日租客卡','钟点客卡')
             AND date(created_at, '-6 hours', 'localtime') < ?2
-            AND date(COALESCE(checked_out_at, expires_at), 'localtime') >= ?1
+            AND date(COALESCE(checked_out_at, invalidated_at, expires_at), 'localtime') >= ?1
           ORDER BY created_at, id",
     )?;
     let rows = stmt.query_map(params![from, to], |r| {
@@ -2561,7 +2682,7 @@ pub fn list_guest_stays(conn: &Connection, from: &str, to: &str) -> Result<Vec<G
             start: r.get(6)?,
             end: r.get(7)?,
             planned_end: r.get(8)?,
-            checked_out: r.get::<_, i64>(9)? != 0,
+            status: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -3364,6 +3485,53 @@ mod tests {
             .query_row("SELECT expires_at FROM issuance WHERE id = ?1", params![id3], |r| r.get(0))
             .unwrap();
         assert_eq!(actual3, expected3, "钟点卡仍按发卡时刻顺延");
+
+        cleanup(conn, path);
+    }
+
+    /// TD-126 补充：改退房钟点后，只重算仍有效的日租客卡；已退房记录保持原样。
+    #[test]
+    fn recalc_guest_day_expiry_moves_active_cards_only() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "701", None, None, None, None).unwrap();
+        set_setting(&conn, "checkoutHour", "12").unwrap();
+        let active = record_issuance(&conn, &sample_issuance(Some("701"), "日租客卡", 2, 0)).unwrap();
+        let gone = record_issuance(&conn, &sample_issuance(Some("701"), "日租客卡", 2, 0)).unwrap();
+        checkout_issuance(&conn, gone, "vacant_dirty").unwrap();
+
+        let expiry = |id: i64| -> String {
+            conn.query_row(
+                "SELECT expires_at FROM issuance WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let active_before = expiry(active);
+        let gone_before = expiry(gone);
+
+        let n = recalc_guest_day_expiry(&conn, 14).unwrap();
+        assert_eq!(n, 1, "只应重算仍有效的那张");
+        let active_after = expiry(active);
+        assert_ne!(active_after, active_before, "在用卡的到期时间应随钟点变化");
+        assert_eq!(expiry(gone), gone_before, "已退房记录的到期时间不能被改写");
+
+        // 与发卡同一公式：本地「开卡日 + 2 天」的 14:00 转 UTC
+        let expected: String = conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',
+                           strftime('%Y-%m-%d', created_at, '+2 days', 'localtime') || ' 14:00:00',
+                           'utc')
+                   FROM issuance WHERE id = ?1",
+                params![active],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_after, expected);
+
+        // 改回 12 点：仍只命中 1 张，且结果回到最初的值
+        assert_eq!(recalc_guest_day_expiry(&conn, 12).unwrap(), 1);
+        assert_eq!(expiry(active), active_before);
 
         cleanup(conn, path);
     }
@@ -4187,6 +4355,144 @@ mod tests {
 
         // 不存在的记录
         assert!(checkout_issuance(&conn, 99999, "vacant_dirty").unwrap().is_none());
+
+        cleanup(conn, path);
+    }
+
+    /// TD-215 补充：日历入住状态四分 —— 过期未退房不能显示成「入住中」。
+    #[test]
+    fn guest_stays_expose_all_four_states() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "601", None, None, None, None).unwrap();
+        let active = record_issuance(&conn, &sample_issuance(Some("601"), "日租客卡", 2, 0)).unwrap();
+        let checked = record_issuance(&conn, &sample_issuance(Some("601"), "日租客卡", 2, 0)).unwrap();
+        let invalid = record_issuance(&conn, &sample_issuance(Some("601"), "日租客卡", 2, 0)).unwrap();
+        let expired = record_issuance(&conn, &sample_issuance(Some("601"), "日租客卡", 2, 0)).unwrap();
+
+        checkout_issuance(&conn, checked, "vacant_dirty").unwrap();
+        conn.execute(
+            "UPDATE issuance
+                SET invalidated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                    invalid_reason = 'lost'
+              WHERE id = ?1",
+            params![invalid],
+        )
+        .unwrap();
+        // 模拟「8 号入住、9 号到期、今天 10 号都没退房」：只让 expires_at 过期
+        conn.execute(
+            "UPDATE issuance
+                SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day')
+              WHERE id = ?1",
+            params![expired],
+        )
+        .unwrap();
+
+        let from: String = conn
+            .query_row("SELECT date('now','localtime','-7 days')", [], |r| r.get(0))
+            .unwrap();
+        let to: String = conn
+            .query_row("SELECT date('now','localtime','+7 days')", [], |r| r.get(0))
+            .unwrap();
+        let stays = list_guest_stays(&conn, &from, &to).unwrap();
+        let state = |id: i64| -> Option<String> {
+            stays.iter().find(|s| s.id == id).map(|s| s.status.clone())
+        };
+
+        assert_eq!(state(active).as_deref(), Some("active"));
+        assert_eq!(state(checked).as_deref(), Some("checked_out"));
+        assert_eq!(state(invalid).as_deref(), Some("invalidated"));
+        assert_eq!(state(expired).as_deref(), Some("expired"), "过期未退房不能算在住");
+
+        cleanup(conn, path);
+    }
+
+    /// TD-218：挂失卡作废同房旧客卡。已退房记录不被二次作废，挂失卡本身不计入有效卡。
+    #[test]
+    fn invalidate_guest_cards_skips_closed_records() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "512", None, None, None, None).unwrap();
+        let old1 = record_issuance(&conn, &sample_issuance(Some("512"), "日租客卡", 1, 0)).unwrap();
+        let old2 = record_issuance(&conn, &sample_issuance(Some("512"), "日租客卡", 2, 0)).unwrap();
+        let gone = record_issuance(&conn, &sample_issuance(Some("512"), "日租客卡", 1, 0)).unwrap();
+        assert!(checkout_issuance(&conn, gone, "vacant_dirty").unwrap().is_some());
+        assert_eq!(count_active_cards(&conn, "512").unwrap(), 2);
+        assert!(latest_active_guest_card(&conn, "512").unwrap().is_some());
+
+        // 发一张挂失卡 → 作废仍有效的两张旧卡
+        let lost_card =
+            record_issuance(&conn, &sample_issuance(Some("512"), "日租客卡", 1, 0)).unwrap();
+        let n = invalidate_guest_cards(&conn, "512", lost_card).unwrap();
+        assert_eq!(n, 2, "两张仍有效的旧卡应被作废");
+        assert_eq!(count_active_cards(&conn, "512").unwrap(), 0, "挂失卡本身不计入有效卡");
+        assert!(latest_active_guest_card(&conn, "512").unwrap().is_none());
+
+        let reason = |id: i64| -> Option<String> {
+            conn.query_row(
+                "SELECT invalid_reason FROM issuance WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(reason(old1).as_deref(), Some("lost"));
+        assert_eq!(reason(old2).as_deref(), Some("lost"));
+        assert_eq!(reason(lost_card).as_deref(), Some("lost_card"));
+        assert!(reason(gone).is_none(), "已退房记录不应被二次作废");
+        assert!(!issuance_is_active(&conn, lost_card).unwrap());
+
+        cleanup(conn, path);
+    }
+
+    /// TD-214：已满房退掉一张 → 未满房；退最后一张 → 退房默认态。
+    #[test]
+    fn checkout_downgrades_full_room_to_partial() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "311", None, None, None, None).unwrap();
+        let id1 = record_issuance(&conn, &sample_issuance(Some("311"), "日租客卡", 1, 0)).unwrap();
+        let id2 = record_issuance(&conn, &sample_issuance(Some("311"), "日租客卡", 1, 0)).unwrap();
+        set_room_status(&conn, "311", "occupied_full").unwrap();
+
+        let (_, remaining) = checkout_issuance(&conn, id1, "vacant_dirty").unwrap().unwrap();
+        assert_eq!(remaining, 1);
+        assert_eq!(
+            find_room(&conn, "311").unwrap().unwrap().status,
+            "occupied_partial",
+            "还剩 1 张有效卡，已满房应回退未满房"
+        );
+
+        let (_, remaining) = checkout_issuance(&conn, id2, "vacant_dirty").unwrap().unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(
+            find_room(&conn, "311").unwrap().unwrap().status,
+            "vacant_dirty",
+            "最后一张退掉后转退房默认态"
+        );
+
+        cleanup(conn, path);
+    }
+
+    /// TD-214：维修 / 其他等人工房态不被退房覆盖（单卡与批量两条路径）。
+    #[test]
+    fn checkout_keeps_manual_room_status() {
+        let (conn, path) = temp_db();
+        insert_room(&conn, "312", None, None, None, None).unwrap();
+        let id1 = record_issuance(&conn, &sample_issuance(Some("312"), "日租客卡", 1, 0)).unwrap();
+        set_room_status(&conn, "312", "maintenance").unwrap();
+        checkout_issuance(&conn, id1, "vacant_dirty").unwrap().unwrap();
+        assert_eq!(
+            find_room(&conn, "312").unwrap().unwrap().status,
+            "maintenance",
+            "维修房退房后仍是维修"
+        );
+
+        let _id2 = record_issuance(&conn, &sample_issuance(Some("312"), "日租客卡", 1, 0)).unwrap();
+        set_room_status(&conn, "312", "other").unwrap();
+        checkout_room(&conn, "312", "vacant_dirty").unwrap();
+        assert_eq!(
+            find_room(&conn, "312").unwrap().unwrap().status,
+            "other",
+            "其他房批量退房后仍是其他"
+        );
 
         cleanup(conn, path);
     }

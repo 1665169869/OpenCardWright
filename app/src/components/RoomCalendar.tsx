@@ -46,7 +46,8 @@ type GuestSpan = {
   days: number
   hours: number
   plannedEnd: string
-  checkedOut: boolean
+  /** 入住状态：active / checked_out / invalidated / expired */
+  status: string
   expiresAt: string
 }
 
@@ -62,6 +63,42 @@ const truncMask = (endPos: number, totalDays: number): React.CSSProperties =>
         WebkitMaskImage: 'linear-gradient(to right, #000 calc(100% - 18px), transparent)',
       }
     : {}
+
+/** 入住色块外观（TD-215 补充）：在住 / 已退房 / 已作废 / 已过期 */
+const STAY_STYLE: Record<
+  string,
+  { label: string; bg: string; border: string; color: string; badgeBg?: string }
+> = {
+  active: {
+    label: '入住中',
+    bg: 'rgba(82, 196, 26, 0.16)',
+    border: '1px solid rgba(82, 196, 26, 0.45)',
+    color: '#389e0d',
+    badgeBg: 'rgba(82, 196, 26, 0.35)',
+  },
+  checked_out: {
+    label: '已退房',
+    bg: 'rgba(0, 0, 0, 0.05)',
+    border: '1px dashed rgba(0, 0, 0, 0.25)',
+    color: '#8c8c8c',
+  },
+  invalidated: {
+    label: '已作废',
+    bg: 'rgba(114, 46, 209, 0.1)',
+    border: '1px dashed rgba(114, 46, 209, 0.45)',
+    color: '#722ed1',
+    badgeBg: 'rgba(114, 46, 209, 0.45)',
+  },
+  expired: {
+    label: '已过期',
+    bg: 'rgba(250, 173, 20, 0.14)',
+    border: '1px dashed rgba(250, 173, 20, 0.55)',
+    color: '#d46b08',
+    badgeBg: 'rgba(250, 173, 20, 0.55)',
+  },
+}
+/** 未知状态按「已过期」处理：宁可显示成历史，也不要误标成在住 */
+const stayStyle = (status: string) => STAY_STYLE[status] ?? STAY_STYLE.expired
 
 /**
  * 房态房间日历图（TD-203）：行 = 房间，列 = 日期，默认当月、可切月。
@@ -195,7 +232,7 @@ export default function RoomCalendar({
             days: s.days,
             hours: s.hours,
             plannedEnd: s.plannedEnd,
-            checkedOut: s.checkedOut,
+            status: s.status,
             expiresAt: s.plannedEnd,
           })
         }
@@ -515,10 +552,11 @@ export default function RoomCalendar({
                       const span = guestSpanOf(g)
                       if (!span) return null
                       const [s, e] = span
+                      const st = stayStyle(g.status)
                       return (
                         <div
                           key={g.id}
-                          title={`${room.roomNo} ${g.checkedOut ? '历史入住' : '入住中'} · ${g.start} → ${g.end}（点击查看入住详情）`}
+                          title={`${room.roomNo} ${st.label} · ${g.start} → ${g.end}（点击查看入住详情）`}
                           onClick={(ev) => {
                             ev.stopPropagation()
                             setStayDetail({ roomNo: room.roomNo, span: g })
@@ -529,12 +567,8 @@ export default function RoomCalendar({
                             top: 4,
                             height: ROW_H - 8,
                             borderRadius: 4,
-                            background: g.checkedOut
-                              ? 'rgba(0, 0, 0, 0.05)'
-                              : 'rgba(82, 196, 26, 0.16)',
-                            border: g.checkedOut
-                              ? '1px dashed rgba(0, 0, 0, 0.25)'
-                              : '1px solid rgba(82, 196, 26, 0.45)',
+                            background: st.bg,
+                            border: st.border,
                             cursor: 'pointer',
                             zIndex: 0,
                             overflow: 'hidden',
@@ -542,11 +576,11 @@ export default function RoomCalendar({
                             fontSize: 13,
                             lineHeight: `${ROW_H - 8}px`,
                             padding: '0 48px 0 8px',
-                            color: g.checkedOut ? '#8c8c8c' : '#389e0d',
+                            color: st.color,
                             ...truncMask(e, days.length),
                           }}
                         >
-                          {!g.checkedOut ? (
+                          {st.badgeBg ? (
                             <span
                               style={{
                                 position: 'absolute',
@@ -556,11 +590,11 @@ export default function RoomCalendar({
                                 lineHeight: '14px',
                                 padding: '0 4px',
                                 borderRadius: 3,
-                                background: 'rgba(82, 196, 26, 0.35)',
+                                background: st.badgeBg,
                                 color: '#fff',
                               }}
                             >
-                              入住中
+                              {st.label}
                             </span>
                           ) : null}
                           {g.guestName ? g.guestName : `入住 ${shortRange(g.start, g.end)}`}
@@ -668,7 +702,11 @@ export default function RoomCalendar({
             </Descriptions.Item>
             <Descriptions.Item label="状态">
               {(() => {
-                const left = Date.parse(stayDetail.span.expiresAt) - Date.now()
+                const span = stayDetail.span
+                if (span.status === 'checked_out') return <Tag>已退房</Tag>
+                if (span.status === 'invalidated') return <Tag color="purple">已作废</Tag>
+                if (span.status === 'expired') return <Tag color="orange">已过期</Tag>
+                const left = Date.parse(span.expiresAt) - Date.now()
                 return left <= 24 * 3600 * 1000 ? (
                   <Tag color="orange">即将到期</Tag>
                 ) : (

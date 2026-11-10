@@ -4,17 +4,15 @@
  * 设备是**独立的**：走华视身份证读卡服务的本地 WebSocket（默认 `ws://127.0.0.1:9001`），
  * 与发卡用的 125 kHz 读卡器（`PMSLockCard.exe` 子进程）完全无关。
  *
- * 协议（用户确认）：连上之后**不发任何命令**，服务读到身份证就推一条 JSON。
+ * 协议（2026-11-10 真机实测）：连上后必须由客户端发读卡命令（`04`，不拿起模式），服务随后返回结果。
  * 各版本厂商服务的字段名不一致（英文 / 拼音缩写 / 中文），这里做宽容归一；
  * 归一不出任何字段就当成心跳忽略，直到超时——读卡器没放卡时不能让表单卡死。
  */
 
 export const ID_CARD_WS_URL = 'ws://127.0.0.1:9001'
 
-/** 读卡请求：服务不会主动推送，必须由客户端发起（03 = 读身份证，超时 10 秒） */
-const READ_CMD = '03?timeout=10000'
-/** 停止读卡（读失败/超时时发一条，只做复位，不阻塞界面） */
-const STOP_CMD = '04?timeout=10000'
+/** 读卡请求：服务不会主动推送，必须由客户端发起（04 = 读身份证，不拿起模式，超时 10 秒） */
+const READ_CMD = '04?timeout=10000'
 
 /** 读到的身份证信息，字段名与发卡表单的 `GuestInput` 对齐 */
 export interface IdCardInfo {
@@ -137,18 +135,11 @@ export function readIdCard(timeoutMs = 8000): Promise<IdCardInfo> {
     let settled = false
     let ws: WebSocket | undefined
 
-    const finish = (fn: () => void, abort = false) => {
+    const finish = (fn: () => void) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      if (abort) {
-        // 让设备停止读卡（只做复位，不等回执、不阻塞界面）
-        try {
-          ws?.send(STOP_CMD)
-        } catch {
-          // 连接已经断了就算了
-        }
-      }
+      // 不再向厂商服务发「停止读卡」命令：04 现在就是读卡命令，超时/失败只断开连接
       try {
         ws?.close()
       } catch {
@@ -166,7 +157,6 @@ export function readIdCard(timeoutMs = 8000): Promise<IdCardInfo> {
                 '并且身份证已经放到读卡器上',
             ),
           ),
-        true, // 通知设备停止读卡
       )
     }, timeoutMs)
 

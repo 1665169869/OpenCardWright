@@ -50,7 +50,7 @@ export default function Logs({ canAdmin }: { canAdmin: boolean }) {
         items={[
           { key: 'issuance', label: '发卡记录', children: <IssuanceTab canAdmin={canAdmin} /> },
           { key: 'checkin', label: '入住记录', children: <CheckinTab canAdmin={canAdmin} /> },
-          { key: 'reservation', label: '预定记录', children: <ReservationTab /> },
+          { key: 'reservation', label: '预定记录', children: <ReservationTab canAdmin={canAdmin} /> },
           { key: 'audit', label: '操作审计', children: <AuditTab /> },
         ]}
       />
@@ -496,7 +496,7 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
 
 /** 预定记录（TD-167）：有效 / 已入住 / 已取消都保留，可按房号、姓名、状态、入住日查询。
  *  只读视图；改期 / 取消仍在日历里操作。 */
-function ReservationTab() {
+function ReservationTab({ canAdmin }: { canAdmin: boolean }) {
   const [rows, setRows] = useState<Reservation[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
@@ -508,6 +508,7 @@ function ReservationTab() {
   const [toDay, setToDay] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const [msg, setMsg] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -534,6 +535,24 @@ function ReservationTab() {
   useEffect(() => {
     void load()
   }, [load])
+
+  /** 导出当前筛选条件下的预定记录（TD-205）：只给管理员，范围不受分页限制。 */
+  const doExport = async () => {
+    setErr(null)
+    setMsg(null)
+    try {
+      const r = await api.exportReservationsCsv({
+        roomNo: roomNo.trim() || null,
+        guestName: guestName.trim() || null,
+        status,
+        from: fromDay,
+        to: toDay,
+      })
+      setMsg(`已导出 ${r.rows} 行到 ${r.path}（${bytesText(r.bytes)}），Excel 可直接打开`)
+    } catch (e) {
+      setErr(describeError(e))
+    }
+  }
 
   const statusTag = (s: string) => {
     if (s === 'cancelled') return <Tag>已取消</Tag>
@@ -597,12 +616,18 @@ function ReservationTab() {
           刷新
         </Button>
         <Button onClick={() => void load()}>查询</Button>
+        {canAdmin ? (
+          <Button type="primary" onClick={() => void doExport()}>
+            导出 CSV
+          </Button>
+        ) : null}
         <Text type="secondary" style={{ fontSize: 12 }}>
           含已取消 / 已入住；改期与取消仍到日历操作
         </Text>
       </Space>
 
       {err ? <Alert type="error" showIcon message="操作失败" description={err} /> : null}
+      {msg ? <Alert type="success" showIcon message="导出完成" description={msg} /> : null}
 
       <Table<Reservation>
         size="small"

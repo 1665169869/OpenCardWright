@@ -340,6 +340,15 @@ export default function IssueForm({
                 {result.card.rawHex}
               </Text>
             </div>
+            {result.invalidated > 0 ? (
+              <Alert
+                style={{ marginTop: 8 }}
+                type="warning"
+                showIcon
+                message={`已作废 ${result.invalidated} 张同房有效卡`}
+                description="旧卡已在本机记录里标记失效：房间有效卡数、续住 / 换房与日历统计都按新口径计算。旧卡在门锁上要靠这张挂失卡才能失效，请务必拿去刷一次门锁。"
+              />
+            ) : null}
           </Card>
         ) : null}
       </Space>

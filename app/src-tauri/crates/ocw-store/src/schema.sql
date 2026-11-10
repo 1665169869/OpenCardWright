@@ -55,7 +55,11 @@ CREATE TABLE IF NOT EXISTS issuance (
     id_valid_to      TEXT,
     id_authority     TEXT,
     id_device_model  TEXT,
-    id_device_serial TEXT
+    id_device_serial TEXT,
+    -- 作废（v13 / TD-218）：挂失卡写卡成功后，同房仍有效的旧客卡在这里打时间戳。
+    -- 与 checked_out_at 区分语义：退房是客人离开，作废是卡被挂失顶掉。
+    invalidated_at   TEXT,
+    invalid_reason   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_issuance_card_no ON issuance (card_no);

@@ -162,8 +162,13 @@ function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
     setErr(null)
     setMsg(null)
     try {
-      setHour(await api.setCheckoutHour(hour))
-      setMsg('已保存；发卡页与日租卡到期时间将按此钟点计算')
+      const res = await api.setCheckoutHour(hour)
+      setHour(res.hour)
+      setMsg(
+        res.recalculated > 0
+          ? `已保存，并按新钟点重算了 ${res.recalculated} 张在用日租卡的到期时间`
+          : '已保存；发卡页与日租卡到期时间将按此钟点计算',
+      )
       onChanged?.()
     } catch (e) {
       setErr(describeError(e))

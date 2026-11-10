@@ -223,6 +223,7 @@ fn main() {
             commands::list_guest_stays,
             commands::list_audits,
             commands::export_issuances_csv,
+            commands::export_reservations_csv,
             commands::import_rooms,
             commands::get_onboarding_status,
             commands::complete_onboarding,

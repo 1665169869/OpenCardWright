@@ -165,6 +165,16 @@ export interface CheckoutResult {
   roomNo: string
   cardsClosed: number
   status: string
+  /** 非本系统卡退房时是否真的把卡擦成空白卡（TD-212） */
+  erased: boolean
+  /** 擦卡失败原因（要求擦卡但没擦成时才有值） */
+  eraseError: string | null
+}
+
+/** 保存退房钟点的结果（TD-126 补充）：同时返回按新钟点重算的在用日租卡张数 */
+export interface CheckoutHourResult {
+  hour: number
+  recalculated: number
 }
 
 /** 预定记录。日期是本地日期（YYYY-MM-DD），退房日不含（住 1 晚 = 今天→明天）。 */
@@ -197,7 +207,8 @@ export interface GuestStay {
   start: string
   end: string
   plannedEnd: string
-  checkedOut: boolean
+  /** 入住状态：active / checked_out / invalidated / expired（过期未退房不再算在住） */
+  status: string
 }
 
 export interface ReservationFilter {
@@ -467,6 +478,8 @@ export interface IssuedCard {
   room: Room | null
   /** 到期时间（UTC ISO8601 估算值）；无时长的卡型为 null。 */
   expiresAt: string | null
+  /** 挂失卡发卡时作废的同房旧客卡张数（TD-218）；普通发卡为 0。 */
+  invalidated: number
 }
 
 /** Rust 端 `CommandError` 的结构；invoke 抛出来就是它。 */
@@ -640,6 +653,21 @@ export const api = {
       to: f.to ?? null,
       guestOnly,
     }),
+  /** 导出预定记录 CSV（管理员）：按当前筛选导出全量，不按分页（TD-205） */
+  exportReservationsCsv: (f: {
+    roomNo?: string | null
+    guestName?: string | null
+    status?: string | null
+    from?: string | null
+    to?: string | null
+  }) =>
+    invoke<CsvResult>('export_reservations_csv', {
+      roomNo: f.roomNo ?? null,
+      guestName: f.guestName ?? null,
+      status: f.status ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+    }),
 
   /** 自动备份设置（管理员） */
   getBackupSettings: () => invoke<BackupSettings>('get_backup_settings'),
@@ -666,8 +694,8 @@ export const api = {
    * 强制退房：卡不是本系统发的，本地没有发卡记录，按前端从卡片里读出的房号
    * 直接写入退房数据（关闭该房全部有效卡 + 改房态）。调用前必须让用户二次确认。
    */
-  forceCheckoutCard: (roomNo: string) =>
-    invoke<CheckoutResult>('force_checkout_card', { roomNo }),
+  forceCheckoutCard: (roomNo: string, erase = true) =>
+    invoke<CheckoutResult>('force_checkout_card', { roomNo, erase }),
   /** 退房后要转成的房态 key（设置项） */
   getCheckoutStatus: () => invoke<string>('get_checkout_status'),
   setCheckoutStatus: (status: string) => invoke<void>('set_checkout_status', { status }),
@@ -709,7 +737,8 @@ export const api = {
   getReminderSettings: () => invoke<ReminderSettings>('get_reminder_settings'),
   /** 退房钟点（TD-126）：读 = 登录即可；写 = 管理员（0–23，返回保存值） */
   getCheckoutHour: () => invoke<number>('get_checkout_hour'),
-  setCheckoutHour: (hour: number) => invoke<number>('set_checkout_hour', { hour }),
+  setCheckoutHour: (hour: number) =>
+    invoke<CheckoutHourResult>('set_checkout_hour', { hour }),
   setReminderSettings: (enabled: boolean, minutes: number, sound: boolean, voice?: boolean) =>
     invoke<ReminderSettings>('set_reminder_settings', {
       enabled,
