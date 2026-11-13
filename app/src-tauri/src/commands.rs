@@ -18,7 +18,10 @@ use tauri::State;
 
 use ocw_store::DbConnection as Connection;
 
-use ocw_device::{CardKind, CardSnapshot, DeviceError};
+use ocw_device::{
+    CardDuration, CardIssuedAt, CardKind, CardSnapshot, CheckoutHourSpec, DeviceError, GuestDaySpec,
+    GuestHourSpec, InstallSpec, MasterSpec, PlainCardSpec, RawSpec, TimeSyncSpec,
+};
 use ocw_store::{self, IssuanceRecord, Room, StoreError};
 
 use crate::rules::{self, CardTier};
@@ -77,6 +80,11 @@ pub struct AppInfo {
     pub sdk_source: Option<String>,
     /// 开发构建（`tauri dev`）为 true
     pub dev: bool,
+    /// 发布通道：`dev` = 调试构建 / DEV 安装包，`release` = 正式版。
+    ///
+    /// 与 `dev` 的区别：DEV 安装包是 **release 构建**（`dev=false`），靠编译期
+    /// `OCW_CHANNEL=dev` 区分；顶栏的「正式版 / DEV」标签看这个字段。
+    pub channel: String,
 }
 
 /// 读卡页 B 区：记录查询的四种结果。
@@ -99,6 +107,27 @@ pub enum RecordLookup {
 pub struct CardReadDto {
     pub card: CardSnapshot,
     pub lookup: RecordLookup,
+}
+
+/// 读到的身份证信息。字段名与前端 `GuestInput` / `CheckinGuest` 对齐。
+///
+/// 头像**不在**这里：硬件层解析时直接丢弃，既不落库也不过 IPC。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdCardDto {
+    pub name: Option<String>,
+    pub gender: Option<String>,
+    pub nation: Option<String>,
+    /// 出生日期，已归一成 `YYYY-MM-DD`
+    pub birth_date: Option<String>,
+    pub address: Option<String>,
+    pub id_number: Option<String>,
+    /// 证件有效期起 / 止，保留厂商原样格式（多为 `YYYYMMDD`）
+    pub id_valid_from: Option<String>,
+    pub id_valid_to: Option<String>,
+    pub id_authority: Option<String>,
+    pub device_model: Option<String>,
+    pub device_serial: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -139,9 +168,29 @@ where
     }
 }
 
+/// 按 `room_index` 把房号文本补进快照。
+///
+/// 硬件层只认序号，房号的真值在业务库。查到就填上；查不到（房间已被删、序号还没入库）
+/// 也**不算错误**——卡片数据本身一定要返回，界面上 `roomIndex` 仍然可读。
+fn attach_room(
+    db: &Arc<Mutex<Connection>>,
+    mut card: CardSnapshot,
+) -> Result<CardSnapshot, CommandError> {
+    if card.room_index < 0 {
+        return Ok(card);
+    }
+    let Ok(index) = u16::try_from(card.room_index) else {
+        return Ok(card);
+    };
+    let conn = lock_db(db)?;
+    if let Some(room) = ocw_store::find_room_by_index(&conn, index)? {
+        card.room = Some(room.room_no);
+    }
+    Ok(card)
+}
+
 /// 记录查询。**这里绝不能把数据库错误吞成"未查到"。**
-fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLookup {
-    let card_no = match card.card_no {
+fn lookup_record(db: &Arc<Mutex<Connection>>, card: &CardSnapshot) -> RecordLookup {    let card_no = match card.card_no {
         Some(no) => no,
         None => {
             let reason = if card.kind.is_blank() {
@@ -229,8 +278,9 @@ fn app_info_of(state: &AppState) -> AppInfo {
         driver_sha256: state.driver_sha256.clone(),
         simulation: state.device().is_sim(),
         port: state.port(),
-        sdk_source: state.sdk_source.clone(),
+        sdk_source: state.device_source.clone(),
         dev: state.dev,
+        channel: crate::provision::channel().to_string(),
     }
 }
 
@@ -256,8 +306,9 @@ pub async fn set_port(state: State<'_, AppState>, port: u8) -> Result<AppInfo, C
         let conn = lock_db(&state.db)?;
         ocw_store::set_setting(&conn, "port", &port.to_string())?;
     }
+    let device = state.device();
     state
-        .rebuild_device(port)
+        .set_port(&device, port)
         .map_err(|m| CommandError::new(-3, m, "重启程序后再试"))?;
 
     Ok(app_info_of(&state))
@@ -271,9 +322,44 @@ pub async fn read_card(state: State<'_, AppState>) -> Result<CardReadDto, Comman
     let db = state.db.clone();
 
     blocking(move || {
-        let card = device.read_card()?;
+        let card = attach_room(&db, device.read_card()?)?;
         let lookup = lookup_record(&db, &card);
         Ok(CardReadDto { card, lookup })
+    })
+    .await
+}
+
+/// 读一张身份证。
+///
+/// # 为什么只在前端做「自动填表」
+///
+/// 身份证读卡器是**独立设备**：没插、没放证、厂商服务没起，都只影响自动填表，
+/// 手填照样能登记。所以这里不做任何业务校验，失败就是失败，由界面提示重试。
+///
+/// 协议细节（9001 端口、`|` 分隔文本、字段别名）全部在硬件层，前端不再自己连 WebSocket。
+#[tauri::command]
+pub async fn read_id_card(state: State<'_, AppState>) -> Result<IdCardDto, CommandError> {
+    require_login(&state)?;
+    let reader = state.id_card();
+
+    blocking(move || {
+        let data = reader
+            .read(&rc_device::IdCardReadSpec::default())
+            .map_err(|e| DeviceError::from_payload(e.payload()))?;
+
+        Ok(IdCardDto {
+            name: data.name,
+            gender: data.gender,
+            nation: data.nation,
+            birth_date: data.birth_date,
+            address: data.address,
+            id_number: data.id_number,
+            id_valid_from: data.valid_from,
+            id_valid_to: data.valid_to,
+            id_authority: data.id_authority,
+            device_model: data.device_model,
+            device_serial: data.device_serial,
+        })
     })
     .await
 }
@@ -297,11 +383,21 @@ pub async fn list_rooms(state: State<'_, AppState>) -> Result<Vec<Room>, Command
 pub async fn create_room(
     state: State<'_, AppState>,
     room_no: String,
-    room_index: Option<u8>,
+    room_index: Option<u16>,
     room_type_id: Option<i64>,
 ) -> Result<ocw_store::RoomUpsert, CommandError> {
     let me = require_admin(&state)?;
     let room_no = require_room_no(&room_no)?;
+    // 4095 与总控卡页1 字节相同（5B EC F0 FF）；数据层也会拒，这里先给出可读提示。
+    if let Some(index) = room_index {
+        if index > ocw_store::MAX_ROOM_INDEX {
+            return Err(CommandError::new(
+                1,
+                format!("房间序号 {index} 超出范围（0–{}）", ocw_store::MAX_ROOM_INDEX),
+                "4095 与总控卡字节相同，不能分配给房间",
+            ));
+        }
+    }
     let db = state.db.clone();
     blocking(move || {
         let conn = lock_db(&db)?;
@@ -457,10 +553,9 @@ pub async fn issue_install_card(
         }
 
         // 设备调用期间不持有数据库锁
-        let card = device.issue(
-            &["--type", "install", "--room", room_no.as_str()],
-            Some(room.room_index),
-        )?;
+        let card = device.write_install(&InstallSpec {
+            room_index: room.room_index,
+        })?;
 
         {
             let conn = lock_db(&db)?;
@@ -472,6 +567,8 @@ pub async fn issue_install_card(
                     kind: "安装卡",
                     days: 0,
                     hours: 0,
+                    // 安装卡不含作业流水号（页2 固定 46 F2 00 01）
+                    card_no: None,
                     raw_hex: Some(card.raw_hex.as_str()),
                     operator_id: Some(me.operator_id),
                     reader_id: None,
@@ -591,6 +688,16 @@ fn admin_card_timestamp_at(req: &AdminCardRequest) -> chrono::DateTime<Local> {
     Local::now()
 }
 
+/// 本地时刻 → 硬件层的发卡时刻（年/月/日/时，卡内没有分钟）。
+fn issued_at_from(dt: chrono::DateTime<Local>) -> CardIssuedAt {
+    CardIssuedAt {
+        year: dt.year(),
+        month: u8::try_from(dt.month()).unwrap_or(1),
+        day: u8::try_from(dt.day()).unwrap_or(1),
+        hour: u8::try_from(dt.hour()).unwrap_or(0),
+    }
+}
+
 impl AdminCardRequest {
     fn label(&self) -> &'static str {
         match self {
@@ -605,84 +712,117 @@ impl AdminCardRequest {
         }
     }
 
-    /// 转成 CLI 参数（不含末尾的 `--json`，由 `Device::issue` 补）。
-    fn to_args(&self) -> Result<Vec<String>, CommandError> {
-        let mut a: Vec<String> = Vec::new();
+    /// 校验参数并转成写卡动作。
+    ///
+    /// 以前这里拼的是 CLI 参数数组（`--type` / `--room` / `--days`）：拼错只有运行期
+    /// 才发现，产品侧还被迫知道设备层的参数拼写。现在返回枚举，每个卡型都必须有
+    /// 对应的写入方法，改协议时编译期就会红。
+    fn prepare(
+        &self,
+        room_index: Option<u16>,
+        at: chrono::DateTime<Local>,
+    ) -> Result<AdminWrite, CommandError> {
         match self {
             Self::Master { days, hours } => {
-                a.push("--type".into());
-                a.push("master".into());
                 if let Some(h) = hours {
                     rules::validate_hours(CardTier::Master, *h)
                         .map_err(|m| CommandError::new(1, m, ""))?;
-                    a.push("--hours".into());
-                    a.push(h.to_string());
+                    Ok(AdminWrite::Master(CardDuration::Hours(*h)))
                 } else {
                     let d = days.unwrap_or(1);
                     rules::validate_days(CardTier::Master, d)
                         .map_err(|m| CommandError::new(1, m, "总控卡超过 63 天请从固定档位选择"))?;
-                    a.push("--days".into());
-                    a.push(d.to_string());
+                    Ok(AdminWrite::Master(CardDuration::Days(d)))
                 }
             }
-            Self::Reset => {
-                a.push("--type".into());
-                a.push("reset".into());
-            }
-            Self::Clear => {
-                a.push("--type".into());
-                a.push("clear".into());
-            }
+            Self::Reset => Ok(AdminWrite::Reset),
+            Self::Clear => Ok(AdminWrite::Clear),
             Self::Install { room_no } => {
-                a.push("--type".into());
-                a.push("install".into());
-                a.push("--room".into());
-                a.push(room_no.trim().to_string());
+                let index = room_index.ok_or_else(|| {
+                    CommandError::new(
+                        1,
+                        format!("房号不存在：{}", room_no.trim()),
+                        "请先在房间管理里新增该房号",
+                    )
+                })?;
+                Ok(AdminWrite::Install { room_index: index })
             }
             Self::Checkout { hour } => {
                 if *hour > 23 {
                     return Err(CommandError::new(1, "退房钟点必须在 0–23", ""));
                 }
-                a.push("--type".into());
-                a.push("checkout".into());
-                a.push("--hour".into());
-                a.push(hour.to_string());
+                Ok(AdminWrite::Checkout(*hour))
             }
             Self::TimeSync { hour, minute, .. } => {
-                a.push("--type".into());
-                a.push("timesync".into());
-                if let (Some(h), Some(m)) = (hour, minute) {
-                    if *h > 23 || *m > 59 {
-                        return Err(CommandError::new(1, "时间不合法", "小时 0–23，分钟 0–59"));
+                let (h, m) = match (hour, minute) {
+                    (Some(h), Some(m)) => {
+                        if *h > 23 || *m > 59 {
+                            return Err(CommandError::new(1, "时间不合法", "小时 0–23，分钟 0–59"));
+                        }
+                        (*h, *m)
                     }
-                    // CLI 用 --room HH:MM 传时间（历史怪癖）
-                    a.push("--room".into());
-                    a.push(format!("{h:02}:{m:02}"));
-                }
+                    // 没传时分就用发卡时刻：校时卡的本意就是「把锁校到这一刻」
+                    _ => (
+                        u8::try_from(at.hour()).unwrap_or(0),
+                        u8::try_from(at.minute()).unwrap_or(0),
+                    ),
+                };
+                Ok(AdminWrite::TimeSync { hour: h, minute: m })
             }
-            Self::Raw { p1, p2 } => {
-                let valid = |s: &str| s.len() == 8 && s.chars().all(|c| c.is_ascii_hexdigit());
-                if !valid(p1) || !valid(p2) {
-                    return Err(CommandError::new(1, "p1 / p2 必须是 8 个十六进制字符", ""));
-                }
-                a.push("--type".into());
-                a.push("raw".into());
-                a.push("--p1".into());
-                a.push(p1.to_uppercase());
-                a.push("--p2".into());
-                a.push(p2.to_uppercase());
-            }
-            // 空白卡（TD-136）：走 raw 通道写全零，与持卡退房的擦卡同字节
-            Self::Blank => {
-                a.push("--type".into());
-                a.push("raw".into());
-                a.push("--p1".into());
-                a.push("00000000".into());
-                a.push("--p2".into());
-                a.push("00000000".into());
-            }
+            Self::Raw { p1, p2 } => Ok(AdminWrite::Raw(
+                RawSpec::from_hex(p1, p2).map_err(|e| {
+                    CommandError::new(1, e.to_string(), "p1 / p2 必须是 8 个十六进制字符")
+                })?,
+            )),
+            // 空白卡（TD-136）：擦卡写零，与持卡退房的擦卡完全同字节
+            Self::Blank => Ok(AdminWrite::Blank),
         }
-        Ok(a)
+    }
+}
+
+/// 管理卡要写的内容（参数已校验、已解析）。
+#[derive(Debug, PartialEq, Eq)]
+enum AdminWrite {
+    Master(CardDuration),
+    Reset,
+    Clear,
+    Install { room_index: u16 },
+    Checkout(u8),
+    TimeSync { hour: u8, minute: u8 },
+    Raw(RawSpec),
+    /// 空白卡：走擦卡（写零），不消耗作业流水号
+    Blank,
+}
+
+/// 把写卡动作落到设备上。`card_no` 与 `issued_at` 必须由调用方同源生成。
+fn write_admin(
+    device: &crate::state::Device,
+    write: AdminWrite,
+    card_no: u16,
+    issued_at: CardIssuedAt,
+) -> Result<CardSnapshot, DeviceError> {
+    match write {
+        AdminWrite::Master(duration) => device.write_master(&MasterSpec {
+            duration,
+            card_no,
+            issued_at,
+        }),
+        AdminWrite::Reset => device.write_reset(&PlainCardSpec { card_no, issued_at }),
+        AdminWrite::Clear => device.write_clear(&PlainCardSpec { card_no, issued_at }),
+        AdminWrite::Install { room_index } => device.write_install(&InstallSpec { room_index }),
+        AdminWrite::Checkout(hour) => device.write_checkout_hour(&CheckoutHourSpec {
+            hour,
+            card_no,
+            issued_at,
+        }),
+        AdminWrite::TimeSync { hour, minute } => device.write_timesync(&TimeSyncSpec {
+            hour,
+            minute,
+            card_no,
+            issued_at,
+        }),
+        AdminWrite::Raw(spec) => device.write_raw(&spec),
+        AdminWrite::Blank => device.erase_card(),
     }
 }
 
@@ -711,22 +851,15 @@ pub async fn issue_admin_card(
     pre_read_card(&device)?;
 
     blocking(move || {
-        let mut args = request.to_args()?;
-        // 需要作业流水号的管理卡统一用「日 / 时 / 序号」编码，与客卡同一套算法；
-        // 不再使用固定号。
-        if admin_card_needs_timestamp(&request) {
-            let at = admin_card_timestamp_at(&request);
-            let card_no =
-                cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_at(at);
-            args.push("--serial".into());
-            args.push(format!("{card_no:04X}"));
-            // 让页2[3] 的年月与卡号使用同一个发卡时刻
-            args.push("--at".into());
-            args.push(at.format("%Y-%m-%d %H:%M").to_string());
-        }
-        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        // 发卡时刻与卡号必须同源：页2[3] 的年月来自 `issued_at`
+        let at_dt = admin_card_timestamp_at(&request);
+        let (card_no, issued_at) = if admin_card_needs_timestamp(&request) {
+            cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_card(at_dt)
+        } else {
+            (0, issued_at_from(at_dt))
+        };
 
-        // 安装卡需要房间；其它卡带房号反而会干扰 CLI
+        // 安装卡需要房间；其它卡带房号反而会干扰设备层
         let room_no = match &request {
             AdminCardRequest::Install { room_no } => Some(room_no.trim().to_string()),
             _ => None,
@@ -750,8 +883,10 @@ pub async fn issue_admin_card(
             None
         };
 
+        let write = request.prepare(room.as_ref().map(|r| r.room_index), at_dt)?;
+
         let started = Instant::now();
-        let issued = device.issue(&refs, room.as_ref().map(|r| r.room_index));
+        let issued = write_admin(&device, write, card_no, issued_at);
         let duration = started.elapsed().as_millis() as i64;
 
         match issued {
@@ -767,6 +902,9 @@ pub async fn issue_admin_card(
                         kind: &label,
                         days: card.days as i64,
                         hours: card.hours as i64,
+                        // 带流水号的管理卡（总控/复位/清除/退房钟点/校时）写卡号；
+                        // 安装卡、空白卡、原始直写不占号，`card_no` 为 None → NULL。
+                        card_no: card.card_no.map(i64::from),
                         raw_hex: Some(card.raw_hex.as_str()),
                         operator_id: Some(me.operator_id),
                         reader_id: None,
@@ -816,7 +954,8 @@ pub async fn issue_admin_card(
 
 fn snapshot_from_record(rec: &IssuanceRecord, room: &Room) -> CardSnapshot {
     let raw_hex = rec.raw_hex.clone().unwrap_or_default();
-    // 发卡记录不再保存卡号；回放快照没有卡号，也无法从记录还原发卡日/时/序号。
+    // 发卡记录已落库 16 位卡号，但 `IssuanceRecord` 的公共列清单不含它（避免波及所有查询），
+    // 所以回放快照里仍给 None；记录页的卡号来自 list_issuances 自己的 SELECT。
     let card_no: Option<u16> = None;
     // 页1[2] 低 4 位 = 挂失（TD-150）；与 ocw_device::parse 的解码口径一致
     let is_lost = raw_hex.len() >= 6
@@ -936,7 +1075,6 @@ pub async fn issue_guest(
     days: Option<u16>,
     hours: Option<u16>,
     idempotency_key: String,
-    guest: Option<GuestInput>,
     // 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效
     lost: Option<bool>,
 ) -> Result<IssuedDto, CommandError> {
@@ -971,22 +1109,6 @@ pub async fn issue_guest(
     let db = state.db.clone();
     let room_no = room_no.trim().to_string();
 
-    // 身份信息只存库，长度做个上限，避免误粘贴
-    let g = guest.unwrap_or_default();
-    let g_name = clip(&g.name, 64);
-    let g_gender = clip(&g.gender, 8);
-    let g_id_type = clip(&g.id_type, 32);
-    let g_id_number = clip(&g.id_number, 64);
-    let g_nation = clip(&g.nation, 32);
-    let g_address = clip(&g.address, 200);
-    let g_birth_date = clip(&g.birth_date, 10);
-    let g_note = clip(&g.note, 500);
-    // 身份证扩展字段（v10）；头像不入库
-    let g_id_valid_from = clip(&g.id_valid_from, 10);
-    let g_id_valid_to = clip(&g.id_valid_to, 10);
-    let g_id_authority = clip(&g.id_authority, 100);
-    let g_device_model = clip(&g.device_model, 64);
-    let g_device_serial = clip(&g.device_serial, 64);
     // 卡号计数器归产品侧维护（SDK/CLI 不再碰 CardNo.state）
     let runtime_dir = state.runtime_dir.clone();
 
@@ -1051,47 +1173,30 @@ pub async fn issue_guest(
 
         // 4) 发卡（设备调用期间不持锁）；每张新卡都取新卡号（不再复用首卡卡号）
         let started = Instant::now();
-        let amount_text = amount.to_string();
-        let flag = if use_days { "--days" } else { "--hours" };
-        // 卡号由产品侧递推（CLI 不再自增）：同小时 seq+1，满 63 进位
+        // 卡号与发卡时刻必须同源：页2[3] 的年月与卡号里的日/时来自同一个时刻，
+        // 否则会出现「卡号说 15 点、年月还是上个月」的自相矛盾卡。
         let now = Local::now();
-        let card_no = cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_at(now);
-        let (cd, ch, cseq) = cardno::decode(card_no);
-        let at = format!(
-            "{}-{:02}-{:02} {:02}:{:02}",
-            now.year(),
-            now.month(),
-            cd,
-            ch,
-            now.minute()
-        );
-        let idx_str = room.room_index.to_string();
-        let seq_str = cseq.to_string();
+        let (card_no, issued_at) =
+            cardno::CardNoState::new(runtime_dir.join("CardNo.state")).next_card(now);
+        let lost = lost.unwrap_or(false);
+        let room_index = room.room_index;
 
-        let mut args: Vec<&str> = vec![
-            "--room-index",
-            idx_str.as_str(),
-            "--seq",
-            seq_str.as_str(),
-            "--datetime",
-            at.as_str(),
-            flag,
-            amount_text.as_str(),
-        ];
-        if lost.unwrap_or(false) {
-            args.push("--lost");
-        }
-        // 模拟设备会离线构包；真机返回 None，继续走 CLI
-        let card = match device.sim_issue_guest(
-            room.room_index,
-            &room_no,
-            if use_days { amount } else { 0 },
-            if use_days { 0 } else { amount },
-            Some(card_no),
-            lost.unwrap_or(false),
-        ) {
-            Some(res) => res?,
-            None => device.issue(&args, Some(room.room_index))?,
+        let card = if use_days {
+            device.write_guest_day(&GuestDaySpec {
+                room_index,
+                days: amount,
+                card_no,
+                lost,
+                issued_at,
+            })?
+        } else {
+            device.write_guest_hour(&GuestHourSpec {
+                room_index,
+                hours: amount,
+                card_no,
+                lost,
+                issued_at,
+            })?
         };
 
         // 5) 落库（含客人身份信息；身份信息只存库，不写卡）
@@ -1104,6 +1209,8 @@ pub async fn issue_guest(
                     kind: &card.kind_label,
                     days: card.days as i64,
                     hours: card.hours as i64,
+                    // 客卡一定有流水号；落库后记录侧的「卡号」列不再是空的
+                    card_no: card.card_no.map(i64::from),
                     raw_hex: Some(card.raw_hex.as_str()),
                     operator_id: Some(me.operator_id),
                     reader_id: None,
@@ -1113,29 +1220,14 @@ pub async fn issue_guest(
                     duration_ms: Some(started.elapsed().as_millis() as i64),
                 },
             )?;
-            ocw_store::update_guest_identity(
-                &conn,
-                issuance_id,
-                &ocw_store::GuestIdentity {
-                    name: g_name.as_deref(),
-                    gender: g_gender.as_deref(),
-                    id_type: g_id_type.as_deref(),
-                    id_number: g_id_number.as_deref(),
-                    nation: g_nation.as_deref(),
-                    address: g_address.as_deref(),
-                    birth_date: g_birth_date.as_deref(),
-                    note: g_note.as_deref(),
-                    id_valid_from: g_id_valid_from.as_deref(),
-                    id_valid_to: g_id_valid_to.as_deref(),
-                    id_authority: g_id_authority.as_deref(),
-                    device_model: g_device_model.as_deref(),
-                    device_serial: g_device_serial.as_deref(),
-                },
-            )?;
+
+            // 5.2) 关联入住登记单（TD-220）：该房有 open 单就挂上去，没有就跳过。
+            //      发卡不再收集身份信息，身份统一在「入住登记」里录。
+            let _ = ocw_store::attach_issuance_to_open_checkin(&conn, issuance_id, &room_no);
 
             // 5.5) 挂失卡（TD-218）：写卡成功后作废同房仍有效的旧客卡。
             //      必须在房态同步之前执行 —— 作废后有效卡数会归零，房态判断要用新口径。
-            let invalidated = if lost.unwrap_or(false) {
+            let invalidated = if lost {
                 ocw_store::invalidate_guest_cards(&conn, &room_no, issuance_id)? as i64
             } else {
                 0
@@ -1144,28 +1236,9 @@ pub async fn issue_guest(
             let expires_at = ocw_store::find_issuance(&conn, issuance_id)?
                 .and_then(|r| r.expires_at);
 
-            // 6) 发卡成功后同步房态（TD-115 + TD-161）：空净房 / 预定房 / 未满房 → 未满房；
-            //    发完这张后有效卡数达到上限 → 直接「已满房」。维修 / 其他 / 已满 不动。
-            //    只在成功分支执行 —— 写卡失败保持原房态。
-            if matches!(
-                room.status.as_str(),
-                "vacant_clean" | "reserved" | "occupied_partial"
-            ) {
-                let global = ocw_store::get_max_cards_default(&conn)?;
-                let limit = ocw_store::effective_max_cards(room.max_cards, global);
-                let after = ocw_store::count_active_cards(&conn, &room_no)?;
-                // 挂失卡场景 after 可能为 0（挂失卡本身不计入有效卡）：此时不动房态，
-                // 否则会把还在住的房间误标成「未满房」。
-                if after > 0 {
-                    let next = match limit {
-                        Some(max) if after >= max => "occupied_full",
-                        _ => "occupied_partial",
-                    };
-                    if room.status != next {
-                        ocw_store::set_room_status(&conn, &room_no, next)?;
-                    }
-                }
-            }
+            // 6) 「登记≠发卡」：发卡**不再**自动改房态。
+            //    房态由登记 / 前台维护（入住时置未满或已满，退房时转空脏），
+            //    发卡只负责写卡与落库，避免「发一张卡就把房态改了」这类隐式联动。
 
             // 7) 发卡即入住（TD-128）：把该房覆盖今天的有效预定标为「已入住」——
             //    日历 / 房号列的「预定」随即消失，再发第二张卡不会重复弹确认框。
@@ -2096,18 +2169,26 @@ pub async fn restore_database(
 pub async fn checkout_room(
     state: State<'_, AppState>,
     room_no: String,
+    // 退房时是否顺带关闭该房的入住登记单（默认不关，由前端勾选框决定）
+    clear_checkin: Option<bool>,
 ) -> Result<CheckoutResult, CommandError> {
     let me = require_login(&state)?;
     let db = state.db.clone();
+    let want_clear = clear_checkin.unwrap_or(false);
     blocking(move || {
         let conn = lock_db(&db)?;
         let dirty = ocw_store::checkout_status(&conn)?;
         let closed = ocw_store::checkout_room(&conn, &room_no, &dirty)? as i64;
+        let checkins = if want_clear {
+            ocw_store::close_open_checkin_for_room_force(&conn, &room_no)? as i64
+        } else {
+            0
+        };
         let _ = ocw_store::record_audit(
             &conn,
             "checkout_room",
             Some(&room_no),
-            Some(&format!("cardsClosed={closed}")),
+            Some(&format!("cardsClosed={closed} checkinsClosed={checkins}")),
             "ok",
             Some(me.operator_id),
         );
@@ -2142,9 +2223,12 @@ pub async fn checkout_card(
     card_no: Option<u16>,
     issuance_id: Option<i64>,
     no_device: Option<bool>,
+    // 退房时是否顺带关闭该房的入住登记单（默认不关）
+    clear_checkin: Option<bool>,
 ) -> Result<CheckoutCardResult, CommandError> {
     let me = require_login(&state)?;
     let skip_device = no_device.unwrap_or(false);
+    let want_clear = clear_checkin.unwrap_or(false);
     let device = state.device();
     let db = state.db.clone();
 
@@ -2153,7 +2237,7 @@ pub async fn checkout_card(
     let mut matched_by = "timestamp";
     if !skip_device {
         let card_no = card_no.ok_or_else(|| CommandError::new(1, "没有读到卡号", "重新读卡"))?;
-        let on_card = device.read_card()?;
+        let on_card = attach_room(&db, device.read_card()?)?;
         // 读卡退房**只处理客卡**（日租 / 钟点）；管理卡不走退房流程。
         let kind = match on_card.kind {
             CardKind::GuestDay => "日租客卡",
@@ -2294,12 +2378,17 @@ pub async fn checkout_card(
                 "刷新后重试",
             ));
         };
+        let checkins = if want_clear {
+            ocw_store::close_open_checkin_for_room_force(&conn, &room_no)? as i64
+        } else {
+            0
+        };
         let _ = ocw_store::record_audit(
             &conn,
             "checkout_card",
             Some(&room_no),
             Some(&format!(
-                "id={id} remaining={remaining} erased={} matchedBy={matched_by}",
+                "id={id} remaining={remaining} checkinsClosed={checkins} erased={} matchedBy={matched_by}",
                 if skip_device { 0 } else { 1 }
             )),
             "ok",
@@ -2320,9 +2409,12 @@ pub async fn force_checkout_card(
     room_no: String,
     // 非本系统卡退房（TD-212）：默认擦成空白卡，传 false 则只关库不动卡
     erase: Option<bool>,
+    // 退房时是否顺带关闭该房的入住登记单（默认不关）
+    clear_checkin: Option<bool>,
 ) -> Result<CheckoutResult, CommandError> {
     let me = require_login(&state)?;
     let db = state.db.clone();
+    let want_clear = clear_checkin.unwrap_or(false);
 
     // 先擦卡再关库（TD-212 拍板：二次确认后擦成空白卡 = 全零 8 字节）。
     // 卡不在读卡器上 / 擦卡失败都**不阻断**退房 —— 卡内数据反正不可信，
@@ -2349,12 +2441,17 @@ pub async fn force_checkout_card(
         let conn = lock_db(&db)?;
         let dirty = ocw_store::checkout_status(&conn)?;
         let closed = ocw_store::checkout_room(&conn, &room_no, &dirty)? as i64;
+        let checkins = if want_clear {
+            ocw_store::close_open_checkin_for_room_force(&conn, &room_no)? as i64
+        } else {
+            0
+        };
         let _ = ocw_store::record_audit(
             &conn,
             "force_checkout_card",
             Some(&room_no),
             Some(&format!(
-                "cardsClosed={closed} foreignCard=true erased={erased} eraseError={}",
+                "cardsClosed={closed} checkinsClosed={checkins} foreignCard=true erased={erased} eraseError={}",
                 erase_error.as_deref().unwrap_or("-")
             )),
             "ok",
@@ -2367,6 +2464,359 @@ pub async fn force_checkout_card(
             erased,
             erase_error,
         })
+    })
+    .await
+}
+
+// ---------------------------------------------------------------- 入住登记（TD-220）
+
+/// 命令入参 `GuestInput` 规范化后的字段（统一去空白、限长；头像不入库）。
+struct GuestFields {
+    name: Option<String>,
+    gender: Option<String>,
+    id_type: Option<String>,
+    id_number: Option<String>,
+    nation: Option<String>,
+    address: Option<String>,
+    birth_date: Option<String>,
+    note: Option<String>,
+    id_valid_from: Option<String>,
+    id_valid_to: Option<String>,
+    id_authority: Option<String>,
+    device_model: Option<String>,
+    device_serial: Option<String>,
+}
+
+impl GuestFields {
+    fn from_input(g: &GuestInput) -> Self {
+        Self {
+            name: clip(&g.name, 64),
+            gender: clip(&g.gender, 8),
+            id_type: clip(&g.id_type, 32),
+            id_number: clip(&g.id_number, 64),
+            nation: clip(&g.nation, 32),
+            address: clip(&g.address, 200),
+            birth_date: clip(&g.birth_date, 10),
+            note: clip(&g.note, 500),
+            id_valid_from: clip(&g.id_valid_from, 10),
+            id_valid_to: clip(&g.id_valid_to, 10),
+            id_authority: clip(&g.id_authority, 100),
+            device_model: clip(&g.device_model, 64),
+            device_serial: clip(&g.device_serial, 64),
+        }
+    }
+
+    fn as_identity(&self) -> ocw_store::GuestIdentity<'_> {
+        ocw_store::GuestIdentity {
+            name: self.name.as_deref(),
+            gender: self.gender.as_deref(),
+            id_type: self.id_type.as_deref(),
+            id_number: self.id_number.as_deref(),
+            nation: self.nation.as_deref(),
+            address: self.address.as_deref(),
+            birth_date: self.birth_date.as_deref(),
+            note: self.note.as_deref(),
+            id_valid_from: self.id_valid_from.as_deref(),
+            id_valid_to: self.id_valid_to.as_deref(),
+            id_authority: self.id_authority.as_deref(),
+            device_model: self.device_model.as_deref(),
+            device_serial: self.device_serial.as_deref(),
+        }
+    }
+}
+
+/// 建入住登记单：同房已有 open 单就复用，返回那张单。
+#[tauri::command]
+pub async fn create_checkin(
+    state: State<'_, AppState>,
+    room_no: String,
+    note: Option<String>,
+) -> Result<ocw_store::Checkin, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    let room_no = room_no.trim().to_string();
+    if room_no.is_empty() {
+        return Err(CommandError::new(1, "房号不能为空", "选择房间后再登记"));
+    }
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::find_room(&conn, &room_no)?.ok_or_else(|| {
+            CommandError::new(1, format!("房号不存在：{room_no}"), "请先在房间管理里新增该房号")
+        })?;
+        let checkin =
+            ocw_store::create_checkin(&conn, &room_no, Some(me.operator_id), note.as_deref())?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "create_checkin",
+            Some(&room_no),
+            Some(&format!("checkinId={} status={}", checkin.id, checkin.status)),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(checkin)
+    })
+    .await
+}
+
+/// 取该房当前 open 的登记单（没有则 `null`）。
+#[tauri::command]
+pub async fn get_open_checkin(
+    state: State<'_, AppState>,
+    room_no: String,
+) -> Result<Option<ocw_store::Checkin>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        Ok(ocw_store::get_open_checkin(&conn, room_no.trim())?)
+    })
+    .await
+}
+
+/// 登记单列表：房号 / 状态 / 入住日区间 + 分页。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn list_checkins(
+    state: State<'_, AppState>,
+    room_no: Option<String>,
+    status: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+) -> Result<ocw_store::Page<ocw_store::CheckinRow>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let filter = ocw_store::CheckinFilter {
+            room_no,
+            status,
+            from,
+            to,
+            page: page.unwrap_or(1),
+            page_size: page_size.unwrap_or(20),
+        };
+        Ok(ocw_store::list_checkins(&conn, &filter)?)
+    })
+    .await
+}
+
+/// 登记详情：在 store 的 `CheckinDetail` 上补「作业流水号」。
+///
+/// 作业流水号要拼 `页2[3]` 的年月与 16 位卡号，属于卡格式知识，只在这里算一次；
+/// 前端只拿现成字符串，不解析 `raw_hex`。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinDetailDto {
+    /// 该房号当前的锁内序号；房间记录缺失时为 `None`（同房间多次入住会重复）。
+    pub room_index: Option<u16>,
+    pub checkin: ocw_store::Checkin,
+    pub guests: Vec<ocw_store::CheckinGuest>,
+    pub cards: Vec<CheckinCardDto>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinCardDto {
+    pub id: i64,
+    pub card_no: Option<i64>,
+    /// 10 位作业流水号 `YYMMDDHHII`；不占号的卡型（安装 / 空白 / 原始直写）为 `None`
+    pub work_no: Option<String>,
+    pub kind: String,
+    pub raw_hex: Option<String>,
+    pub expires_at: Option<String>,
+    pub result: String,
+    pub checked_out_at: Option<String>,
+    pub invalidated_at: Option<String>,
+}
+
+fn checkin_detail_dto(d: ocw_store::CheckinDetail, room_index: Option<u16>) -> CheckinDetailDto {
+    CheckinDetailDto {
+        room_index,
+        checkin: d.checkin,
+        guests: d.guests,
+        cards: d
+            .cards
+            .into_iter()
+            .map(|c| CheckinCardDto {
+                id: c.id,
+                card_no: c.card_no,
+                work_no: ocw_device::work_no(
+                    c.card_no.and_then(|n| u16::try_from(n).ok()),
+                    c.raw_hex.as_deref(),
+                ),
+                kind: c.kind,
+                raw_hex: c.raw_hex,
+                expires_at: c.expires_at,
+                result: c.result,
+                checked_out_at: c.checked_out_at,
+                invalidated_at: c.invalidated_at,
+            })
+            .collect(),
+    }
+}
+
+/// 登记单详情（含全部住客，按 seq 排序；关联的卡带作业流水号）。
+#[tauri::command]
+pub async fn get_checkin(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<Option<CheckinDetailDto>, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let Some(detail) = ocw_store::get_checkin(&conn, id)? else {
+            return Ok(None);
+        };
+        let room_index = ocw_store::find_room(&conn, &detail.checkin.room_no)?
+            .map(|r| r.room_index);
+        Ok(Some(checkin_detail_dto(detail, room_index)))
+    })
+    .await
+}
+
+/// 追加住客的结果：住客 id + 顺手转正的预定 id（`null` = 没有预定可转）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddGuestResult {
+    pub guest_id: i64,
+    pub reservation_converted: Option<i64>,
+}
+
+/// 追加一位住客（`seq` 自动递增，决定「首个登记人」）。
+#[tauri::command]
+pub async fn add_checkin_guest(
+    state: State<'_, AppState>,
+    checkin_id: i64,
+    guest: GuestInput,
+) -> Result<AddGuestResult, CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    let f = GuestFields::from_input(&guest);
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        // 「办理完登记 → 转为正式入住单」：第一位住客加进来时，把该房今天覆盖的预定转正。
+        // 空单判断必须放在 add 之前——add 之后 guests 至少有一条，就判断不出「之前是否空单」。
+        let before = ocw_store::get_checkin(&conn, checkin_id)?;
+        let was_empty = before.as_ref().is_some_and(|d| d.guests.is_empty());
+        let room_no = before.map(|d| d.checkin.room_no);
+
+        let id = ocw_store::add_checkin_guest(&conn, checkin_id, &f.as_identity())?;
+
+        let mut converted: Option<i64> = None;
+        if was_empty {
+            if let Some(room_no) = room_no.as_deref() {
+                let today = ocw_store::local_today(&conn)?;
+                match ocw_store::convert_reservation_for_room(&conn, room_no, &today, checkin_id) {
+                    Ok(hit) => converted = hit,
+                    Err(e) => {
+                        // 转正失败不阻断登记：住客已经加进去了，只留痕说明预定没转成
+                        let _ = ocw_store::record_audit(
+                            &conn,
+                            "add_checkin_guest",
+                            Some(room_no),
+                            Some(&format!(
+                                "checkinId={checkin_id} reservationConvertFailed={e}"
+                            )),
+                            "failed",
+                            Some(me.operator_id),
+                        );
+                    }
+                }
+            }
+        }
+
+        let _ = ocw_store::record_audit(
+            &conn,
+            "add_checkin_guest",
+            room_no.as_deref(),
+            Some(&format!(
+                "checkinId={checkin_id} guestId={id} name={} reservationId={}",
+                f.name.as_deref().unwrap_or("-"),
+                converted
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            )),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(AddGuestResult {
+            guest_id: id,
+            reservation_converted: converted,
+        })
+    })
+    .await
+}
+
+/// 改一位住客的资料。
+#[tauri::command]
+pub async fn update_checkin_guest(
+    state: State<'_, AppState>,
+    id: i64,
+    guest: GuestInput,
+) -> Result<(), CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    let f = GuestFields::from_input(&guest);
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::update_checkin_guest(&conn, id, &f.as_identity())?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "update_checkin_guest",
+            None,
+            Some(&format!("guestId={id}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// 删一位住客。
+#[tauri::command]
+pub async fn delete_checkin_guest(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<(), CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::delete_checkin_guest(&conn, id)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "delete_checkin_guest",
+            None,
+            Some(&format!("guestId={id}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// 关闭登记单（退房时会自动调用，这里给手动关闭用）。
+#[tauri::command]
+pub async fn close_checkin(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
+    let me = require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::close_checkin(&conn, id)?;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "close_checkin",
+            None,
+            Some(&format!("checkinId={id}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(())
     })
     .await
 }
@@ -2706,6 +3156,68 @@ pub async fn set_checkout_hour(
             Some(me.operator_id),
         );
         Ok(CheckoutHourResult { hour, recalculated })
+    })
+    .await
+}
+
+/// 凌晨房归属时间（TD-225）：`HH:mm`，默认 `06:00`。
+///
+/// 在该时刻**之前**开卡的日租客卡，归属日算作前一天 —— 凌晨 2 点开 1 天卡
+/// 到期是当天 12:00，而非次日 12:00。
+#[tauri::command]
+pub async fn get_morning_cutoff(state: State<'_, AppState>) -> Result<String, CommandError> {
+    require_login(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let minutes = ocw_store::get_morning_cutoff_minutes(&conn)?;
+        Ok(format!("{:02}:{:02}", minutes / 60, minutes % 60))
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MorningCutoffResult {
+    /// 规范化后的 `HH:mm`
+    pub cutoff: String,
+    /// 本次重算的在用日租卡张数（改归属时间会影响凌晨卡的到期）
+    pub recalculated: i64,
+}
+
+/// 设置凌晨房归属时间（TD-225）。改完立刻重算仍在用的日租卡：
+/// 凌晨归属时间变了，凌晨开卡那批的到期日就会变。
+#[tauri::command]
+pub async fn set_morning_cutoff(
+    state: State<'_, AppState>,
+    cutoff: String,
+) -> Result<MorningCutoffResult, CommandError> {
+    let me = require_admin(&state)?;
+    let minutes = ocw_store::parse_hhmm(&cutoff)
+        .ok_or_else(|| CommandError::new(1, "凌晨房归属时间格式应为 HH:mm（00:00–23:59）", ""))?;
+    let normalized = format!("{:02}:{:02}", minutes / 60, minutes % 60);
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        ocw_store::set_setting(&conn, "morningCutoff", &normalized)?;
+        // 重算沿用当前退房钟点，保证与 record_issuance 同一套公式
+        let hour = ocw_store::get_setting(&conn, "checkoutHour")?
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| (0..=23).contains(v))
+            .unwrap_or(12);
+        let recalculated = ocw_store::recalc_guest_day_expiry(&conn, hour)? as i64;
+        let _ = ocw_store::record_audit(
+            &conn,
+            "set_morning_cutoff",
+            None,
+            Some(&format!("cutoff={normalized} recalc={recalculated}")),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(MorningCutoffResult {
+            cutoff: normalized,
+            recalculated,
+        })
     })
     .await
 }
@@ -3175,9 +3687,10 @@ pub async fn export_diagnostics(
     let db_path = state.db_path.clone();
     let runtime = state.runtime_dir.clone();
     let driver = state.driver_sha256.clone();
-    let sdk_source = state.sdk_source.clone();
+    let device_source = state.device_source.clone();
     let port = state.port();
-    let sim = state.device().is_sim();
+    let device = state.device();
+    let sim = device.is_sim();
     blocking(move || {
         // 先查计数再把锁放开 —— 诊断模块自己会加锁做在线备份，Mutex 不可重入
         let (schema, rooms, issuances, operators) = {
@@ -3192,6 +3705,13 @@ pub async fn export_diagnostics(
             (schema, count("room"), count("issuance"), count("operator"))
         };
 
+        // 硬件层的设备信息（驱动路径/哈希/架构/端口/后端）。拿不到不影响诊断包，
+        // 只是少一块现场信息——而 sidecar 起不来时恰恰最需要诊断包。
+        let device_info = device
+            .device_info()
+            .ok()
+            .and_then(|info| serde_json::to_value(info).ok());
+
         let meta = serde_json::json!({
             "app": "OpenCardWright",
             "version": env!("CARGO_PKG_VERSION"),
@@ -3199,7 +3719,8 @@ pub async fn export_diagnostics(
             "dbPath": db_path.display().to_string(),
             "runtimeDir": runtime.display().to_string(),
             "driverSha256": driver,
-            "sdkSource": sdk_source,
+            "deviceSource": device_source,
+            "deviceInfo": device_info,
             "simulation": sim,
             "port": port,
             "os": std::env::var("OS").unwrap_or_default(),
@@ -3416,6 +3937,104 @@ pub fn reservations_to_csv(rows: &[ocw_store::Reservation]) -> String {
     out
 }
 
+/// 登记单 CSV（BOM + CRLF）：一张单 × 一位住客一行，空单也会保留一行。
+pub fn checkins_to_csv(rows: &[ocw_store::CheckinExportRow]) -> String {
+    let mut out = String::from("\u{feff}");
+    // 两种「序号」别混：房间序号是锁内身份（同房间多次入住会重复），
+    // 登记单号才是「哪几个人是同一张单」的分组键；住客序号只是单内顺序。
+    out.push_str("房号,房间序号,登记单号,入住时间,退房时间,状态,住客序号,姓名,性别,证件类型,证件号码,民族,出生日期,住址,证件有效期起,证件有效期止,签发机关,登记单备注,住客备注\r\n");
+    for r in rows {
+        let cells = [
+            r.room_no.clone(),
+            r.room_index.map(|v| v.to_string()).unwrap_or_default(),
+            r.checkin_id.to_string(),
+            r.check_in_at.clone(),
+            r.check_out_at.clone().unwrap_or_default(),
+            if r.status == "open" {
+                "登记中".to_string()
+            } else {
+                "已关闭".to_string()
+            },
+            r.seq.map(|v| v.to_string()).unwrap_or_default(),
+            r.name.clone().unwrap_or_default(),
+            r.gender.clone().unwrap_or_default(),
+            r.id_type.clone().unwrap_or_default(),
+            r.id_number.clone().unwrap_or_default(),
+            r.nation.clone().unwrap_or_default(),
+            r.birth_date.clone().unwrap_or_default(),
+            r.address.clone().unwrap_or_default(),
+            r.id_valid_from.clone().unwrap_or_default(),
+            r.id_valid_to.clone().unwrap_or_default(),
+            r.id_authority.clone().unwrap_or_default(),
+            r.checkin_note.clone().unwrap_or_default(),
+            r.guest_note.clone().unwrap_or_default(),
+        ];
+        let line: Vec<String> = cells.iter().map(|c| csv_cell(c)).collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
+    }
+    out
+}
+
+/// 登记单 CSV 文件名。
+fn checkins_csv_name(stamp: &str) -> String {
+    format!("入住登记-{stamp}.csv")
+}
+
+/// 导出登记单 CSV（管理员，TD-221）：按筛选条件导出，不按分页。
+#[tauri::command]
+pub async fn export_checkins_csv(
+    state: State<'_, AppState>,
+    room_no: Option<String>,
+    status: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<CsvResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let filter = ocw_store::CheckinFilter {
+            room_no,
+            status,
+            from,
+            to,
+            page: 1,
+            page_size: 50_000,
+        };
+        let rows = ocw_store::export_checkins(&conn, &filter)?;
+        if rows.len() >= 50_000 {
+            return Err(CommandError::new(
+                1,
+                "结果超过 5 万行，请缩小日期范围再导出",
+                "按月份分批导出",
+            ));
+        }
+        let csv = checkins_to_csv(&rows);
+        let dir = export_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CommandError::internal(format!("创建导出目录失败：{e}")))?;
+        let path = dir.join(checkins_csv_name(&local_stamp(&conn)));
+        std::fs::write(&path, csv.as_bytes())
+            .map_err(|e| CommandError::internal(format!("写 CSV 失败：{e}")))?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = ocw_store::record_audit(
+            &conn,
+            "export_checkins_csv",
+            None,
+            Some(&format!("rows={} path={}", rows.len(), path.display())),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(CsvResult {
+            path: path.display().to_string(),
+            rows: rows.len() as i64,
+            bytes,
+        })
+    })
+    .await
+}
+
 /// 导出目录：系统「桌面」→ 系统「下载」→ 数据目录 `exports`。
 ///
 /// **不能用 `%USERPROFILE%\Desktop` 硬拼**：Windows 允许把桌面重定向到 D 盘
@@ -3512,6 +4131,75 @@ pub async fn export_issuances_csv(
         })
     })
     .await
+}
+
+/// 导出「在用房间」的序号 ↔ 房号对照表（管理员）。
+///
+/// 给外部系统 / 脚本用：`[{"id": 1, "room": "201"}, …]`，`id` 是锁内序号、`room` 是房号，
+/// 按序号升序。**只含在用房间**（`active = 1`）：已逻辑删除的序号虽然仍占位，
+/// 但不再对外提供，避免下游把已删房当成有效房。
+#[tauri::command]
+pub async fn export_room_index_json(
+    state: State<'_, AppState>,
+) -> Result<CsvResult, CommandError> {
+    let me = require_admin(&state)?;
+    let db = state.db.clone();
+    blocking(move || {
+        let conn = lock_db(&db)?;
+        let rows = room_index_rows(ocw_store::list_rooms(&conn)?);
+
+        let json = room_index_json(&rows);
+        let dir = export_dir();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CommandError::internal(format!("创建导出目录失败：{e}")))?;
+        let path = dir.join("room_index.json");
+        std::fs::write(&path, json.as_bytes())
+            .map_err(|e| CommandError::internal(format!("写 room_index.json 失败：{e}")))?;
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = ocw_store::record_audit(
+            &conn,
+            "export_room_index_json",
+            None,
+            Some(&format!("rows={} path={}", rows.len(), path.display())),
+            "ok",
+            Some(me.operator_id),
+        );
+        Ok(CsvResult {
+            path: path.display().to_string(),
+            rows: rows.len() as i64,
+            bytes,
+        })
+    })
+    .await
+}
+
+/// 导出用的行：只用 in-use 房间（`active = 1`），按序号升序。
+///
+/// 已逻辑删除的房间会继续占着序号，但不再对外提供——避免下游把已删房当成有效房。
+fn room_index_rows(rooms: Vec<ocw_store::Room>) -> Vec<(u16, String)> {
+    let mut rows: Vec<(u16, String)> = rooms
+        .into_iter()
+        .filter(|r| r.active)
+        .map(|r| (r.room_index, r.room_no))
+        .collect();
+    rows.sort_by_key(|(index, _)| *index);
+    rows
+}
+
+/// 生成 `room_index.json`：两空格缩进、UTF-8 无 BOM、结尾带换行。
+fn room_index_json(rows: &[(u16, String)]) -> String {
+    let mut out = String::from("[\n");
+    for (i, (index, room)) in rows.iter().enumerate() {
+        // 房号是自由文本，做最小 JSON 转义（正常房号里不会出现引号/反斜杠）
+        let escaped = room.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!("  {{\"id\": {index}, \"room\": \"{escaped}\"}}"));
+        if i + 1 < rows.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("]\n");
+    out
 }
 
 /// 导出当前筛选条件下的预定记录为 CSV（管理员，TD-205）。
@@ -3678,8 +4366,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use super::AdminCardRequest;
 
-    fn args(req: AdminCardRequest) -> Vec<String> {
-        req.to_args().expect("参数应合法")
+    fn at_fixed() -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 11, 8, 14, 30, 0)
+            .single()
+            .unwrap()
+    }
+
+    /// 用固定时刻解析管理卡请求，结果可复现。
+    fn write_of(req: AdminCardRequest, room_index: Option<u16>) -> AdminWrite {
+        req.prepare(room_index, at_fixed()).expect("参数应合法")
     }
 
     #[test]
@@ -3788,99 +4484,141 @@ mod tests {
 
     #[test]
     fn master_defaults_to_one_day() {
-        let a = args(AdminCardRequest::Master {
-            days: None,
-            hours: None,
-        });
-        assert_eq!(a, vec!["--type", "master", "--days", "1"]);
+        assert_eq!(
+            write_of(AdminCardRequest::Master { days: None, hours: None }, None),
+            AdminWrite::Master(CardDuration::Days(1))
+        );
     }
 
     #[test]
     fn master_prefers_hours_when_given() {
-        let a = args(AdminCardRequest::Master {
-            days: Some(3),
-            hours: Some(2),
-        });
-        assert_eq!(a, vec!["--type", "master", "--hours", "2"]);
+        assert_eq!(
+            write_of(
+                AdminCardRequest::Master {
+                    days: Some(3),
+                    hours: Some(2),
+                },
+                None
+            ),
+            AdminWrite::Master(CardDuration::Hours(2))
+        );
     }
 
     #[test]
-    fn install_carries_room() {
-        let a = args(AdminCardRequest::Install {
-            room_no: " 220 ".into(),
-        });
-        assert_eq!(a, vec!["--type", "install", "--room", "220"]);
+    fn install_carries_room_index() {
+        assert_eq!(
+            write_of(
+                AdminCardRequest::Install {
+                    room_no: " 220 ".into(),
+                },
+                Some(15)
+            ),
+            AdminWrite::Install { room_index: 15 }
+        );
+    }
+
+    /// 安装卡拿不到房号（房号不存在）时必须在碰设备之前就拒掉。
+    #[test]
+    fn install_without_room_index_is_rejected() {
+        let err = AdminCardRequest::Install {
+            room_no: "999".into(),
+        }
+        .prepare(None, at_fixed())
+        .expect_err("没有房号必须拒绝");
+        assert_eq!(err.code, 1);
     }
 
     #[test]
-    fn timesync_without_time_omits_room() {
-        let a = args(AdminCardRequest::TimeSync {
-            hour: None,
-            minute: None,
-            at: None,
-        });
-        assert_eq!(a, vec!["--type", "timesync"]);
+    fn timesync_without_time_uses_issue_moment() {
+        // 校时卡的本意是「把锁校到这一刻」：没传时分就用发卡时刻（14:30）
+        assert_eq!(
+            write_of(
+                AdminCardRequest::TimeSync {
+                    hour: None,
+                    minute: None,
+                    at: None,
+                },
+                None
+            ),
+            AdminWrite::TimeSync {
+                hour: 14,
+                minute: 30
+            }
+        );
     }
 
     #[test]
-    fn timesync_with_time_uses_hh_mm_quirk() {
-        let a = args(AdminCardRequest::TimeSync {
-            hour: Some(9),
-            minute: Some(5),
-            at: None,
-        });
-        assert_eq!(a, vec!["--type", "timesync", "--room", "09:05"]);
+    fn timesync_with_explicit_time_keeps_it() {
+        assert_eq!(
+            write_of(
+                AdminCardRequest::TimeSync {
+                    hour: Some(9),
+                    minute: Some(5),
+                    at: None,
+                },
+                None
+            ),
+            AdminWrite::TimeSync { hour: 9, minute: 5 }
+        );
     }
 
     #[test]
     fn sim_erase_card_returns_blank_snapshot() {
         // 模拟设备没有真实写入闭环：擦卡直接回放空白卡快照（真实设备写 28 字节全零）
-        let dev = Device::Sim(ocw_device::SimDevice::default());
+        let dev = Device::Sim(Arc::new(ocw_device::SimDevice::new()));
         let card = dev.erase_card().expect("模拟擦卡应成功");
         assert!(card.kind.is_blank(), "擦卡结果必须是空白卡");
         assert!(card.card_no.is_none(), "空白卡不含卡号");
     }
 
     #[test]
-    fn blank_card_writes_all_zero_bytes() {
-        // TD-136：空白卡走 raw 通道写全零（与持卡退房擦卡同字节），但 label 必须显示「空白卡」，
+    fn blank_card_maps_to_erase() {
+        // TD-136：空白卡写全零 = 擦卡。label 必须显示「空白卡」，
         // 否则发卡记录/CSV 里会混成「原始直写」，事后分不清操作意图。
         assert_eq!(AdminCardRequest::Blank.label(), "空白卡");
+        assert_eq!(write_of(AdminCardRequest::Blank, None), AdminWrite::Blank);
+    }
+
+    #[test]
+    fn checkout_and_raw_map_to_typed_writes() {
         assert_eq!(
-            args(AdminCardRequest::Blank),
-            vec!["--type", "raw", "--p1", "00000000", "--p2", "00000000"]
+            write_of(AdminCardRequest::Checkout { hour: 12 }, None),
+            AdminWrite::Checkout(12)
+        );
+        assert_eq!(
+            write_of(
+                AdminCardRequest::Raw {
+                    p1: "5bec492b".into(),
+                    p2: "13bf22ab".into()
+                },
+                None
+            ),
+            AdminWrite::Raw(RawSpec {
+                p1: [0x5B, 0xEC, 0x49, 0x2B],
+                p2: [0x13, 0xBF, 0x22, 0xAB],
+            })
         );
     }
 
     #[test]
-    fn checkout_and_raw_are_formatted() {
-        assert_eq!(
-            args(AdminCardRequest::Checkout { hour: 12 }),
-            vec!["--type", "checkout", "--hour", "12"]
-        );
-        assert_eq!(
-            args(AdminCardRequest::Raw {
-                p1: "5bec492b".into(),
-                p2: "13bf22ab".into()
-            }),
-            vec!["--type", "raw", "--p1", "5BEC492B", "--p2", "13BF22AB"]
-        );
-    }
-
-    #[test]
-    fn invalid_inputs_are_rejected_before_touching_device() {        assert!(AdminCardRequest::Checkout { hour: 24 }.to_args().is_err());
-        assert!(AdminCardRequest::Raw {
-            p1: "xyz".into(),
-            p2: "13BF22AB".into()
+    fn invalid_inputs_are_rejected_before_touching_device() {
+        let invalid = [
+            AdminCardRequest::Checkout { hour: 24 },
+            AdminCardRequest::Raw {
+                p1: "xyz".into(),
+                p2: "13BF22AB".into(),
+            },
+            AdminCardRequest::Master {
+                days: None,
+                hours: Some(0),
+            },
+        ];
+        for req in invalid {
+            assert!(
+                req.prepare(None, at_fixed()).is_err(),
+                "{req:?} 必须在碰设备之前被拒绝"
+            );
         }
-        .to_args()
-        .is_err());
-        assert!(AdminCardRequest::Master {
-            days: None,
-            hours: Some(0)
-        }
-        .to_args()
-        .is_err());
     }
 
     /// 前端发的是 `{kind:"install", roomNo:"220"}`。`rename_all` 只改变体名，
@@ -3895,7 +4633,10 @@ mod tests {
         }
 
         let req: AdminCardRequest = serde_json::from_str(r#"{"kind":"master","days":63}"#).unwrap();
-        assert_eq!(args(req), vec!["--type", "master", "--days", "63"]);
+        assert_eq!(
+            write_of(req, None),
+            AdminWrite::Master(CardDuration::Days(63))
+        );
     }
 
     #[test]
@@ -3915,10 +4656,11 @@ mod tests {
                 admin_card_needs_timestamp(&req),
                 "{req:?} 应由 issue_admin_card 追加时间戳卡号"
             );
-            let args = req.to_args().unwrap();
+            // 写卡动作里**没有卡号字段**：卡号由 issue_admin_card 单独生成后传入，
+            // 不可能被这条路径写死成固定号。
             assert!(
-                !args.windows(2).any(|w| w[0] == "--serial"),
-                "to_args 不应再写固定卡号: {args:?}"
+                req.prepare(None, at_fixed()).is_ok(),
+                "{req:?} 应能转成写卡动作"
             );
         }
         assert!(!admin_card_needs_timestamp(&AdminCardRequest::Install {
@@ -3952,6 +4694,8 @@ mod tests {
         ("log_frontend", Level::Public),
         // 登录即可（前台日常操作 + 只读查询）
         ("read_card", Level::Login),
+        // 身份证读卡器（9001 服务）：只用于自动填表，与门锁卡设备互不影响
+        ("read_id_card", Level::Login),
         ("list_rooms", Level::Login),
         ("run_selftest", Level::Login),
         ("probe_ports", Level::Public),
@@ -3969,6 +4713,7 @@ mod tests {
         ("change_own_password", Level::Login),
         ("get_reminder_settings", Level::Login),
         ("get_checkout_hour", Level::Login),
+        ("get_morning_cutoff", Level::Login),
         ("expiring_cards", Level::Login),
         ("list_issuances", Level::Login),
         ("list_guest_stays", Level::Login),
@@ -3979,6 +4724,15 @@ mod tests {
         ("create_reservation", Level::Login),
         ("update_reservation", Level::Login),
         ("cancel_reservation", Level::Login),
+        // 入住登记（TD-220）：前台日常操作，登录即可
+        ("create_checkin", Level::Login),
+        ("get_open_checkin", Level::Login),
+        ("list_checkins", Level::Login),
+        ("get_checkin", Level::Login),
+        ("add_checkin_guest", Level::Login),
+        ("update_checkin_guest", Level::Login),
+        ("delete_checkin_guest", Level::Login),
+        ("close_checkin", Level::Login),
         ("hide_to_tray", Level::Login),
         ("quit_app", Level::Login),
         // 管理员
@@ -4010,12 +4764,15 @@ mod tests {
         ("set_operator_active", Level::Admin),
         ("set_reminder_settings", Level::Admin),
         ("set_checkout_hour", Level::Admin),
+        ("set_morning_cutoff", Level::Admin),
         ("get_backup_settings", Level::Admin),
         ("set_backup_settings", Level::Admin),
         ("import_backup_file", Level::Admin),
         ("export_diagnostics", Level::Admin),
+        ("export_room_index_json", Level::Admin),
         ("export_issuances_csv", Level::Admin),
         ("export_reservations_csv", Level::Admin),
+        ("export_checkins_csv", Level::Admin),
         ("import_rooms", Level::Admin),
         ("complete_onboarding", Level::Admin),
     ];
@@ -4105,13 +4862,53 @@ mod tests {
         assert!(problems.is_empty(), "鉴权矩阵不一致：\n{}", problems.join("\n"));
     }
 
+    /// room_index.json：只用 in-use 房间、按序号升序、空库是 `[]`，房号里的引号要转义。
+    #[test]
+    fn room_index_json_filters_active_sorts_and_escapes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("ocw-roomjson-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = ocw_store::open(&dir.join("t.db")).unwrap();
+
+        // 空库
+        let empty = room_index_rows(ocw_store::list_rooms(&conn).unwrap());
+        assert!(empty.is_empty());
+        assert_eq!(room_index_json(&empty), "[\n]\n");
+
+        ocw_store::insert_room(&conn, "201", Some(15), None, None, None).unwrap();
+        ocw_store::insert_room(&conn, "202", Some(2), None, None, None).unwrap();
+        ocw_store::insert_room(&conn, "203", Some(7), None, None, None).unwrap();
+        ocw_store::deactivate_room(&conn, "203").unwrap();
+
+        let rows = room_index_rows(ocw_store::list_rooms(&conn).unwrap());
+        assert_eq!(
+            rows,
+            vec![(2u16, "202".to_string()), (15u16, "201".to_string())],
+            "已删房不导出，按序号升序"
+        );
+        assert_eq!(
+            room_index_json(&rows),
+            "[\n  {\"id\": 2, \"room\": \"202\"},\n  {\"id\": 15, \"room\": \"201\"}\n]\n"
+        );
+        // 房号里出现引号时转义
+        assert_eq!(
+            room_index_json(&[(1u16, "A\"B".to_string())]),
+            "[\n  {\"id\": 1, \"room\": \"A\\\"B\"}\n]\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn auth_matrix_counts() {
         let admin = MATRIX.iter().filter(|(_, l)| *l == Level::Admin).count();
         let login = MATRIX.iter().filter(|(_, l)| *l == Level::Login).count();
         let public = MATRIX.iter().filter(|(_, l)| *l == Level::Public).count();
-        assert_eq!((admin, login, public), (36, 29, 7));
-        assert_eq!(command_bodies().len(), 72, "命令数量变了，矩阵要同步");
+        assert_eq!((admin, login, public), (39, 39, 7));
+        assert_eq!(command_bodies().len(), 85, "命令数量变了，矩阵要同步");
     }
 
     fn test_state(role: Option<Role>) -> AppState {
@@ -4127,12 +4924,13 @@ mod tests {
             db: Arc::new(Mutex::new(conn)),
             db_path,
             slot: Arc::new(Mutex::new(DeviceSlot {
-                device: Device::Sim(ocw_device::SimDevice::default()),
+                device: Device::Sim(Arc::new(ocw_device::SimDevice::new())),
                 port: 0,
             })),
             runtime_dir: dir,
             driver_sha256: None,
-            sdk_source: None,
+            device_source: None,
+            id_card: Arc::new(rc_device::idcard_ws::HsWsIdCardReader::new()),
             dev: true,
             session: Arc::new(Mutex::new(role.map(|role| Session {
                 operator_id: 1,
@@ -4169,6 +4967,55 @@ mod tests {
     }
 
     /// CSV：BOM 开头、CRLF 换行、逗号/引号转义、公式注入防护。
+    /// 登记 CSV：表头同时有「房间序号」与「登记单号」，原「序号」已改名「住客序号」；
+    /// 房间序号为空时该列留空，不能串到下一列。
+    #[test]
+    fn checkins_csv_has_room_index_and_checkin_no() {
+        let mk = |checkin_id: i64, room_no: &str, room_index: Option<u16>, seq: Option<i64>| {
+            ocw_store::CheckinExportRow {
+                checkin_id,
+                room_no: room_no.into(),
+                room_index,
+                check_in_at: "2026-11-14T02:00:00Z".into(),
+                check_out_at: None,
+                status: "open".into(),
+                checkin_note: None,
+                seq,
+                name: Some("张三".into()),
+                gender: None,
+                id_type: None,
+                id_number: None,
+                nation: None,
+                birth_date: None,
+                address: None,
+                id_valid_from: None,
+                id_valid_to: None,
+                id_authority: None,
+                guest_note: None,
+            }
+        };
+        let csv = checkins_to_csv(&[
+            mk(128, "801", Some(40), Some(1)),
+            mk(129, "999", None, None),
+        ]);
+
+        assert!(csv.starts_with('\u{feff}'), "CSV 要带 BOM 给 Excel");
+        let mut lines = csv.lines();
+        // 第一行带 BOM，比较前先剥掉
+        let header = lines.next().unwrap().trim_start_matches('\u{feff}');
+        assert!(
+            header.starts_with("房号,房间序号,登记单号,入住时间,退房时间,状态,住客序号"),
+            "表头不对：{header}"
+        );
+        let first = lines.next().unwrap();
+        assert!(first.starts_with("801,40,128,"), "首行不对：{first}");
+        let second = lines.next().unwrap();
+        assert!(
+            second.starts_with("999,,129,"),
+            "房间序号为空要留空列：{second}"
+        );
+    }
+
     #[test]
     fn csv_escapes_and_has_bom() {
         let row = ocw_store::IssuanceRow {
@@ -4188,6 +5035,7 @@ mod tests {
             guest_note: None,
             operator_name: Some("值班\"甲".into()),
             result: "ok".into(),
+            status: "active".into(),
             expires_at: None,
             checked_out_at: None,
             duration_ms: Some(120),

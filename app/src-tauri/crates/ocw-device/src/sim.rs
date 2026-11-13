@@ -1,274 +1,275 @@
-//! 模拟设备：用固定样本回放，让 CI 与前端开发不依赖读卡器。
+//! 进程内模拟设备：没有读卡器时也能跑完整发卡流程。
 //!
-//! 样本取自 `sdk/` 的既有输出格式（见 `docs/抓包样本与验证记录.md` 的黄金样本），
-//! 但这里是**输出契约**的样本，不描述卡内字节规则。
+//! # 模拟由硬件层提供，不是产品自己拼
+//!
+//! 旧实现是「产品编译一个 `OCWCardBuild.exe`，再按 CLI 参数拼包」——卡字节规则
+//! 在模拟路径上又写了一遍，和真机路径迟早对不上。现在直接用 `rc_device::sim::SimCardDevice`：
+//! 它实现同一个 `CardDevice` 契约，写卡走 `builder`、读卡走 `parser`，
+//! 与真机**逐字节相同**，只是把「写进卡」换成「写进内存卡槽」。
+//!
+//! # 为什么不用 sidecar 的 `--sim`
+//!
+//! 两种方式都提供，用途不同：
+//!
+//! - **进程内**（本模块）：不需要 exe、不需要 32 位、启动零延迟，适合 `OCW_SIM=1` 的
+//!   日常开发与单元测试；
+//! - **sidecar `--sim`**：连协议、进程生命周期、崩溃重启一起测，适合端到端与 CI 冒烟。
+//!
+//! 两者返回的 DTO 与错误形状完全一致，命令层看不出差别。
 
-use crate::parse::{self, CardSnapshot, DeviceError, PortProbe, SelfTest};
+use rc_device::sim::SimCardDevice;
+use rc_device::CardDevice;
 
-/// 220 房 1 天日租卡。
-pub const GUEST_DAY_JSON: &str = r#"{"ok":true,"card":{"kind":"日租客卡","room":"220","roomIndex":15,"days":1,"hours":0,"cardNo":"0x2404","raw":"5BECF100810424AB0000000000000000000000000000000000000000"}}"#;
+use crate::error::DeviceError;
+use crate::map::{self, CardSnapshot, PortProbe, SelfTest};
 
-/// 220 房 3 小时钟点卡。
-pub const GUEST_HOUR_JSON: &str = r#"{"ok":true,"card":{"kind":"钟点客卡","room":"220","roomIndex":15,"days":0,"hours":3,"cardNo":"0x2289","raw":"5BECF100448922AB0000000000000000000000000000000000000000"}}"#;
-
-/// 空白卡：A 区仍要有数据可展示。
-pub const BLANK_JSON: &str = r#"{"ok":true,"card":{"kind":"空白卡","room":null,"roomIndex":-1,"days":0,"hours":0,"cardNo":null,"raw":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"}}"#;
-
-/// 管理卡（安装卡）：无卡号。
-pub const INSTALL_JSON: &str = r#"{"ok":true,"card":{"kind":"安装卡","room":"220","roomIndex":15,"days":0,"hours":0,"cardNo":null,"raw":"5BECFC0046F200010000000000000000000000000000000000000000"}}"#;
-
-/// 无卡。
-pub const NO_CARD_JSON: &str = r#"{"ok":false,"error":{"code":3,"msg":"未检测到卡片或卡型不符"}}"#;
-
-/// 自检全绿。
-pub const SELFTEST_OK: &str = "自检结果: 27 通过, 0 失败\n";
-
-/// 自检有失败。
-pub const SELFTEST_BAD: &str = "自检结果: 26 通过, 1 失败\n";
-
-/// 两个口，第二个能用。
-pub const PORTS_TEXT: &str = "COM6  可打开但异常  读卡器握手失败\nCOM7  可用   读卡器=4E57520492008A7F\n";
-
-#[derive(Default, Clone)]
+/// 模拟设备。默认卡槽里预置一张空白卡，保证「写卡前先读卡」能通过。
 pub struct SimDevice {
-    /// 下一次 `read_card` 返回哪个样本；None 用默认的日租卡。
-    pub next_read: Option<&'static str>,
-    /// 运行时目录（含 `OCWCardBuild.exe` 与 `CardNo.state`）。
-    /// 给了它，`issue_guest` 就会像真机一样**离线构包并推进计数器**；没给则退回固定样本。
-    pub runtime: Option<std::path::PathBuf>,
-    /// 计数器起点（CardNo.state 缺失时用）
-    pub start: u16,
+    inner: SimCardDevice,
+}
+
+impl Default for SimDevice {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimDevice {
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 绑定运行时目录：模拟发卡会用这里的构包器和计数器。
-    pub fn at(runtime: &std::path::Path) -> Self {
         Self {
-            runtime: Some(runtime.to_path_buf()),
-            start: 0x2403,
-            ..Self::default()
+            inner: SimCardDevice::new(),
         }
     }
+
+    /// 卡槽里放一张现成的 28 字节卡（演示「读一张已发出的卡」）。
+    pub fn with_card(raw: [u8; rc_device::CARD_BYTES]) -> Self {
+        Self {
+            inner: SimCardDevice::with_card(raw),
+        }
+    }
+
+    /// 另一个后端实例，互不共享卡槽状态。
+    pub fn from(inner: SimCardDevice) -> Self {
+        Self { inner }
+    }
+
+    // ------------------------------------------------------------ 卡槽控制
+
+    /// 把卡放到读卡器上。
+    pub fn insert_card(&self, raw: [u8; rc_device::CARD_BYTES]) {
+        self.inner.insert_card(raw);
+    }
+
+    /// 把卡拿走：之后读卡返回 `no_card`。
+    pub fn remove_card(&self) {
+        self.inner.remove_card();
+    }
+
+    /// 卡槽里当前的 28 字节。
+    pub fn card(&self) -> Option<[u8; rc_device::CARD_BYTES]> {
+        self.inner.card()
+    }
+
+    // ------------------------------------------------------------ 设备操作
 
     pub fn read_card(&self) -> Result<CardSnapshot, DeviceError> {
-        parse::parse_card(self.next_read.unwrap_or(GUEST_DAY_JSON), 0)
+        self.inner.read_card().map(map::to_dto).map_err(to_err)
     }
 
-    /// 模拟发卡：调用 `OCWCardBuild.exe`（内部用 SDK 的 CardBuilder + CardNoStore）。
-    ///
-    /// 返回 `None` 表示"没有可用的构包器"，调用方应退回固定样本。
-    pub fn issue_guest(
+    pub fn erase_card(&self) -> Result<CardSnapshot, DeviceError> {
+        self.inner.erase_card().map(map::to_dto).map_err(to_err)
+    }
+
+    pub fn write_guest_day(&self, spec: &rc_device::GuestDaySpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner
+            .write_guest_day(spec)
+            .map(map::to_dto)
+            .map_err(to_err)
+    }
+
+    pub fn write_guest_hour(
         &self,
-        room_index: u8,
-        room_no: &str,
-        days: u16,
-        hours: u16,
-        // 复用卡号（TD-127）：Some 时构包器用 `--serial` 指定卡号、不推进计数器
-        serial: Option<u16>,
-        // 挂失卡（TD-150）：页1[2] 低 4 位 = 1
-        lost: bool,
-    ) -> Option<Result<CardSnapshot, DeviceError>> {
-        let dir = self.runtime.as_ref()?;
-        let exe = dir.join("OCWCardBuild.exe");
-        if !exe.is_file() {
-            return None;
-        }
-
-        let state = dir.join("CardNo.state");
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--state")
-            .arg(&state)
-            .arg("--start")
-            .arg(format!("{:04X}", self.start))
-            .arg("--index")
-            .arg(room_index.to_string());
-        if let Some(s) = serial {
-            cmd.arg("--serial").arg(format!("{s:04X}"));
-        }
-        if lost {
-            cmd.arg("--lost");
-        }
-        if hours > 0 {
-            cmd.arg("--hours").arg(hours.to_string());
-        } else {
-            cmd.arg("--days").arg(days.to_string());
-        }
-        // 不弹黑框（和 CLI 设备保持一致）
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-
-        let out = cmd.output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let raw = json_field(&text, "raw")?;
-        let card_no = json_field(&text, "cardNo")?;
-
-        // 复用 CLI 的 JSON 形状，交给现有解析器，避免这里再造一份样本结构
-        let kind = if hours > 0 { "钟点客卡" } else { "日租客卡" };
-        let json = format!(
-            r#"{{"ok":true,"card":{{"kind":"{kind}","room":"{room_no}","roomIndex":{room_index},"days":{days},"hours":{hours},"cardNo":"{card_no}","raw":"{raw}"}}}}"#
-        );
-        Some(parse::parse_card(&json, 0))
+        spec: &rc_device::GuestHourSpec,
+    ) -> Result<CardSnapshot, DeviceError> {
+        self.inner
+            .write_guest_hour(spec)
+            .map(map::to_dto)
+            .map_err(to_err)
     }
 
-    /// 模拟发**管理卡**（总控 / 复位 / 清除 / 安装 / 退房钟点 / 校时 / raw）。
-    ///
-    /// 参数原样转发给 `OCWCardBuild.exe`，只做两件事：把 `--room <房号>` 换成
-    /// `--index <序号>`（构包器按序号算页1 第三/四字节），以及把输出翻译成统一的
-    /// 卡快照 JSON。返回 `None` 表示没有构包器，调用方决定回退还是报错。
-    pub fn issue_admin(
+    pub fn write_master(&self, spec: &rc_device::MasterSpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner.write_master(spec).map(map::to_dto).map_err(to_err)
+    }
+
+    pub fn write_install(&self, spec: &rc_device::InstallSpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner
+            .write_install(spec)
+            .map(map::to_dto)
+            .map_err(to_err)
+    }
+
+    pub fn write_reset(&self, spec: &rc_device::PlainCardSpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner.write_reset(spec).map(map::to_dto).map_err(to_err)
+    }
+
+    pub fn write_clear(&self, spec: &rc_device::PlainCardSpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner.write_clear(spec).map(map::to_dto).map_err(to_err)
+    }
+
+    pub fn write_checkout_hour(
         &self,
-        args: &[&str],
-        room_index: Option<u8>,
-    ) -> Option<Result<CardSnapshot, DeviceError>> {
-        let dir = self.runtime.as_ref()?;
-        let exe = dir.join("OCWCardBuild.exe");
-        if !exe.is_file() {
-            return None;
-        }
-
-        let state = dir.join("CardNo.state");
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--state")
-            .arg(&state)
-            .arg("--start")
-            .arg(format!("{:04X}", self.start));
-
-        let mut kind_type = String::new();
-        let mut days: u16 = 0;
-        let mut hours: u16 = 0;
-        let mut i = 0;
-        while i < args.len() {
-            let a = args[i];
-            // 构包器不认识房号（卡内只有序号），跳过它的值
-            if a == "--room" {
-                i += 2;
-                continue;
-            }
-            if a == "--type" && i + 1 < args.len() {
-                kind_type = args[i + 1].to_string();
-            } else if a == "--days" && i + 1 < args.len() {
-                days = args[i + 1].parse().unwrap_or(0);
-            } else if a == "--hours" && i + 1 < args.len() {
-                hours = args[i + 1].parse().unwrap_or(0);
-            }
-            cmd.arg(a);
-            i += 1;
-        }
-        if let Some(idx) = room_index {
-            cmd.arg("--index").arg(idx.to_string());
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
-        }
-
-        let out = cmd.output().ok()?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        if !text.contains("\"ok\":true") {
-            let msg = json_field(&text, "msg").unwrap_or_else(|| text.to_string());
-            return Some(Err(DeviceError::Protocol(format!(
-                "模拟构包失败：{msg}"
-            ))));
-        }
-
-        let raw = match json_field(&text, "raw") {
-            Some(v) => v,
-            None => return Some(Err(DeviceError::Protocol("构包器输出缺少 raw".into()))),
-        };
-        // 安装卡 / raw 卡不含卡号：构包器给的是 null，解析器能接受
-        let card_no = json_field(&text, "cardNo").unwrap_or_else(|| "null".into());
-
-        // 卡型中文名要和 parse.rs 认的名字一致（退房是「退房钟点设置卡」全称）
-        let kind = match kind_type.as_str() {
-            "master" => "总控卡",
-            "reset" => "复位卡",
-            "clear" => "清除卡",
-            "install" => "安装卡",
-            "checkout" => "退房钟点设置卡",
-            "timesync" => "校时卡",
-            "raw" => "自定义卡",
-            _ => "管理卡",
-        };
-        let idx = room_index.map(|v| v as i32).unwrap_or(-1);
-        let json = format!(
-            r#"{{"ok":true,"card":{{"kind":"{kind}","room":null,"roomIndex":{idx},"days":{days},"hours":{hours},"cardNo":{card_no},"raw":"{raw}"}}}}"#
-        );
-        Some(parse::parse_card(&json, 0))
+        spec: &rc_device::CheckoutHourSpec,
+    ) -> Result<CardSnapshot, DeviceError> {
+        self.inner
+            .write_checkout_hour(spec)
+            .map(map::to_dto)
+            .map_err(to_err)
     }
 
-    pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
-        parse::parse_selftest(SELFTEST_OK)
+    pub fn write_timesync(
+        &self,
+        spec: &rc_device::TimeSyncSpec,
+    ) -> Result<CardSnapshot, DeviceError> {
+        self.inner
+            .write_timesync(spec)
+            .map(map::to_dto)
+            .map_err(to_err)
+    }
+
+    /// 原始直写：模拟环境下同样会写出一张「坏卡」，不会替你回滚。
+    pub fn write_raw(&self, spec: &rc_device::RawSpec) -> Result<CardSnapshot, DeviceError> {
+        self.inner.write_raw(spec).map(map::to_dto).map_err(to_err)
     }
 
     pub fn probe_ports(&self) -> Result<Vec<PortProbe>, DeviceError> {
-        Ok(parse::parse_ports(PORTS_TEXT))
+        self.inner
+            .probe_ports()
+            .map(|list| list.into_iter().map(PortProbe::from).collect())
+            .map_err(to_err)
+    }
+
+    pub fn set_port(&self, port: u8) -> Result<(), DeviceError> {
+        self.inner.set_port(port).map_err(to_err)
+    }
+
+    pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
+        self.inner.selftest().map(SelfTest::from).map_err(to_err)
+    }
+
+    pub fn device_info(&self) -> Result<rc_device::DeviceInfo, DeviceError> {
+        self.inner.device_info().map_err(to_err)
     }
 }
 
-/// 从构包器的 JSON 里抠一个字符串/数字字段（输出形状是我们自己定的，够用）。
-fn json_field(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\":\"");
-    if let Some(start) = text.find(&needle) {
-        let rest = &text[start + needle.len()..];
-        let end = rest.find('"')?;
-        return Some(rest[..end].to_string());
-    }
-    // 数字字段（roomIndex）
-    let needle = format!("\"{key}\":");
-    let start = text.find(&needle)? + needle.len();
-    let rest = &text[start..];
-    let end = rest.find(|c: char| c == ',' || c == '}')?;
-    Some(rest[..end].trim().to_string())
+/// 硬件层错误 → 产品错误。模拟与真机走同一条映射，前端不需要区分后端。
+fn to_err(e: rc_device::DeviceError) -> DeviceError {
+    DeviceError::from_payload(e.payload())
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::parse::CardKind;
+    use rc_device::{timestamp_card_no, CardIssuedAt, GuestDaySpec, RawSpec};
 
-    #[test]
-    fn sim_returns_guest_day_by_default() {
-        let c = SimDevice::new().read_card().unwrap();
-        assert_eq!(c.kind, CardKind::GuestDay);
-        assert_eq!(c.card_no, Some(0x2404));
-    }
-
-    #[test]
-    fn sim_can_replay_blank_card() {
-        let mut sim = SimDevice::new();
-        sim.next_read = Some(BLANK_JSON);
-        let c = sim.read_card().unwrap();
-        assert!(c.kind.is_blank());
-    }
-
-    #[test]
-    fn all_samples_parse() {
-        for s in [GUEST_DAY_JSON, GUEST_HOUR_JSON, BLANK_JSON, INSTALL_JSON] {
-            parse::parse_card(s, 0).expect("样本必须能解析");
+    fn issued_at() -> CardIssuedAt {
+        CardIssuedAt {
+            year: 2026,
+            month: 11,
+            day: 8,
+            hour: 14,
         }
-        assert!(parse::parse_card(NO_CARD_JSON, 3).is_err());
     }
 
-    /// 样本是契约：28 字节 = 56 个十六进制字符。改样本时这条会立刻抓住手滑。
-    #[test]
-    fn every_sample_raw_is_28_bytes() {
-        for s in [GUEST_DAY_JSON, GUEST_HOUR_JSON, BLANK_JSON, INSTALL_JSON] {
-            let card = parse::parse_card(s, 0).unwrap();
-            assert!(
-                card.raw_is_28_bytes(),
-                "{} 的原始数据长度应为 56，实际 {}",
-                card.kind_label,
-                card.raw_hex.len()
-            );
+    fn guest_day(index: u16) -> GuestDaySpec {
+        GuestDaySpec {
+            room_index: index,
+            days: 1,
+            card_no: timestamp_card_no(&issued_at(), 0).unwrap(),
+            lost: false,
+            issued_at: issued_at(),
         }
+    }
+
+    /// 默认有一张空白卡：否则模拟环境里任何发卡都会在「写卡前预读」失败。
+    #[test]
+    fn new_sim_holds_a_blank_card() {
+        let dev = SimDevice::new();
+        assert_eq!(dev.read_card().unwrap().kind, crate::CardKind::Blank);
+    }
+
+    /// 发卡 → 读回：DTO 字段与字节都要对得上。
+    #[test]
+    fn written_card_reads_back_with_same_bytes() {
+        let dev = SimDevice::new();
+        let written = dev.write_guest_day(&guest_day(15)).unwrap();
+        let back = dev.read_card().unwrap();
+
+        assert_eq!(written.kind, crate::CardKind::GuestDay);
+        assert_eq!(written.room_index, 15);
+        assert_eq!(written.days, 1);
+        assert_eq!(back.raw_hex, written.raw_hex);
+        assert!(dev.card().is_some(), "写卡后卡槽里必须留有这张卡");
+    }
+
+    /// 没放卡时是 `no_card`（码 5），前端据此提示「把卡放上去」。
+    #[test]
+    fn missing_card_reports_no_card_error() {
+        let dev = SimDevice::new();
+        dev.remove_card();
+        let err = dev.read_card().unwrap_err();
+        assert_eq!(err.kind(), "no_card");
+        assert_eq!(err.exit_code(), 5);
+        assert!(!err.is_device_fault());
+    }
+
+    /// 擦卡把卡写零：持卡退房后要用 `kind=blank` 判定擦卡成功。
+    #[test]
+    fn erase_produces_a_blank_card() {
+        let dev = SimDevice::new();
+        dev.write_guest_day(&guest_day(3)).unwrap();
+        let erased = dev.erase_card().unwrap();
+        assert_eq!(erased.kind, crate::CardKind::Blank);
+        assert!(erased.raw_hex.chars().all(|c| c == '0'));
+    }
+
+    /// 原始直写在模拟环境里同样能写出「读不懂的卡」，且不回滚。
+    #[test]
+    fn raw_write_keeps_garbage() {
+        let dev = SimDevice::new();
+        let spec = RawSpec {
+            p1: [0x11, 0x22, 0x33, 0x44],
+            p2: [0x55, 0x66, 0x77, 0x88],
+        };
+        let snap = dev.write_raw(&spec).unwrap();
+        assert_eq!(snap.kind, crate::CardKind::Unknown);
+        assert_eq!(dev.card().unwrap()[0..4], spec.p1);
+    }
+
+    /// 自检 46 项必须全绿——模拟可信的唯一依据。
+    #[test]
+    fn selftest_is_green() {
+        let report = SimDevice::new().selftest().unwrap();
+        assert!(report.is_ok(), "{} 项失败", report.failed);
+        assert_eq!(report.passed, 46);
+    }
+
+    /// 端口探测：当前端口可用，其余不可用（前端的端口选择器据此排序）。
+    #[test]
+    fn probe_ports_only_current_is_available() {
+        let dev = SimDevice::new();
+        dev.set_port(2).unwrap();
+        let ports = dev.probe_ports().unwrap();
+        assert_eq!(ports.len(), 8);
+        assert!(ports[2].available);
+        assert_eq!(ports[2].com, "COM3");
+        assert!(!ports[0].available);
+    }
+
+    /// 模拟后端要能被识别出来，诊断包才有「当前在模拟」这一条。
+    #[test]
+    fn device_info_reports_mock_backend() {
+        let info = SimDevice::new().device_info().unwrap();
+        assert_eq!(info.backend, rc_device::DeviceBackend::Mock);
     }
 }

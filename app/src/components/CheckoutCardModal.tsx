@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ExclamationCircleOutlined, ScanOutlined } from '@ant-design/icons'
-import { Alert, Button, Modal, Space, Typography } from 'antd'
+import { Alert, Button, Checkbox, Modal, Space, Typography } from 'antd'
 import {
   api,
   describeError,
@@ -48,6 +48,8 @@ export function CheckoutCardModal({
   const [error, setError] = useState<string | null>(null)
   /** 强制退房的二次确认（非本系统卡才用得到） */
   const [forceOpen, setForceOpen] = useState(false)
+  /** 退房时是否顺带关闭该房的入住登记单（默认勾选：退房即收拾干净） */
+  const [clearCheckin, setClearCheckin] = useState(true)
 
   // 每次打开都从"还没读卡"开始，避免上一次读到的卡被误当成这一次的
   useEffect(() => {
@@ -128,7 +130,7 @@ export function CheckoutCardModal({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.checkoutCard({ cardNo })
+      const res = await api.checkoutCard({ cardNo, clearCheckin })
       onDone(
         `${res.roomNo} 房：已退房，剩余有效卡 ${res.remaining} 张` +
           (res.remaining === 0 ? '（房态已按设置转换）' : ''),
@@ -147,7 +149,7 @@ export function CheckoutCardModal({
     setBusy(true)
     setError(null)
     try {
-      const res = await api.forceCheckoutCard(roomNo)
+      const res = await api.forceCheckoutCard(roomNo, true, clearCheckin)
       setForceOpen(false)
       const eraseText = res.erased
         ? '，卡已擦成空白卡'
@@ -249,6 +251,16 @@ export function CheckoutCardModal({
               description="退房只关闭这一张卡；作废该房间全部有效卡请用右键菜单里的「无卡退房」。"
             />
           )}
+
+          <Checkbox
+            checked={clearCheckin}
+            onChange={(e) => setClearCheckin(e.target.checked)}
+          >
+            同时清除入住登记信息
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              （只关单、保留住客档案，可在「记录」里回查）
+            </Text>
+          </Checkbox>
         </Space>
       </Modal>
 

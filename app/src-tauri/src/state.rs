@@ -1,122 +1,189 @@
-//! 全局状态与设备后端抽象。
+//! 全局状态与设备门面。
+//!
+//! # 门面只有两个分支，且行为一致
+//!
+//! - [`Device::Sidecar`]：真机。64 位主程序加载不了 32 位驱动，所以门锁卡操作
+//!   全部交给常驻的 `rc-device-sidecar.exe`（NDJSON 协议）。
+//! - [`Device::Sim`]：没有读卡器时（`OCW_SIM=1` 或 sidecar 缺失）用进程内模拟后端。
+//!
+//! 两者返回同一套 DTO 与错误，命令层不需要知道当前是哪一个。
+//! 以前这里是 `Cli(PMSLockCard.exe) | Sim(OCWCardBuild.exe)`，两条路径各有各的字节规则；
+//! 现在字节规则只在 `rc-device` 里，模拟与真机写出来的卡逐字节相同。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ocw_device::{parse, CardSnapshot, CliDevice, DeviceError, PortProbe, SelfTest, SimDevice};
+use ocw_device::{
+    CardSnapshot, CheckoutHourSpec, DeviceError, GuestDaySpec, GuestHourSpec, InstallSpec,
+    MasterSpec, PlainCardSpec, PortProbe, RawSpec, SelfTest, SidecarDevice, SimDevice, TimeSyncSpec,
+};
 use ocw_store::DbConnection as Connection;
 
 use crate::auth::Session;
 
-/// 设备后端。真实机器走 `Cli`（子进程），CI/无驱动环境走 `Sim`。
-///
-/// `Sim` 也带运行时目录：发客卡时会调用 `OCWCardBuild.exe` 离线构包并推进 `CardNo.state`，
-/// 所以模拟环境下的作业流水号也像真机一样按「日 / 时 / 序号」推进。
+/// 设备门面。内部用 `Arc`，复制成本与路径句柄相当。
 #[derive(Clone)]
 pub enum Device {
-    Cli(CliDevice),
-    Sim(SimDevice),
+    Sidecar(Arc<SidecarDevice>),
+    Sim(Arc<SimDevice>),
 }
 
 impl Device {
+    /// 当前是否为模拟后端（持卡退房时对擦卡失败的处理不同）。
     pub fn is_sim(&self) -> bool {
         matches!(self, Self::Sim(_))
     }
 
-    /// 模拟设备专用：离线构一张客卡。真机返回 `None`，调用方继续走 CLI。
-    /// `serial` = 复用卡号（TD-127），Some 时构包器不推进 `CardNo.state`。
-    pub fn sim_issue_guest(
-        &self,
-        room_index: u8,
-        room_no: &str,
-        days: u16,
-        hours: u16,
-        serial: Option<u16>,
-        lost: bool,
-    ) -> Option<Result<CardSnapshot, DeviceError>> {
+    /// 后端名字，进日志与诊断包。
+    pub fn backend(&self) -> &'static str {
         match self {
-            Self::Sim(d) => d.issue_guest(room_index, room_no, days, hours, serial, lost),
-            Self::Cli(_) => None,
+            Self::Sidecar(_) => "sidecar",
+            Self::Sim(_) => "sim",
         }
     }
 
     pub fn read_card(&self) -> Result<CardSnapshot, DeviceError> {
         match self {
-            Self::Cli(d) => d.read_card(),
+            Self::Sidecar(d) => d.read_card(),
             Self::Sim(d) => d.read_card(),
         }
     }
 
-    /// 擦卡（TD-124）：把页1/页2 写零 → 28 字节全零 = 空白卡（锁不再认这张卡）。
-    /// 真实设备走 CLI `issue --type raw`（页3–7 原厂本就全零）；模拟设备没有真实写入
-    /// 闭环，直接回放空白卡快照。擦卡不消耗卡号（raw 卡不含卡号）。
     pub fn erase_card(&self) -> Result<CardSnapshot, DeviceError> {
         match self {
-            Self::Cli(d) => d.issue(&["--type", "raw", "--p1", "00000000", "--p2", "00000000"]),
-            Self::Sim(_) => parse::parse_card(ocw_device::sim::BLANK_JSON, 0),
+            Self::Sidecar(d) => d.erase_card(),
+            Self::Sim(d) => d.erase_card(),
         }
     }
 
-    /// 写一张卡。`room_index` 只有模拟构包器用得上（卡里存的是序号不是房号）。
-    pub fn issue(&self, args: &[&str], room_index: Option<u8>) -> Result<CardSnapshot, DeviceError> {
+    pub fn write_guest_day(&self, spec: &GuestDaySpec) -> Result<CardSnapshot, DeviceError> {
         match self {
-            Self::Cli(d) => d.issue(args),
-            Self::Sim(d) => {
-                // 有构包器就按卡型真实构包（字节与真机一致），没有才回退
-                if let Some(res) = d.issue_admin(args, room_index) {
-                    return res;
-                }
-                let kind = args
-                    .iter()
-                    .position(|a| *a == "--type")
-                    .and_then(|i| args.get(i + 1))
-                    .copied();
-                match kind {
-                    // 安装卡与客卡有固定样本可回放
-                    Some("install") => parse::parse_card(ocw_device::sim::INSTALL_JSON, 0),
-                    // 其它管理卡没有样本：宁可报错，也不要静默回放客卡让人以为发对了
-                    Some(other) => Err(DeviceError::Protocol(format!(
-                        "模拟设备缺少 OCWCardBuild.exe，无法构 {other} 卡（先跑 npm run build:sdk）"
-                    ))),
-                    None => parse::parse_card(ocw_device::sim::GUEST_DAY_JSON, 0),
-                }
-            }
+            Self::Sidecar(d) => d.write_guest_day(spec),
+            Self::Sim(d) => d.write_guest_day(spec),
+        }
+    }
+
+    pub fn write_guest_hour(&self, spec: &GuestHourSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_guest_hour(spec),
+            Self::Sim(d) => d.write_guest_hour(spec),
+        }
+    }
+
+    pub fn write_master(&self, spec: &MasterSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_master(spec),
+            Self::Sim(d) => d.write_master(spec),
+        }
+    }
+
+    pub fn write_install(&self, spec: &InstallSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_install(spec),
+            Self::Sim(d) => d.write_install(spec),
+        }
+    }
+
+    pub fn write_reset(&self, spec: &PlainCardSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_reset(spec),
+            Self::Sim(d) => d.write_reset(spec),
+        }
+    }
+
+    pub fn write_clear(&self, spec: &PlainCardSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_clear(spec),
+            Self::Sim(d) => d.write_clear(spec),
+        }
+    }
+
+    pub fn write_checkout_hour(&self, spec: &CheckoutHourSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_checkout_hour(spec),
+            Self::Sim(d) => d.write_checkout_hour(spec),
+        }
+    }
+
+    pub fn write_timesync(&self, spec: &TimeSyncSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_timesync(spec),
+            Self::Sim(d) => d.write_timesync(spec),
+        }
+    }
+
+    /// 原始直写（破坏性，仅供逆向/排障）。
+    pub fn write_raw(&self, spec: &RawSpec) -> Result<CardSnapshot, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.write_raw(spec),
+            Self::Sim(d) => d.write_raw(spec),
         }
     }
 
     pub fn selftest(&self) -> Result<SelfTest, DeviceError> {
         match self {
-            Self::Cli(d) => d.selftest(),
+            Self::Sidecar(d) => d.selftest(),
             Self::Sim(d) => d.selftest(),
         }
     }
 
     pub fn probe_ports(&self) -> Result<Vec<PortProbe>, DeviceError> {
         match self {
-            Self::Cli(d) => d.probe_ports(),
+            Self::Sidecar(d) => d.probe_ports(),
             Self::Sim(d) => d.probe_ports(),
+        }
+    }
+
+    pub fn device_info(&self) -> Result<ocw_device::DeviceInfo, DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.device_info(),
+            Self::Sim(d) => d.device_info(),
+        }
+    }
+
+    pub fn set_port(&self, port: u8) -> Result<(), DeviceError> {
+        match self {
+            Self::Sidecar(d) => d.set_port(port),
+            Self::Sim(d) => d.set_port(port),
+        }
+    }
+
+    /// 退出前关掉 sidecar（模拟后端是空操作）。
+    pub fn shutdown(&self) {
+        if let Self::Sidecar(d) = self {
+            d.shutdown();
         }
     }
 }
 
-/// 按运行时目录构造设备。`OCW_SIM=1` 或 SDK 不存在时退化为模拟设备。
-pub fn build_device(runtime_dir: &Path, port: u8) -> Device {
-    if std::env::var_os("OCW_SIM").is_some() {
-        return Device::Sim(SimDevice::at(runtime_dir));
+/// 按运行时目录构造设备。
+///
+/// 优先级：`OCW_SIM=1` 或 `sim` 参数 → 进程内模拟；找不到 sidecar → 也退化为模拟
+/// （界面会明确提示「模拟设备」，避免用户以为真的在写卡）。
+pub fn build_device(runtime_dir: &Path, port: u8, sim: bool) -> Device {
+    let exe = runtime_dir.join("rc-device-sidecar.exe");
+    if sim || !exe.is_file() {
+        if !sim {
+            eprintln!(
+                "[ocw] 未找到 {}，退化为模拟设备（先跑 pnpm build:device）",
+                exe.display()
+            );
+        }
+        let device = SimDevice::new();
+        let _ = device.set_port(port);
+        return Device::Sim(Arc::new(device));
     }
-    let exe = runtime_dir.join("PMSLockCard.exe");
-    if !exe.is_file() {
-        return Device::Sim(SimDevice::at(runtime_dir));
+
+    let driver_dir = runtime_dir.join("drivers").join("LC2000");
+    let device = SidecarDevice::new(exe, Some(driver_dir));
+    // 端口设置失败不阻塞启动：真机上「没有读卡器」是常见状态，界面会提示去探测
+    if let Err(e) = device.set_port(port) {
+        eprintln!("[ocw] 设置串口 {port} 失败（可稍后在设置页重选）：{e}");
     }
-    Device::Cli(CliDevice::new(
-        exe,
-        runtime_dir.join("LockCard.ini"),
-        runtime_dir.join("IOServer").join("LC2000"),
-        port,
-    ))
+    Device::Sidecar(Arc::new(device))
 }
 
-/// 当前设备 + 串口。串口可变，所以放在锁里；切换端口时整体重建。
+/// 当前设备 + 串口。串口可变，所以放在锁里。
 pub struct DeviceSlot {
     pub device: Device,
     pub port: u8,
@@ -128,8 +195,14 @@ pub struct AppState {
     pub slot: Arc<Mutex<DeviceSlot>>,
     pub runtime_dir: PathBuf,
     pub driver_sha256: Option<String>,
-    pub sdk_source: Option<String>,
+    /// 硬件层来源：`env` / `resource` / `dev`
+    pub device_source: Option<String>,
     pub dev: bool,
+    /// 身份证读卡器。与门锁卡读写器是**两个互不相关的设备**：任一故障都不影响另一个。
+    ///
+    /// 它走本机 `ws://127.0.0.1:9001` 服务，不需要 32 位驱动，所以留在主进程内，
+    /// 不经过 sidecar。
+    pub id_card: Arc<dyn rc_device::IdCardReader>,
     /// 当前会话。只存内存，重启即失效。
     pub session: Arc<Mutex<Option<Session>>>,
 }
@@ -148,12 +221,17 @@ impl AppState {
         }
     }
 
-    /// 取一份设备副本。`Device` 是轻量句柄（路径 + 端口），复制成本可忽略。
+    /// 取一份设备副本。`Device` 内部是 `Arc`，复制成本可忽略。
     pub fn device(&self) -> Device {
         match self.slot.lock() {
             Ok(s) => s.device.clone(),
-            Err(_) => Device::Sim(SimDevice::default()),
+            Err(_) => Device::Sim(Arc::new(SimDevice::new())),
         }
+    }
+
+    /// 身份证读卡器。与门锁卡设备彼此独立，故障不互相传染。
+    pub fn id_card(&self) -> Arc<dyn rc_device::IdCardReader> {
+        Arc::clone(&self.id_card)
     }
 
     pub fn port(&self) -> u8 {
@@ -163,11 +241,12 @@ impl AppState {
         }
     }
 
-    /// 切换串口：设备层本来就是"每次调用开关一次串口"，重建实例是安全的。
-    pub fn rebuild_device(&self, port: u8) -> Result<(), String> {
-        let device = build_device(&self.runtime_dir, port);
+    /// 切换串口：发一条 `set_port` 给硬件层，成功后才更新本地记录。
+    pub fn set_port(&self, device: &Device, port: u8) -> Result<(), String> {
+        device
+            .set_port(port)
+            .map_err(|e| format!("{}（{}）", e, e.hint()))?;
         let mut slot = self.slot.lock().map_err(|_| "设备状态锁异常".to_string())?;
-        slot.device = device;
         slot.port = port;
         Ok(())
     }

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Modal, Space, Table, Typography } from 'antd'
+import { Alert, Button, Checkbox, Modal, Space, Table, Typography } from 'antd'
 import type { ColumnsType } from 'antd/es/table'
 import {
   api,
@@ -33,6 +33,8 @@ export default function NoCardCheckoutModal({
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  /** 退房时是否顺带关闭该房的入住登记单（默认勾选） */
+  const [clearCheckin, setClearCheckin] = useState(true)
 
   const roomNo = room?.roomNo ?? ''
 
@@ -81,7 +83,7 @@ export default function NoCardCheckoutModal({
     for (const [i, row] of selectedRows.entries()) {
       try {
         // 无卡退房：用户手上没有卡，跳过读卡器（不读卡、不擦卡），只做数据库标记
-        const res = await api.checkoutCard({ issuanceId: row.id, noDevice: true })
+        const res = await api.checkoutCard({ issuanceId: row.id, noDevice: true, clearCheckin })
         done.push(row.id)
         remaining = res.remaining
       } catch (e) {
@@ -161,6 +163,16 @@ export default function NoCardCheckoutModal({
           }}
           columns={columns}
         />
+
+        <Checkbox
+          checked={clearCheckin}
+          onChange={(e) => setClearCheckin(e.target.checked)}
+        >
+          同时清除入住登记信息
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            （只关单、保留住客档案，可在「记录」里回查）
+          </Text>
+        </Checkbox>
 
         <Space wrap>
           <Button

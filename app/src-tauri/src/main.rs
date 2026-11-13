@@ -28,6 +28,8 @@ fn main() {
     }));
 
     tauri::Builder::default()
+        // 到期提醒的系统通知（TD-228）：Windows 原生 toast
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // 第二个实例只把已有窗口叫到前台：串口是独占资源，不能有两个发卡进程。
             // 窗口可能被缩小到托盘（hide），所以要先 show 再 unminimize/focus。
@@ -89,10 +91,9 @@ fn main() {
 
             let runtime = provision::ensure_runtime(app.handle());
 
-            let device = build_device(&runtime.dir, port);
-            if device.is_sim() {
-                eprintln!("[ocw] 使用模拟设备（未找到 SDK，或设置了 OCW_SIM）");
-            }
+            let sim = std::env::var_os("OCW_SIM").is_some();
+            let device = build_device(&runtime.dir, port, sim);
+            eprintln!("[ocw] 设备后端: {}（运行时目录 {}）", device.backend(), runtime.dir.display());
 
             let db = Arc::new(Mutex::new(conn));
             let db_for_job = db.clone();
@@ -104,8 +105,10 @@ fn main() {
                 slot: Arc::new(Mutex::new(DeviceSlot { device, port })),
                 runtime_dir: runtime.dir,
                 driver_sha256: runtime.driver_sha256,
-                sdk_source: runtime.source,
+                device_source: runtime.source,
                 dev: runtime.dev,
+                // 身份证读卡器是独立设备：走本机 9001 服务，不需要 32 位驱动
+                id_card: Arc::new(rc_device::idcard_ws::HsWsIdCardReader::new()),
                 session: Arc::new(Mutex::new(None)),
             });
 
@@ -179,6 +182,7 @@ fn main() {
             commands::login,
             commands::logout,
             commands::read_card,
+            commands::read_id_card,
             commands::list_rooms,
             commands::create_room,
             commands::rename_room,
@@ -224,6 +228,16 @@ fn main() {
             commands::list_audits,
             commands::export_issuances_csv,
             commands::export_reservations_csv,
+            commands::export_checkins_csv,
+            commands::export_room_index_json,
+            commands::create_checkin,
+            commands::get_open_checkin,
+            commands::list_checkins,
+            commands::get_checkin,
+            commands::add_checkin_guest,
+            commands::update_checkin_guest,
+            commands::delete_checkin_guest,
+            commands::close_checkin,
             commands::import_rooms,
             commands::get_onboarding_status,
             commands::complete_onboarding,
@@ -239,6 +253,8 @@ fn main() {
             commands::set_reminder_settings,
             commands::get_checkout_hour,
             commands::set_checkout_hour,
+            commands::get_morning_cutoff,
+            commands::set_morning_cutoff,
             commands::expiring_cards,
             commands::hide_to_tray,
             commands::quit_app,
@@ -246,6 +262,15 @@ fn main() {
             commands::probe_ports,
             commands::set_port,
         ])
-        .run(tauri::generate_context!())
-        .expect("门锁发卡台启动失败");
+        .build(tauri::generate_context!())
+        .expect("门锁发卡台启动失败")
+        .run(|app_handle, event| {
+            // 退出时把常驻 sidecar 关掉：串口是独占资源，留孤儿进程会让下一次启动
+            // 抢不到端口。（正常退出走 shutdown 请求，超时由 Session 的 Drop 兜底。）
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    state.device().shutdown();
+                }
+            }
+        });
 }

@@ -160,11 +160,11 @@ export default function FirstRunWizard({
             <Text>串口号</Text>
             <InputNumber
               min={0}
-              max={255}
+              max={7}
               value={port}
               onChange={(v) => setPort(Number(v ?? 0))}
             />
-            <Text type="secondary">（0 = COM1；不确定就保持默认，之后可在设置→设备 里改）</Text>
+            <Text type="secondary">（0–7，0 = COM1；不确定就保持默认，之后可在设置→设备 里改）</Text>
             <Button loading={busy} onClick={() => void savePort()}>
               保存并切换
             </Button>

@@ -1,9 +1,11 @@
 # AGENTS.md
 
-本仓库是「智能门锁管理软件（LOCK_V8 / V8.9）」TEMIC 卡的**逆向成果 + 独立发卡 SDK**，
-并在其上开发开源发卡台 **OpenCardWright**。`sdk/` 侧不是常规应用工程：没有解决方案文件、
-没有包管理，也没有单元测试框架（回归靠 `PMSLockCard.exe selftest`）；产品侧
-`app/` 是独立的 Tauri + Rust + React 工程，有自己的构建链（见第 9 节）。
+本仓库是「智能门锁管理软件（LOCK_V8 / V8.9）」TEMIC 卡的**逆向成果**，
+并在其上开发开源发卡台 **OpenCardWright**。
+
+2026-11-14 起，卡格式实现与门锁驱动（原 `sdk/` 那套 .NET SDK / CLI）已整体迁到独立仓库
+**rc-device-sdk**，以 git submodule 挂在 `app/src-tauri/vendor/rc-device`：
+产品侧不再持有任何卡字节知识，硬件兼容（驱动加载、卡格式、9001 身份证服务）全部由它负责。
 仓库已纳入 git，见第 8 节。
 
 改动前先读 `docs/`，那里是唯一权威来源；代码是文档的实现。
@@ -20,72 +22,83 @@
 | `docs/抓包样本与验证记录.md` | 原厂字节样本表、实测结论、复现方法 | 新样本**必须**登记在这里 |
 | `docs/SDK使用说明.md` | .NET / COM / CLI 三种用法、错误码、FAQ | 接口变了才改 |
 | `docs/接口文档.md` | 卡格式、驱动 `te_*`、`SM_RW_Card`、SDK/COM/CLI 接口汇总（对外/对下） | 接口变了才改 |
-| `sdk/PMSLockSDK.cs` | 类库：`CardBuilder`（纯函数）、`LockCardReader`（P/Invoke）、配置/状态 | 见第 4 节约定 |
-| `sdk/PMSLockCard.cs` | CLI，含 `selftest` 的 46 项（33 字节向量 + 7 卡号编码 + 6 时长码） | 加样本只追加 |
-| `sdk/PMSLockSDK.Com.cs` | COM 可见封装（`PmsLockSdk.Reader`） | 改 ProgId/GUID 会破坏调用方 |
-| `sdk/demo/` | COM/VBScript 与 C# 调用示例（`Demo.cs`、`ComTest.vbs`），自含一份 SDK dll 副本 | 改接口时同步示例 |
-| `sdk/tools/RawRead.exe` | 原始读卡小工具（联机排障用） | 慎改 |
-| `sdk/IOServer/LC2000/*.dll` | 原厂读卡器驱动（x86，随包分发） | **不要动**，见第 3 节哈希 |
-| `sdk/LockCard.ini`、`sdk/CardNo.state` | 运行配置、起始卡号模板（构建时不复制，运行时由产品侧 `cardno.rs` 维护） | 状态文件是现场数据 |
+| `app/src-tauri/vendor/rc-device/` | **git submodule**：硬件兼容层（`rc_device` crate）。驱动加载、卡字节编解码、46 项黄金向量自检、身份证 9001 客户端、`rc-device-sidecar` 32 位宿主与 `--sim` 模拟后端 | 在**它自己的仓库**里改，改完提交并更新子模块指针 |
+| `rc-device` 的 `drivers/LC2000/*.dll` | 原厂读卡器驱动（x86，随包分发，手动拷进产品资源，见第 2 节） | **不要动**，见第 3 节哈希 |
 | `data/NacreHis.json`、`data/RoomIndex.ini` | 数据库导出（303 表）、房号↔序号 | 只读参考 |
 | `vendor/125k-sdk-v4.2/` | 原厂 SDK 开发模块留档（IDA / dumpbin 分析材料） | 只读；结论进 `docs/` |
-| `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**，有自己的构建链（`scripts/build-sdk.ps1` → `pnpm` → `build-release.ps1`） | 见第 9 节 |
+| `app/` | 开源发卡台产品，**独立的 Tauri + Rust 工程**（手动 cargo 编 sidecar → `pnpm` → `build-release.ps1`） | 见第 9 节 |
 | `app/docs/使用手册.md`、根 `CHANGELOG.md` | 面向最终用户的手册、版本变更 | 只写结论；未完成项进 `plan/待办清单.md` |
-| `app/build-release.ps1`、`.github/workflows/ci.yml` | 一键 MSI 发布（需 WiX Toolset v3）、CI 四道门禁（selftest / cargo test / cargo check / 前端） | 发布链变了要同步 |
-| `app/tools/CardBuild.cs` | 模拟设备离线构包器（只调 SDK 的 `CardBuilder`；**卡号必须由 `--serial` 传入**，不再自增） | 随 SDK 接口同步 |
+| `app/build-release.ps1`、`.github/workflows/ci.yml` | 一键 MSI 发布（需 WiX Toolset v3）、CI 门禁（sidecar selftest / cargo test / cargo check / 前端） | 发布链变了要同步 |
 | `plan/` | 建设方案（v0.1 作废留档、v0.2 已批准）、`待办清单.md`（索引）、`已完成.md`（摘要）与 `td-xxx.md`（条目详情） | 方案改结论要留痕；待办清单每轮更新，见第 10 节 |
 
-`sdk/` 会被**整目录拷到现场 32 位 Windows** 直接运行，所以不要在 `sdk/` 里塞构建中间物或文档。
+`sdk/` 已在 2026-11-14 整体移除（历史见 git）。`plan/td-*.md` 里出现的 `sdk/...` 路径
+都是**当时快照**的历史记录，不是现行路径；现行实现看 `app/src-tauri/vendor/rc-device/src/`。
 
 ---
 
-## 2. 构建（裸 csc，无 MSBuild）
+## 2. 构建（硬件层手动编，不依赖脚本）
 
-编译环境：`C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe`（.NET Framework 4.0，C# 5 语法上限，
-不要用字符串插值 / `?.` / `nameof` 等新语法）。**必须 `/platform:x86`**，驱动是 32 位。
+卡字节与驱动绑定不在本仓库编译。硬件层由开发者手动用 cargo 编出来，四步（在 `app/` 内执行）：
 
-在 `sdk\` 目录下按顺序：
+```powershell
+# 1) 编 32 位 sidecar（驱动只有 x86，64 位进程加载不了）
+cargo build --manifest-path src-tauri/vendor/rc-device/Cargo.toml `
+  --bin rc-device-sidecar --release --target i686-pc-windows-msvc `
+  --target-dir src-tauri/target/sidecar
 
-```bat
-csc /target:library /platform:x86 /out:PMSLockSDK.dll /doc:PMSLockSDK.xml PMSLockSDK.cs
-csc /target:exe     /platform:x86 /out:PMSLockCard.exe /r:PMSLockSDK.dll PMSLockCard.cs
-csc /target:library /platform:x86 /out:PMSLockSDK.Com.dll /r:PMSLockSDK.dll PMSLockSDK.Com.cs
+# 2) 摆成 sidecar 默认查找的布局（exe 同目录的 drivers/LC2000）
+New-Item -ItemType Directory -Force -Path src-tauri/resources/device/drivers/LC2000 | Out-Null
+Copy-Item src-tauri/target/sidecar/i686-pc-windows-msvc/release/rc-device-sidecar.exe src-tauri/resources/device/ -Force
+Copy-Item src-tauri/vendor/rc-device/drivers/LC2000/* src-tauri/resources/device/drivers/LC2000/ -Recurse -Force
+
+# 3) 门禁：46 项黄金向量（--sim 不加载驱动；selftest 本来就是纯计算）
+@('{"id":1,"op":"selftest"}','{"id":2,"op":"shutdown"}') |
+  & src-tauri/resources/device/rc-device-sidecar.exe --sim
+
+# 4) 起开发环境（前端 + Tauri 壳）
+pnpm tauri dev
 ```
 
-- 第 1 条来自 `PMSLockSDK.cs` 头注释；第 2、3 条按同样方式推导（`PMSLockCard.cs` 头注释只列用法，
-  未给编译行），exe/COM 的 `/r:PMSLockSDK.dll` 是必需项（`using PmsLockSdk`）。
-- COM 注册（管理员，32 位）：`regasm.exe PMSLockSDK.Com.dll /tlb /codebase`。
-- 源码含中文注释与中文输出：若编译后乱码，加 `/codepage:65001`，**不要**转成 GBK 保存。
-- 交付物是 `.dll/.exe`，仓库里已提交编译结果；改源码后要同步重建，否则现场跑的是旧二进制。
-- **产品侧不要手工执行上面的 csc**：统一走 `app/scripts/build-sdk.ps1`
-  （额外编 `OCWCardBuild.exe`、跑 46 项自检门禁、不复制 `CardNo.state`）。
+- 第 3 步的响应必须 `"passed":46,"failed":0`；对不上就停下，不要上机。
+- `resources/device/` 是构建产物，不入库（`app/.gitignore`）。驱动指纹由程序启动时**现算**
+  SHA-256（`provision.rs`），不再有 `manifest.json` 之类的构建清单要维护。
+- 驱动哈希必须等于 `F2F483E0…BCCBC0`（102,492 字节、92 导出）；不符只在日志与设置页告警，
+  但卡格式结论对该版本未必成立，发布前必须在测试机跑一次真实读写。
+- **发布打包（`pnpm tauri build`）之前必须先跑第 1–2 步**：MSI 打包的就是 `resources/device`，
+  没准备就会带着「模拟设备」出门。
+- 改硬件行为（卡字节、驱动调用、超时、模拟）一律在 **rc-device-sdk 仓库**里改并提交，
+  然后在本仓库更新子模块指针；**不要**把卡字节逻辑写回产品侧。
 
 ## 3. 验证（不需要读卡器）
 
-```bat
-cd sdk
-PMSLockCard.exe selftest
+```powershell
+cargo test --manifest-path app/src-tauri/vendor/rc-device/Cargo.toml   # 硬件层：201 单测 + 契约 + sidecar
+cargo test --workspace --manifest-path app/src-tauri/Cargo.toml         # 产品侧 156 项（含真起 sidecar --sim）
 ```
 
-- 期望末行 `自检结果: 46 通过, 0 失败`；失败时进程返回 `5`。
-- 46 项 = 33 条字节向量 + 7 条卡号编码（含进位/跨日）+ 6 条时长码。向量取自
+- 46 项 = 33 条字节向量 + 7 条卡号编码（含进位/跨日）+ 6 条时长码，取自
   `docs/抓包样本与验证记录.md` §1（31 行原厂样本）与月数/校时实验表；校时卡 6 条已进向量。
-  `NAME` 字段可与表对号。
-- **纯字节回归**：`CardBuilder` 是静态纯函数，`selftest` 不打开串口，可随时跑。
-- 需要硬件时才用 `PMSLockCard.exe ports` / `read`；驱动哈希不符、串口被 `NacreHis.exe` 占用都会失败。
+- `selftest` 是纯函数、不打开串口，随时可跑；构建前按第 2 节第 3 步手工跑一遍。
+- 需要硬件时：在 `vendor/rc-device` 内
+  `cargo run --bin probe --target i686-pc-windows-msvc`；
+  看模拟路径用 `cargo run --bin probe -- --sim`。
+  驱动哈希不符、串口被 `NacreHis.exe` 占用都会失败。
 
-改任何组包逻辑后，**先让 `selftest` 全绿**再谈上机。
+改任何组包逻辑后，**先让 46 项全绿**再谈上机。
 
 ## 4. 代码约定
 
-1. **分层不许破**：字节格式只写在 `CardBuilder`（静态、无 IO、可离线验证）；
-   串口/驱动调用只写在 `LockCardReader`（实例、线程不安全、一个实例一个串口）。
-   不要为了省事在 CLI 里拼字节或在 `CardBuilder` 里碰句柄。
-2. **错误码两套，不要混**：`LockResult` 是 SDK 码（0–11），`PMSLockCard.cs` 的 `Fail()`
-   把它映射成进程退出码（0–7）。新增 SDK 码时，末尾追加并在 `Fail()` 补映射，别改既有值。
+1. **分层不许破**：字节格式只写在 `rc-device` 的 `builder`（纯函数、可离线验证）；
+   串口/驱动调用只写在 `src/dll/`（唯一 `unsafe` 区）。产品侧（`commands.rs` / `state.rs`）
+   只允许出现 `rc_device::*Spec`，**不要**自己拼字节或 CLI 参数。
+2. **错误码一套**：硬件层给 `DeviceErrorPayload`（`sdkCode` 0–11、`kind`、`hint`、`deviceFault`），
+   产品侧 `ocw-device::DeviceError` 原样搬运，命令层只把它映射成 `CommandError`；
+   不要再引入第二套码，也不要按进程退出码猜语义。
 3. **卡号与 `CardNo.state`**：`CardNo.state` 只是内部计数器，由产品侧 `cardno.rs` 在发卡时读写；
    `setting.startCardNo` 不再读取，现有 `CardNo.state` **保留、不重置**。
-   `issuance.card_no` 列保留但**停止读写**（发卡记录不存卡号）；卡号仍按时间戳生成并只写入卡。
+   `issuance.card_no` **恢复写入**（16 位作业流水号）；没有流水号的卡型（安装卡、空白卡、
+   原始直写）记 NULL。**它不当唯一键**——不含年月，跨月同日同时同序会重复；
+   发卡记录之间的关联键仍是 `raw_hex`（28 字节整卡指纹），主键是自增 `id`。
 4. **文档同步**：改格式要同时 (a) 在 `抓包样本与验证记录.md` 登记样本，(b) 在 `selftest` 加向量，
    (c) 更新技术规格对应小节。三者缺一视为未完成。
 5. **证据标注沿用文档惯例**：`【实测】`=有抓包或联机证据，`【推断】`=由证据归纳，`【待定】`=机制未证实。
@@ -107,7 +120,7 @@ PMSLockCard.exe selftest
 | 总控卡页1 | `5B EC F0 FF` |
 | 安装卡页2 | 固定 `46 F2 00 01`，**不含**作业流水号 |
 | 校时卡 | 编码的是 **`YYMMDDHHmm`**（年月日时分）：`YYMM` 在 `页2[3]`、`DD` 在卡号日段、`HH:mm` 在页1 位域（`页1[2] = 16 × (分 & 0x0F) + 9`、`页1[3] = (分 >> 4) + ((4 × 时) & 0x7C)`）；页2 首字节 **`0x06`**（明文，IDA: `LOBYTE(v14[2]) = 6`）；页1[2] 必须满足 `& 0x09 == 0x09`，否则读卡返回错误 4。旧公式 `16×当日分钟+953` 已废弃 |
-| 作业流水号 | **10 位十进制 `YYMMDDHHII`**（年 2 + 月 2 + 日 2 + 时 2 + 小时内序号 2；如 `2611081100` = 2026-11-08 11 时第 00 号）。写卡时拆两处：`页2[3]` 存 `YYMM`（高 4 位年、低 4 位月），16 位卡号存 `DDHHII` = `(日 & 0x1F) << 11 ｜ (时 & 0x1F) << 6 ｜ 序号(0–62)`；满 63 张则小时 +1、序号归 0。客卡 / 总控 / 复位 / 清除 / 退房钟点 / 校时共用；产品侧只用于写卡，**不落库、不展示**（数据库列保留但停止读写） |
+| 作业流水号 | **10 位十进制 `YYMMDDHHII`**（年 2 + 月 2 + 日 2 + 时 2 + 小时内序号 2；如 `2611081100` = 2026-11-08 11 时第 00 号）。写卡时拆两处：`页2[3]` 存 `YYMM`（高 4 位年、低 4 位月），16 位卡号存 `DDHHII` = `(日 & 0x1F) << 11 ｜ (时 & 0x1F) << 6 ｜ 序号(0–62)`；满 63 张则小时 +1、序号归 0。客卡 / 总控 / 复位 / 清除 / 退房钟点 / 校时共用。产品侧按发卡时刻生成并写卡，同时把 16 位 `DDHHII` **落库到 `issuance.card_no`**（安装卡 / 空白卡 / 原始直写记 NULL）；年月随整卡指纹留在 `raw_hex`，**记录关联不用卡号**（跨月会重复），继续按 `raw_hex` 匹配 |
 | CLI 时间源 | `issue --datetime "YYYY-MM-DD HH:mm"`（`--at` 同义）驱动 `CardBuilder.Now`（`页2[3]` 的 `YYMM`）；**`DDHHII` = `日<<11 ｜ 时<<6 ｜ seq`** 用同一个时间 + `--seq` 算出，两段天然同源。CLI 不再维护计数器；`--serial` 可显式指定 `DDHHII` 部分 |
 | 挂失 | `页1[2]` **低 4 位** = 1 即挂失（`BuildGuestDay/Hour(..., lost)`）；原 `LowNibble`（`天数&3==1`）已删除，那会让 1 天卡/钟点卡被误标挂失 |
 | 时长码·月 | 超 63 天走 `0xC0 \| 月数`，**按 30 天/月换算**（90→3 月、1095→**36 月**）；锁按日历月执行 |
@@ -146,42 +159,51 @@ PMSLockCard.exe selftest
 
 **仍存在的不一致（无害）**：
 
-- `RoomIndex.ini` 有两份（`data/` 与 `sdk/`）；运行时读 `sdk/` 侧（`LockCard.ini` 用相对路径），
-  增删房间要两份同步。
-- `sdk/PMSLockSDK.cs` 头注释仍是旧格式（写死 `0xAB`、31 天/月、递增发号、`CardNo.state`），
-  2026-11-08 重构未同步；**以代码与 `docs/` 为准**。
-- `sdk/PMSLockCard.cs` 头注释的用法仍是 `issue --room 220`（实际按 `--room-index`），
-  时间源是 `--datetime` / `--at`。
-- `app/scripts/build-sdk.ps1` 与 `app/tools/CardBuild.cs` 的注释仍提 `CardNoStore` /「27 条黄金向量」
-  （实际 `selftest` 已是 46 项），不影响构建，但别照着注释理解现状。
+- `RoomIndex.ini` 有两份（`data/` 与历史 `sdk/` 副本）；`sdk/` 已于 2026-11-14 移除，
+  现行只用 `data/RoomIndex.ini` 作参考——房号↔序号的真值在 SQLite 的 `room` 表。
+- `plan/td-*.md` 里的 `sdk/PMSLockSDK.cs`、`PMSLockCard.exe` 路径都是**当时快照**；
+  这些条目记录历史，不要照着它们定位现行代码。
 - `plan/待办清单.md` 正文完成记录里的数字滞后（TD-150 仍写 39 项 / 126 项测试）；
   判定完成看 §1 索引与代码实跑。
 
 ## 8. 环境注记
 
-- 2026-11-06 本机 `pwsh` 7、`csc`（.NET Framework 4.0）、`npm` 均可用；2026-11-07 起前端包管理改用
-  **pnpm**（2026-11-10 实测 10.29.3，`pnpm build:sdk` 46/46 通过）。`app/pnpm-workspace.yaml` 的
+- 2026-11-06 本机 `pwsh` 7、`npm` 均可用；2026-11-07 起前端包管理改用
+  **pnpm**（2026-11-14 实测手动编 sidecar 后 selftest 46/46 通过）。`app/pnpm-workspace.yaml` 的
   `allowBuilds: esbuild` 不能删，否则 `pnpm install` 会以 `ERR_PNPM_IGNORED_BUILDS` 失败。
   若某会话 `pwsh` 启动失败（`0xC0000142` DLL 初始化失败），先确认能否编译，
   不要把“没跑过命令”当成验证通过。
-- **`cargo` 不在 PATH**（PowerShell / cmd 都找不到）：本机绝对路径
-  `C:\Users\Administrator\.cargo\bin\cargo.exe`。测试要在 `app/src-tauri/` 内跑（仓库根没有 `Cargo.toml`）。
+- 硬件层构建需要 **Rust + `i686-pc-windows-msvc`**（`rustup target add`）；
+  2026-11-14 起**不再需要** `csc` / .NET Framework。
+- **`cargo` 可能不在 PATH**：本机绝对路径 `C:\Users\Administrator\.cargo\bin\cargo.exe`。
+  产品测试在 `app/src-tauri/` 内跑；硬件层测试用
+  `cargo test --manifest-path app/src-tauri/vendor/rc-device/Cargo.toml`（仓库根没有 `Cargo.toml`）。
 - **`D8050` 与中文路径无关**：真因是 `libsqlite3-sys` 编 `sqlite3.c` 时命令行过长。项目现在
   **不再覆盖** `CARGO_TARGET_DIR` / `DEBUG`，统一使用 Tauri/Cargo 默认的 `app/src-tauri/target`。
   若本机默认 target 仍触发 D8050，作为本机环境问题单独处理，不要写回仓库脚本。
+- **双通道（正式版 / DEV）**：`build-release.ps1 -Channel dev` 用 `src-tauri/tauri.dev.conf.json`
+  覆盖 identifier（`…desktop.dev`）/ productName（`门锁发卡台 Dev`）/ 窗口标题 / WiX `upgradeCode`，
+  并设编译期 `OCW_CHANNEL=dev`；数据目录因此分开（`OpenCardWright` / `OpenCardWright-dev`），
+  两版可同时安装、同时打开（串口独占，读卡器只有一边能连）。顶栏标签读 `AppInfo.channel`：
+  正式版品牌渐变、DEV 橙色。
 - 驱动版本敏感：结论只对 SHA-256 `F2F483E08BA8048FFD1C57E66CB35D9E32C1C1E280DC5F2FF100A5D881BCCBC0`
   的 `LC32RFRW.dll`（102,492 字节、92 个导出）成立。厂商升级驱动需重新评估。
-- **版本号**：每次有代码、行为或用户可见文档变动，都要提升 `app` 的构建号，并同步
+- **版本号**：三段 `A.B.C`，**没有独立的构建号段**——Windows Installer 的
+  `ProductVersion` 只认 `major.minor.build` 三段，每段 ≤65535（历史上把年份塞进主版本
+  就撞过 `app version major number cannot be greater than 255`）：
+  - `A` 主版本：大量功能重做或有不兼容改动时 +1（`1.x.x` → `2.0.0`）；
+  - `B` 次版本：增加新功能或改进现有功能时 +1，`C` 归 0（`1.0.x` → `1.1.0`）；
+  - `C` 构建号：**每打一次包 +1**（同日重打包也 +1）。它同时充当 MSI 的 build 段，
+    这样重打包才能覆盖安装——同版本 MSI 会被判定为「已安装」而装不上。
+  新体系从 `1.0.0` 起，旧的 `26.M.DDD`（日×100+序号）已废止。
+  每次改动在 `CHANGELOG.md` 记一条并写明这次为什么升这一段；**四处同步**：
   `app/package.json`、`app/src-tauri/Cargo.toml`、`app/src-tauri/tauri.conf.json`、
-  `app/src-tauri/Cargo.lock`，同时在 `CHANGELOG.md` 记录本版结论。
-  当前格式 `26.M.DDD`：主版本 = 年份−2000（MSI/WiX 要求主版本 ≤ 255，`2026.x` 会报
-  `app version major number cannot be greater than 255`），次版本 = 月份，
-  补丁号 = **日×100 + 当日构建序号**（如 11 月 9 日第 62 号 → `26.11.962`），每月进次版本。
-  不要只改一个位置；版本号不一致会导致安装包、关于页和 Cargo 产物对不上。
+  `app/src-tauri/Cargo.lock`。不要只改一个位置；版本号不一致会导致安装包、关于页和
+  Cargo 产物对不上。
 - 版本库：仓库已纳入 git（远程 `origin` = `github.com/1665169869/OpenCardWright`）。
   **未明确要求不得提交**：除非用户当轮明确说要「提交 / commit / 推送」，否则只改工作区、在回复里列出改动，
   **不要 `git add` / `git commit` / `git push`**；需要提交时先给 `git status` 摘要等用户点头。
-  `sdk/CardNo.state` 是起始卡号模板（构建时不打包），提交前确认值未被误改；`app/src-tauri/resources/sdk/` 是构建产物，不入库。
+  `app/src-tauri/resources/device/` 是构建产物，不入库；子模块改动要在 rc-device-sdk 仓库里单独提交并更新指针。
 
 ---
 
@@ -192,38 +214,38 @@ PMSLockCard.exe selftest
 
 | 关系 | 说明 |
 |---|---|
-| `sdk/` 的定位 | 产品的**设备实现与参考实现**。产品在构建期用 `csc` 从 `sdk/*.cs` 现编，产物打进 `src-tauri/resources/sdk/` |
-| 能否修改 `sdk/` | **默认只读**。2026-11-08 的卡号/挂失/年月重构直接改过 `sdk/*.cs`；确需改设备行为时，必须同步 `selftest` 向量与 `docs/`，产品适配层能解决的不要动 SDK |
-| `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现必须与之一致 |
-| 回归口径 | `sdk` 自带的 46 项自检；产品构建流水线会跑 `PMSLockCard.exe selftest` 做门禁 |
-| 构建命令 | 在 `app/` 内：`pwsh -File scripts/build-sdk.ps1` → `pnpm build:sdk`；随后 `pnpm tauri build --bundles msi`（或发布脚本 `build-release.ps1`） |
+| 硬件层的定位 | 产品的**设备实现**，已迁到独立仓库 `rc-device-sdk`（git submodule，`app/src-tauri/vendor/rc-device`）。构建期用 cargo 编 32 位 `rc-device-sidecar`，产物打进 `src-tauri/resources/device/` |
+| 能否修改硬件层 | **可以，但要在它自己的仓库里改**：改完提交到 rc-device-sdk，再更新本仓库的子模块指针；卡字节、驱动调用、超时、模拟都属于硬件层 |
+| `docs/` 的定位 | 卡格式与锁行为的**唯一权威来源**；产品实现与硬件层都必须与之一致 |
+| 回归口径 | 硬件层自带 46 项黄金向量；构建前按第 2 节第 3 步手工跑一遍 |
+| 构建命令 | 在 `app/` 内：按第 2 节手动编 sidecar → `pnpm tauri build --bundles msi`（或发布脚本 `build-release.ps1`） |
 | 编译环境坑 | MSVC `D8050` 是 **命令行过长**（`sqlite3.c`），不是中文路径；项目使用 Cargo/Tauri 默认 target，不覆盖 `CARGO_TARGET_DIR` / `DEBUG`。详见 `app/README.md` §5 |
 
-新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准，不要套用本文件的 csc 构建命令。
+新产品自己的约定（技术栈、目录、阶段）以 `app/README.md` 为准。
 
 ### 产品侧模块（改代码先定位）
 
 | 位置（相对 `app/`） | 职责 |
 |---|---|
-| `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/`，校验与提示音在 `utils/`；`idcard.ts` 是身份证读卡 WebSocket |
-| `src-tauri/src/commands.rs` | 全部 `#[tauri::command]`：发卡 / 退房 / 房间 / 管理卡 / 备份 / 诊断 / 登录，以及命令 × 角色矩阵 |
+| `src/` | React 19 + antd 5 前端；`api.ts` 是唯一的 Tauri invoke 封装，页面在 `pages/`，复用组件在 `components/`，校验与提示音在 `utils/`。**前端不再接触硬件协议**：门锁卡与身份证都只经 `api.ts` 调命令 |
+| `src-tauri/src/commands.rs` | 全部 `#[tauri::command]`：发卡 / 退房 / 房间 / 管理卡 / 备份 / 诊断 / 登录 / 读身份证，以及命令 × 角色矩阵 |
 | `src-tauri/src/rules.rs` | 时长边界（客卡 62 / 总控 63）、长有效期档位与确认词；**与 `src/api.ts` 的档位表必须同步** |
-| `src-tauri/src/cardno.rs` | 卡号时间戳编码（日/时/序号）、`CardNo.state` 原子读写与递推；卡号由产品侧算好后传给 CLI |
+| `src-tauri/src/cardno.rs` | `CardNo.state` 原子读写 + 时钟回拨保护；卡号编码与进位交给 `rc_device::{timestamp_card_no, next_stamp}` |
 | `src-tauri/src/auth.rs` | 会话、角色（admin / frontdesk）、Argon2 口令 |
 | `src-tauri/crates/ocw-store/` | SQLite schema 与查询（rusqlite bundled）；`issuance` 只追加，序号唯一 |
-| `src-tauri/crates/ocw-device/` | 启动 `PMSLockCard.exe` 子进程、GBK 解码、解析、模拟设备 |
-| `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 运行目录 + 首启卡号、自动备份、文件日志、诊断包。**备份走 SQLite 在线备份 API**（`ocw_store::backup_to` → `rusqlite::backup::Backup::run_to_completion`），逐页拷贝到完成，**是全量备份**（含 `-wal` 里未 checkpoint 的数据）且不锁库；备份后把目标库设为 `journal_mode=DELETE`，避免「db + db-wal 两个文件才算完整」。**不要改成 `std::fs::copy`**——那会漏掉 WAL 中未刷盘的事务 |
-| `src-tauri/src/room_import.rs` | 房号 INI / CSV 导入（坏行收集不致命、删房序号可复活） |
+| `src-tauri/crates/ocw-device/` | 设备门面：常驻 sidecar 会话（NDJSON）、硬件快照 → 界面 DTO、错误翻译、进程内模拟后端 |
+| `src-tauri/src/{provision,backup_job,logging,diagnostics}.rs` | 运行目录（复制 `resources/device`）、自动备份、文件日志、诊断包。**备份走 SQLite 在线备份 API**（`ocw_store::backup_to` → `rusqlite::backup::Backup::run_to_completion`），逐页拷贝到完成，**是全量备份**（含 `-wal` 里未 checkpoint 的数据）且不锁库；备份后把目标库设为 `journal_mode=DELETE`，避免「db + db-wal 两个文件才算完整」。**不要改成 `std::fs::copy`**——那会漏掉 WAL 中未刷盘的事务 |
+| `src-tauri/src/room_import.rs` | 房号 INI / CSV 导入（坏行收集不致命、删房序号可复活）；GBK 解码在本文件，与设备层无关 |
 | `src-tauri/src/demo_import.rs` | 仅 `debug_assertions`：空库时从 `data/NacreHis.json` 的 `Kf_fh` 建 30 个房间，发布版不编译 |
 
 产品工作区常用命令（在 `app/` 内）：
 
 ```powershell
 pnpm install
-pnpm build:sdk      # 编译 ../sdk → resources/sdk，跑 46 项门禁；同时编 tools/CardBuild.cs → OCWCardBuild.exe
-pnpm dev            # build:sdk + vite（只起前端，不含 Tauri 壳）
+# 硬件层：按第 2 节手动编 sidecar 并拷到 resources/device（打包前必须做）
+pnpm dev            # vite（只起前端，不含 Tauri 壳）
 pnpm tauri dev      # 前端热更新 + Tauri 壳；改 Rust 会自动重编译+重启
-pnpm build          # build:sdk + tsc --noEmit + vite build
+pnpm build          # tsc --noEmit + vite build
 pnpm exec tsc --noEmit       # 只做前端类型检查
 pnpm tauri build --bundles msi   # 出 WiX MSI 安装包；不要用 cargo build --release（出的是 dev 壳）
 pwsh -NoProfile -File build-release.ps1   # 一键正式版：MSI → app/output，并打印 SHA-256
@@ -235,22 +257,18 @@ NSIS / Inno Setup 已废弃，`pnpm setup:nsis` 与相关脚本都不存在了�
 测试在 `src-tauri/` 内跑，几种粒度都常用：
 
 ```powershell
-cargo test --workspace                                   # 全部；2026-11-10 实测 136 项全绿
+cargo test --workspace                                   # 产品侧全部；2026-11-14 实测 57 项全绿
 cargo test -p ocw-store                                  # 只跑存储层（56）
-cargo test -p ocw-device --test sim_cardbuild            # 单跑一个集成测试文件（5）
+cargo test -p ocw-device --test sidecar_session          # 真起 sidecar（--sim）的端到端（10）
 cargo test -p ocw-store insert_room                      # 按用例名子串单跑
+cargo test --manifest-path vendor/rc-device/Cargo.toml   # 硬件层：201 单测 + 10 契约 + 6 sidecar
 ```
 
-> 2026-11-06 起 `real_selftest_is_all_green_and_parses` 已改用 `ocw_device::cli::decode`，
-> GBK 红灯已修复；2026-11-10 实测 `cargo test --workspace` 136 项全绿
-> （解析 27 + 真实 selftest 1 + 模拟构包 5 + 存储 56 + 命令层 47）。
-> 编译警告已清零（2026-11-08 删除了 `cardno.rs` 的未用方法、`provision.rs` 的
-> `apply_start_card_no`、`rules.rs` 的 `needs_long_confirm`；并修正了 `commands.rs`
-> 的 `#[test]` 属性错位——`auth_matrix_matches_every_command` 此前实际没跑，现在会校验）。
+> 2026-11-14 迁移后：产品侧 57 项（含鉴权矩阵 84 条命令）；设备层 21 单测 + 10 集成；
+> 硬件层 201 单测 + 10 契约 + 6 sidecar。GBK 解码只剩在 `room_import.rs`（CSV 导入），与设备无关。
 
-无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`。发卡时仍由产品侧 `cardno.rs` 递推卡号，
-再调 `OCWCardBuild.exe --serial ...` 离线构包，因此卡号/字节与真机一致，只是不真写卡
-（缺构包器时退回固定样本）。
+无读卡器时用模拟设备：应用启动环境变量 `OCW_SIM=1`（或用 sidecar 的 `--sim`）。
+两种模拟写出的字节与真机逐字节相同（都走 `rc_device::builder`），只是写进内存卡槽。
 
 **运行时数据不在仓库里**，且**调试与正式环境分目录存放**（`provision.rs::data_root()`）：
 
@@ -259,7 +277,8 @@ cargo test -p ocw-store insert_room                      # 按用例名子串单
 | `pnpm tauri dev` / `cargo run`（debug） | `%PROGRAMDATA%\OpenCardWright-dev\` |
 | 安装包（release） | `%PROGRAMDATA%\OpenCardWright\` |
 
-两个目录里都有 `opencardwright.db`（SQLite）+ `runtime\`（构建期从 `src-tauri/resources/sdk` 拷入）。
+两个目录里都有 `opencardwright.db`（SQLite）+ `runtime\`（构建期从 `src-tauri/resources/device` 拷入，
+含 sidecar 与 `drivers/LC2000`）。
 debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 30 个房间 + 房型 + 房态；发布版不含这段。
 查数据时先确认自己看的是哪个目录，不要指望仓库内有 `*.db`。
 
@@ -267,6 +286,9 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 
 | 规则 | 原因 |
 |---|---|
+| 登记 ≠ 发卡 | 两者是独立入口：发卡只写卡与落库、**不改房态**；登记只录住客与房态、不碰读卡器。发卡时若该房有登记中的单，卡会挂到那张单上（弱关联）；退房时**该单关联的卡全部失效**才自动关单。退房弹窗可勾「同时清除入住登记信息」（默认勾选），勾了立即强制关单——**只关不删**，住客档案仍在记录页 |
+| 预定 → 入住单 | 三层职责固定：`reservation`（预定）→ `checkin`（入住单）→ `checkin_guest`（登记单）。登记单可挂 `checkin.reservation_id`；**第一位住客加成功**时把该房今天覆盖的 `booked` 预定转成 `checked_in` 并回写关联（`convert_reservation_for_room`）——空单不消耗预定，同房多条只转最早一条。发卡路径仍走 `check_in_reservations`（按房号+日期批量标已入住、不写关联，因为发卡时可能还没建单） |
+| 序号范围 **0–4094**（12 bit） | 序号 = `B2` 高 4 位 << 4 \| `B3`。**4095 与总控卡页1（`5B EC F0 FF`）字节相同**，分给房间会让该房客卡被读成总控卡——schema `CHECK`、`insert_room_reporting`、导入器三处都拦。4080–4094 的页1 是 `*FFF`，与总控卡只差 B2 高 4 位，前端填号会二次确认 |
 | 房间序号绑上锁后**永不复用** | 序号写进卡内页1（`5B EC` 之后的字节）；换成新序号后，旧卡不能再用于新房 |
 | 删房是**逻辑删除**（`room.active=0`） | 历史发卡记录要留档，序号仍占位，`list_rooms` 返回全量 |
 | 新增房间用到已删序号 = **复活那条记录改房名**，不插新行 | 否则撞 `room_index UNIQUE`；同时重置房态/发卡上限/安装卡记录 |
@@ -281,8 +303,8 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 - npm 时代 `pnpm install` 会重写 `package-lock.json` 的 `libc` 元数据产生无意义 diff；2026-11-07 起改用
   **pnpm**（`pnpm-lock.yaml`），此坑基本消失；若 lock 出现无意义 diff，`git checkout -- app/pnpm-lock.yaml` 还原。
 
-产品侧高频踩坑（详见 `app/README.md` §5）：设备 CLI 输出是 GBK，必须经
-`ocw-device::cli::decode` 解码；禁用 antd 命令式弹窗（React 19 已移除其依赖的 API，调用静默失效）。
+产品侧高频踩坑（详见 `app/README.md` §5）：禁用 antd 命令式弹窗（React 19 已移除其依赖的
+API，调用静默失效）；写卡**超时不要重试**（重试会把同一张卡写两遍、卡号推进两次）。
 
 - 新增/改名 Tauri 命令必须同步 `app/README.md` §6 的「命令 × 角色」表；
   `commands.rs` 的 `auth_matrix_matches_every_command` 会机械校验，漏登记即红。
@@ -308,6 +330,7 @@ debug 构建在空库时会自动导入 `data/NacreHis.json` 的 `Kf_fh`，建 3
 | 不引入外部跟踪 | 不用 GitHub Issues 或在线看板：另一台电脑可能没网、没 gh 登录 |
 | 来源可追溯 | 每条待办在清单 §7「来源登记表」有出处；登记前先查表，避免同一需求登记两次 |
 | 待拍板显式化 | 需要用户决定的（有效期怎么存、音色怎么来、某功能是否废弃）必须写进条目「待拍板」并给建议默认，不许自行假设 |
+| 大改先出方案 | 涉及**数据库表字段的增删改**、或耦合过高的重构（改跨模块边界 / 改公共数据结构 / 动发布链），**先给 2–3 个方案（含各自利弊与推荐）让用户选**，选中后再实施；不许直接开工 |
 
 用户目录下的 agent 计划（如 `~/.workbuddy/plans/`）**只当草稿**：它不入库，
 交付前必须把未完成项搬进 `plan/待办清单.md` 与对应的 `td-xxx.md`，否则下一个接手的人看不到。

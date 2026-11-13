@@ -3,10 +3,12 @@ name = "ocw-device"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "OpenCardWright device adapter: drives PMSLockCard.exe and parses its JSON/text output"
+description = "OpenCardWright device facade: drives the 32-bit rc-device-sidecar over NDJSON and maps hardware snapshots to UI DTOs"
 
 [dependencies]
-encoding_rs = "0.8"
+# 硬件兼容层（驱动加载、卡字节、身份证读卡器）全部在 rc-device；
+# 本 crate 只做进程会话、DTO 映射与错误翻译。
+rc-device = { path = "../../vendor/rc-device" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"

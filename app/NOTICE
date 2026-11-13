@@ -1,10 +1,15 @@
 OpenCardWright
 Copyright (C) 2026 OpenCardWright contributors
 
-This product bundles a card-issuing SDK (PMSLockCard.exe / PMSLockSDK.dll) that was
+This product bundles the hardware layer `rc-device` (repository: rc-device-sdk),
 written from scratch by this project's author after reverse engineering the card
 format and the serial protocol. It is original code, released under the same
-license as the rest of this repository.
+license as the rest of this repository (MIT).
+
+Its sources live in the separate repository `rc-device-sdk` and are included here
+as a git submodule at `app/src-tauri/vendor/rc-device`. At build time it is
+compiled into a 32-bit `rc-device-sidecar.exe` (the vendor driver is x86-only),
+which the 64-bit application talks to over stdin/stdout NDJSON.
 
 The vendor reader driver (LC32RFRW.dll) is shipped alongside for interoperability
 with the hardware it was built for. It is not covered by this project's copyright

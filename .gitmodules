@@ -1,0 +1,3 @@
+[submodule "app/src-tauri/vendor/rc-device"]
+	path = app/src-tauri/vendor/rc-device
+	url = https://github.com/1665169869/rc-device-sdk.git

@@ -1,13 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ReloadOutlined } from '@ant-design/icons'
-
-/** 证件有效期：`20231106` → `23年11月06日`（缺值显示 `—`） */
-function fmtIdDate(raw: string | null): string {
-  if (!raw) return '—'
-  const d = raw.replace(/[^0-9]/g, '')
-  if (d.length !== 8) return raw
-  return `${d.slice(2, 4)}年${d.slice(4, 6)}月${d.slice(6, 8)}日`
-}
+import { ReloadOutlined, UserAddOutlined } from '@ant-design/icons'
 import {
   Alert,
   Button,
@@ -23,14 +15,26 @@ import {
   Tag,
   Typography,
 } from 'antd'
+import CheckinForm from '../components/CheckinForm'
 import {
   api,
   describeError,
   formatTime,
   type AuditRow,
+  type CheckinDetail,
+  type CheckinGuest,
+  type CheckinRow,
   type IssuanceRow,
   type Reservation,
 } from '../api'
+
+/** 证件有效期：`20231106` → `23年11月06日`（缺值显示 `—`） */
+function fmtIdDate(raw: string | null): string {
+  if (!raw) return '—'
+  const d = raw.replace(/[^0-9]/g, '')
+  if (d.length !== 8) return raw
+  return `${d.slice(2, 4)}年${d.slice(4, 6)}月${d.slice(6, 8)}日`
+}
 
 const { Text } = Typography
 
@@ -49,7 +53,7 @@ export default function Logs({ canAdmin }: { canAdmin: boolean }) {
       <Tabs
         items={[
           { key: 'issuance', label: '发卡记录', children: <IssuanceTab canAdmin={canAdmin} /> },
-          { key: 'checkin', label: '入住记录', children: <CheckinTab canAdmin={canAdmin} /> },
+          { key: 'checkin', label: '入住登记', children: <CheckinTab canAdmin={canAdmin} /> },
           { key: 'reservation', label: '预定记录', children: <ReservationTab canAdmin={canAdmin} /> },
           { key: 'audit', label: '操作审计', children: <AuditTab /> },
         ]}
@@ -246,14 +250,25 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
             title: '状态',
             width: 100,
             render: (_: unknown, r: IssuanceRow) => {
-              if (r.result !== 'ok') return <Tag color="red">失败</Tag>
-              if (r.checkedOutAt) return <Tag>已退房</Tag>
-              const guest = r.kind === '日租客卡' || r.kind === '钟点客卡'
-              const expires = r.expiresAt ? Date.parse(r.expiresAt) : NaN
-              if (guest && Number.isFinite(expires) && expires <= Date.now()) {
-                return <Tag color="red">已过期</Tag>
+              // TD-229：状态由后端算好（active / expired / checked_out / voided / failed），
+              // 前端不再自己比较时间，也不再限定卡型 —— 总控卡过期同样要显示「已过期」。
+              switch (r.status) {
+                case 'failed':
+                  return <Tag color="red">失败</Tag>
+                case 'checked_out':
+                  return <Tag>已退房</Tag>
+                case 'voided':
+                  return <Tag color="purple">已作废</Tag>
+                case 'expired':
+                  return <Tag color="red">已过期</Tag>
+                default:
+                  // 没有到期时间的卡型（安装 / 复位 / 清除 / 退房钟点 / 校时）不参与过期判断
+                  return r.expiresAt ? (
+                    <Tag color="green">有效</Tag>
+                  ) : (
+                    <Tag color="green">有效（无期限）</Tag>
+                  )
               }
-              return <Tag color="green">有效</Tag>
             },
           },
         ]}
@@ -266,36 +281,32 @@ function IssuanceTab({ canAdmin }: { canAdmin: boolean }) {
  *  未输入身份信息的发卡不进入本表 —— guestOnly 由后端查询层过滤（TRIM 非空），
  *  这里只管展示：谁、哪间房、什么时候发的卡、住到什么时候。 */
 function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
-  const [rows, setRows] = useState<IssuanceRow[]>([])
+  const [rows, setRows] = useState<CheckinRow[]>([])
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   /** 默认每页 20 条（用户设定，TD-128） */
   const [pageSize, setPageSize] = useState(20)
   const [roomNo, setRoomNo] = useState('')
+  const [status, setStatus] = useState<string | null>(null)
   const [fromDay, setFromDay] = useState<string | null>(null)
   const [toDay, setToDay] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [msg, setMsg] = useState<string | null>(null)
-  /** 行「详情」弹窗（TD-122）：展示发卡时登记的全部身份信息，只读 */
-  const [detail, setDetail] = useState<IssuanceRow | null>(null)
-
-  // 到期状态按当前时间计算，跨过到期点自动变色（同发卡记录，60 秒重渲染）
-  const [, setTick] = useState(0)
-  useEffect(() => {
-    const timer = window.setInterval(() => setTick((t) => t + 1), 60_000)
-    return () => window.clearInterval(timer)
-  }, [])
+  /** 登记单详情（TD-221）：一张单 + 全部住客 */
+  const [detail, setDetail] = useState<CheckinDetail | null>(null)
+  /** 新增登记（TD-222）：从这里进来的不预填房号 */
+  const [createOpen, setCreateOpen] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     setErr(null)
     try {
-      const p = await api.listIssuances({
+      const p = await api.listCheckins({
         roomNo: roomNo.trim() || null,
-        from: dayToIso(fromDay),
-        to: dayToIso(toDay, true),
-        guestOnly: true,
+        status,
+        from: fromDay,
+        to: toDay,
         page,
         pageSize,
       })
@@ -306,25 +317,32 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
     } finally {
       setLoading(false)
     }
-  }, [roomNo, fromDay, toDay, page, pageSize])
+  }, [roomNo, status, fromDay, toDay, page, pageSize])
 
   useEffect(() => {
     void load()
   }, [load])
 
-  /** 导出当前筛选条件下的入住记录（只含填了身份信息的发卡，TD-165） */
+  const openDetail = async (id: number) => {
+    setErr(null)
+    try {
+      setDetail(await api.getCheckin(id))
+    } catch (e) {
+      setErr(describeError(e))
+    }
+  }
+
+  /** 导出当前筛选条件下的登记单（管理员，TD-221） */
   const doExport = async () => {
     setErr(null)
     setMsg(null)
     try {
-      const r = await api.exportIssuancesCsv(
-        {
-          roomNo: roomNo.trim() || null,
-          from: dayToIso(fromDay),
-          to: dayToIso(toDay, true),
-        },
-        true,
-      )
+      const r = await api.exportCheckinsCsv({
+        roomNo: roomNo.trim() || null,
+        status,
+        from: fromDay,
+        to: toDay,
+      })
       setMsg(`已导出 ${r.rows} 行到 ${r.path}（${bytesText(r.bytes)}），Excel 可直接打开`)
     } catch (e) {
       setErr(describeError(e))
@@ -344,6 +362,20 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
           style={{ width: 150 }}
           allowClear
         />
+        <Select
+          placeholder="状态"
+          value={status ?? undefined}
+          onChange={(v) => {
+            setStatus(v ?? null)
+            setPage(1)
+          }}
+          allowClear
+          style={{ width: 120 }}
+          options={[
+            { value: 'open', label: '登记中' },
+            { value: 'closed', label: '已关闭' },
+          ]}
+        />
         <DatePicker
           placeholder="入住起始日"
           onChange={(_, s) => {
@@ -362,25 +394,36 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
           刷新
         </Button>
         <Button onClick={() => void load()}>查询</Button>
+        <Button icon={<UserAddOutlined />} onClick={() => setCreateOpen(true)}>
+          新增登记
+        </Button>
         {canAdmin ? (
           <Button type="primary" onClick={() => void doExport()}>
             导出 CSV
           </Button>
         ) : null}
         <Text type="secondary" style={{ fontSize: 12 }}>
-          只显示发卡时填写了身份信息的记录；未填写的不计入入住记录
+          按入住登记单展示，一单可含多位住客
         </Text>
       </Space>
+
+      {/* 新增登记（TD-222）：不预填房号，表单里自己填 */}
+      <CheckinForm
+        open={createOpen}
+        roomNo={null}
+        onClose={() => setCreateOpen(false)}
+        onSaved={() => void load()}
+      />
 
       {err ? <Alert type="error" showIcon message="操作失败" description={err} /> : null}
       {msg ? <Alert type="success" showIcon message="导出完成" description={msg} /> : null}
 
-      <Table<IssuanceRow>
+      <Table<CheckinRow>
         size="small"
         rowKey="id"
         loading={loading}
         dataSource={rows}
-        locale={{ emptyText: '这个条件下没有入住记录' }}
+        locale={{ emptyText: '这个条件下没有入住登记' }}
         pagination={{
           current: page,
           pageSize,
@@ -394,45 +437,50 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
           },
         }}
         columns={[
+          { title: '房号', dataIndex: 'roomNo', width: 90 },
+          {
+            title: '登记单号',
+            dataIndex: 'id',
+            width: 100,
+            render: (v: number) => `#${v}`,
+          },
+          {
+            title: '房间序号',
+            dataIndex: 'roomIndex',
+            width: 100,
+            render: (v: number | null) => (v === null ? '—' : v),
+          },
+          {
+            title: '首位登记人',
+            dataIndex: 'firstGuestName',
+            width: 120,
+            render: (v: string | null) => v ?? '—',
+          },
+          { title: '人数', dataIndex: 'guestCount', width: 70 },
           {
             title: '入住时间',
-            dataIndex: 'createdAt',
+            dataIndex: 'checkInAt',
             width: 170,
             render: (v: string) => formatTime(v),
           },
-          { title: '房号', dataIndex: 'roomNo', width: 90, render: (v: string | null) => v ?? '—' },
-          { title: '客人', dataIndex: 'guestName', width: 110, render: (v: string | null) => v ?? '—' },
-          { title: '卡型', dataIndex: 'kind', width: 120 },
           {
-            title: '时长',
-            width: 100,
-            render: (_: unknown, r: IssuanceRow) =>
-              r.days > 0 ? `${r.days} 天` : r.hours > 0 ? `${r.hours} 小时` : '—',
-          },
-          {
-            title: '到期',
-            dataIndex: 'expiresAt',
+            title: '退房时间',
+            dataIndex: 'checkOutAt',
             width: 170,
             render: (v: string | null) => (v ? formatTime(v) : '—'),
           },
           {
             title: '状态',
-            width: 100,
-            render: (_: unknown, r: IssuanceRow) => {
-              if (r.result !== 'ok') return <Tag color="red">失败</Tag>
-              if (r.checkedOutAt) return <Tag>已退房</Tag>
-              const expires = r.expiresAt ? Date.parse(r.expiresAt) : NaN
-              if (Number.isFinite(expires) && expires <= Date.now()) {
-                return <Tag color="red">已过期</Tag>
-              }
-              return <Tag color="green">有效</Tag>
-            },
+            width: 90,
+            render: (_: unknown, r: CheckinRow) =>
+              r.status === 'open' ? <Tag color="green">登记中</Tag> : <Tag>已关闭</Tag>,
           },
+          { title: '备注', dataIndex: 'note', render: (v: string | null) => v ?? '—' },
           {
             title: '详情',
             width: 70,
-            render: (_: unknown, r: IssuanceRow) => (
-              <Button size="small" onClick={() => setDetail(r)}>
+            render: (_: unknown, r: CheckinRow) => (
+              <Button size="small" onClick={() => void openDetail(r.id)}>
                 详情
               </Button>
             ),
@@ -440,54 +488,120 @@ function CheckinTab({ canAdmin }: { canAdmin: boolean }) {
         ]}
       />
 
-      {/* 入住详情（TD-122）：发卡时登记的全部身份信息，只读展示，空字段回退「—」 */}
+      {/* 登记单详情（TD-221）：一张单 + 全部住客 */}
       <Modal
         open={detail !== null}
-        title={
-          detail
-            ? `入住详情 · ${detail.roomNo ?? '—'} · ${detail.guestName ?? '—'}`
-            : '入住详情'
-        }
+        title={`入住登记 · ${detail?.checkin.roomNo ?? ''}`}
         onCancel={() => setDetail(null)}
         footer={null}
-        width={620}
+        width={900}
       >
         {detail ? (
-          <Descriptions
-            column={1}
-            size="small"
-            bordered
-            style={{ maxWidth: 560 }}
-            items={[
-              { key: 'room', label: '房号', children: detail.roomNo ?? '—' },
-              { key: 'name', label: '客人姓名', children: detail.guestName ?? '—' },
-              { key: 'gender', label: '性别', children: detail.guestGender ?? '—' },
-              { key: 'idType', label: '证件类型', children: detail.guestIdType ?? '—' },
-              { key: 'idNo', label: '证件号码', children: detail.guestIdNumber ?? '—' },
-              { key: 'nation', label: '民族', children: detail.guestNation ?? '—' },
-              { key: 'birth', label: '出生日期', children: detail.guestBirthDate ?? '—' },
-              { key: 'validFrom', label: '证件有效期起', children: fmtIdDate(detail.idValidFrom) },
-              { key: 'validTo', label: '证件有效期止', children: fmtIdDate(detail.idValidTo) },
-              { key: 'authority', label: '签发机关', children: detail.idAuthority ?? '—' },
-              { key: 'devModel', label: '读卡设备型号', children: detail.idDeviceModel ?? '—' },
-              { key: 'devSerial', label: '读卡设备序列', children: detail.idDeviceSerial ?? '—' },
-              { key: 'addr', label: '住址', children: detail.guestAddress ?? '—' },
-              { key: 'note', label: '备注', children: detail.guestNote ?? '—' },
-              { key: 'at', label: '入住时间', children: formatTime(detail.createdAt) },
-              {
-                key: 'card',
-                label: '卡型 / 时长',
-                children: `${detail.kind} · ${
-                  detail.days > 0
-                    ? `${detail.days} 天`
-                    : detail.hours > 0
-                      ? `${detail.hours} 小时`
-                      : '—'
-                }`,
-              },
-              { key: 'exp', label: '到期', children: detail.expiresAt ? formatTime(detail.expiresAt) : '—' },
-            ]}
-          />
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Descriptions
+              column={2}
+              size="small"
+              bordered
+              items={[
+                { key: 'room', label: '房号', children: detail.checkin.roomNo },
+                { key: 'no', label: '登记单号', children: `#${detail.checkin.id}` },
+                {
+                  key: 'index',
+                  label: '房间序号',
+                  children: detail.roomIndex ?? '—',
+                },
+                {
+                  key: 'status',
+                  label: '状态',
+                  children: detail.checkin.status === 'open' ? '登记中' : '已关闭',
+                },
+                {
+                  key: 'in',
+                  label: '入住时间',
+                  children: formatTime(detail.checkin.checkInAt),
+                },
+                {
+                  key: 'out',
+                  label: '退房时间',
+                  children: detail.checkin.checkOutAt
+                    ? formatTime(detail.checkin.checkOutAt)
+                    : '—',
+                },
+                { key: 'count', label: '住客人数', children: detail.guests.length },
+                { key: 'note', label: '备注', children: detail.checkin.note ?? '—' },
+              ]}
+            />
+            <Table<CheckinGuest>
+              size="small"
+              rowKey="id"
+              dataSource={detail.guests}
+              pagination={false}
+              locale={{ emptyText: '这张登记单还没有住客' }}
+              columns={[
+                { title: '#', dataIndex: 'seq', width: 46 },
+                {
+                  title: '姓名',
+                  dataIndex: 'name',
+                  width: 96,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '性别',
+                  dataIndex: 'gender',
+                  width: 64,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '证件类型',
+                  dataIndex: 'idType',
+                  width: 96,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '证件号码',
+                  dataIndex: 'idNumber',
+                  width: 180,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '民族',
+                  dataIndex: 'nation',
+                  width: 70,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '出生日期',
+                  dataIndex: 'birthDate',
+                  width: 110,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '证件有效期',
+                  width: 180,
+                  render: (_: unknown, g: CheckinGuest) =>
+                    g.idValidFrom || g.idValidTo
+                      ? `${fmtIdDate(g.idValidFrom)} ~ ${fmtIdDate(g.idValidTo)}`
+                      : '—',
+                },
+                {
+                  title: '签发机关',
+                  dataIndex: 'idAuthority',
+                  width: 140,
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '住址',
+                  dataIndex: 'address',
+                  render: (v: string | null) => v ?? '—',
+                },
+                {
+                  title: '备注',
+                  dataIndex: 'note',
+                  render: (v: string | null) => v ?? '—',
+                },
+              ]}
+            />
+          </Space>
         ) : null}
       </Modal>
     </Space>

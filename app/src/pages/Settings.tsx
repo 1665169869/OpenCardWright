@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   ColorPicker,
+  Divider,
   Input,
   InputNumber,
   Modal,
@@ -13,8 +14,10 @@ import {
   Table,
   Tabs,
   Tag,
+  TimePicker,
   Typography,
 } from 'antd'
+import dayjs from 'dayjs'
 import {
   api,
   describeError,
@@ -125,7 +128,19 @@ function ReminderPanel({ onChanged }: { onChanged?: () => void }) {
         <Button type="primary" loading={busy} onClick={save}>
           保存
         </Button>
-        <Button onClick={() => setMsg(tryPreview() ? '已播放提示音' : '当前环境不支持音频，只会弹窗')}>
+        <Button
+          onClick={() => {
+            // TD-226：与真实提醒同一条路径 —— 语音优先，失败 / 无中文音色退回提示音
+            const r = tryPreview(s.voice)
+            setMsg(
+              r.spoke
+                ? '已用系统语音播报'
+                : r.sounded
+                  ? '没有可用的中文语音包，已播放提示音'
+                  : '当前环境不支持音频（提示音与语音都不可用），只会弹窗',
+            )
+          }}
+        >
           试听
         </Button>
       </Space>
@@ -145,8 +160,11 @@ function ReminderPanel({ onChanged }: { onChanged?: () => void }) {
 
 function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
   const [hour, setHour] = useState<number | null>(null)
+  const [cutoff, setCutoff] = useState('06:00')
   const [busy, setBusy] = useState(false)
+  const [cutoffBusy, setCutoffBusy] = useState(false)
   const [msg, setMsg] = useState<string | null>(null)
+  const [cutoffMsg, setCutoffMsg] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
@@ -154,6 +172,10 @@ function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
       .getCheckoutHour()
       .then(setHour)
       .catch((e: unknown) => setErr(describeError(e)))
+    api
+      .getMorningCutoff()
+      .then(setCutoff)
+      .catch(() => setCutoff('06:00'))
   }, [])
 
   const save = async () => {
@@ -174,6 +196,27 @@ function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
       setErr(describeError(e))
     } finally {
       setBusy(false)
+    }
+  }
+
+  // TD-225：凌晨房归属时间 —— 早于该时刻开卡的日租卡按「前一天」归属
+  const saveCutoff = async () => {
+    setCutoffBusy(true)
+    setErr(null)
+    setCutoffMsg(null)
+    try {
+      const res = await api.setMorningCutoff(cutoff)
+      setCutoff(res.cutoff)
+      setCutoffMsg(
+        res.recalculated > 0
+          ? `已保存，并重算了 ${res.recalculated} 张在用日租卡的到期时间`
+          : '已保存；之后发出的日租卡将按此规则计算到期',
+      )
+      onChanged?.()
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setCutoffBusy(false)
     }
   }
 
@@ -199,6 +242,28 @@ function CheckoutHourPanel({ onChanged }: { onChanged?: () => void }) {
         钟点卡」发卡取值。
       </Text>
       {msg ? <Text type="success">{msg}</Text> : null}
+
+      <Divider style={{ margin: '4px 0' }} />
+
+      <Space>
+        <Text>凌晨房归属时间</Text>
+        <TimePicker
+          format="HH:mm"
+          minuteStep={10}
+          allowClear={false}
+          value={dayjs(cutoff, 'HH:mm')}
+          onChange={(v) => setCutoff(v ? v.format('HH:mm') : '06:00')}
+        />
+        <Button type="primary" loading={cutoffBusy} onClick={() => void saveCutoff()}>
+          保存
+        </Button>
+      </Space>
+      <Text type="secondary" style={{ fontSize: 12 }}>
+        该时刻**之前**入住的日租卡按「前一晚」归属：凌晨 2 点开 1 天卡到期是**当天**退房钟点，
+        而不是次日。默认 06:00。
+      </Text>
+      {cutoffMsg ? <Text type="success">{cutoffMsg}</Text> : null}
+
       {err ? <Text type="danger">{err}</Text> : null}
     </Space>
   )

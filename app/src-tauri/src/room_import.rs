@@ -2,16 +2,31 @@
 //!
 //! 现场第一次装完是空库，房号得一次性导进来。数据源两种：
 //! * CSV：`房号,序号,房型,楼层`（序号/房型/楼层可空；Excel 另存为 CSV 也能用）
-//! * ini：`房号=序号`（沿用 `data/RoomIndex.ini` 的格式）
+//! * ini：`房号=序号`（沿用旧版 `RoomIndex.ini` 的格式，仅作导入模板）
+//!
+//! 运行期**不读任何 ini**：房号 ↔ 序号的对应关系只存在 SQLite 的 `room` 表里；
+//! 门锁认的是**卡内序号**（安装卡写进去的那个），不是房号文本。
 //!
 //! 两条工程约束：
 //! * 不引 csv crate：字段就四列，手写状态机处理引号与 `""` 转义足够；
-//! * 解码走 `ocw_device::cli::decode`（UTF-8 优先、失败回落 GBK）—— Excel 默认存 GBK，
-//!   这一步漏了中文房型就会变乱码。
+//! * 解码走本文件的 [`decode`]（UTF-8 优先、失败回落 GBK）—— Excel 默认存 GBK，
+//!   这一步漏了中文房型就会变乱码。这跟设备层无关，别再往下沉。
 //!
 //! 落库统一走 `insert_room_reporting`，所以「序号命中已删除的房间」会按既有规则**复活**它。
 
 use ocw_store::DbConnection as Connection;
+
+/// 把导入文件解码成字符串。
+///
+/// Excel「另存为 CSV」在中文 Windows 上写出的是 GBK，不是 UTF-8。
+/// 直接按 UTF-8 解会整体失败（`from_utf8` 一遇非法字节就报错），现场表现是
+/// 「导入成功 0 行」或房型乱码。所以先试 UTF-8，失败再按 GBK 解。
+pub fn decode(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => encoding_rs::GBK.decode(bytes).0.into_owned(),
+    }
+}
 
 #[derive(Debug, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,14 +47,14 @@ pub struct FailedRow {
 struct Row {
     line: usize,
     room_no: String,
-    index: Option<u8>,
+    index: Option<u16>,
     room_type: Option<String>,
     floor: Option<i64>,
 }
 
 /// 按文件名后缀猜格式（`.ini` 走 ini，其余按 CSV）。
 pub fn import_bytes(conn: &Connection, file_name: &str, bytes: &[u8]) -> Result<ImportReport, String> {
-    let text = ocw_device::cli::decode(bytes);
+    let text = decode(bytes);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let rows = if file_name.to_ascii_lowercase().ends_with(".ini") {
         parse_ini(text)
@@ -76,7 +91,7 @@ fn parse_csv(text: &str) -> Vec<Row> {
             .get(1)
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse::<u8>().ok());
+            .and_then(|s| s.parse::<u16>().ok());
         let room_type = cells
             .get(2)
             .map(|s| s.trim().to_string())
@@ -111,7 +126,7 @@ fn parse_ini(text: &str) -> Vec<Row> {
         out.push(Row {
             line: i + 1,
             room_no: room_no.to_string(),
-            index: right.trim().parse::<u8>().ok(),
+            index: right.trim().parse::<u16>().ok(),
             room_type: None,
             floor: None,
         });
@@ -184,6 +199,20 @@ fn ensure_room_type(conn: &Connection, name: &str) -> Result<i64, String> {
 fn apply(conn: &Connection, rows: Vec<Row>) -> ImportReport {
     let mut report = ImportReport::default();
     for row in rows {
+        // 序号超出 12 位可分配范围（0–4094）：记为坏行，不让整批导入失败。
+        // 4095 与总控卡页1 字节相同，分给房间会让该房客卡被读成总控卡。
+        if let Some(index) = row.index {
+            if index > ocw_store::MAX_ROOM_INDEX {
+                report.failed.push(FailedRow {
+                    line: row.line,
+                    reason: format!(
+                        "序号 {index} 超出范围（0–{}）；4095 与总控卡字节相同，不能分配给房间",
+                        ocw_store::MAX_ROOM_INDEX
+                    ),
+                });
+                continue;
+            }
+        }
         let room_type_id = match row.room_type.as_deref() {
             Some(name) => match ensure_room_type(conn, name) {
                 Ok(id) => Some(id),
@@ -230,12 +259,14 @@ mod tests {
     use super::*;
 
     fn temp_db() -> (Connection, std::path::PathBuf) {
+        // 只按纳秒命名在并行跑时会撞名（Windows 计时器精度 100ns），
+        // 两个用例共用同一个库 → 「库里多出别人插的房间」。加进程内自增序号。
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "ocw-import-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "ocw-import-{}-{seq}.db",
+            std::process::id()
         ));
         let conn = ocw_store::open(&path).unwrap();
         (conn, path)
@@ -293,6 +324,29 @@ mod tests {
             rooms.iter().find(|x| x.room_no == "253").unwrap().room_index,
             1
         );
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 序号 4094 可以导入；4095（与总控卡字节相同）与更大的值必须记为坏行，
+    /// 而不是被截断后悄悄落库。
+    #[test]
+    fn out_of_range_index_is_a_failed_row() {
+        let (conn, path) = temp_db();
+        let csv = "房号,序号\n801,4094\n802,4095\n803,4096\n";
+        let r = import_bytes(&conn, "r.csv", csv.as_bytes()).unwrap();
+
+        assert_eq!(r.added, 1, "只有 4094 能进来：{r:?}");
+        assert_eq!(r.failed.len(), 2, "4095 / 4096 都算坏行：{r:?}");
+        assert!(
+            r.failed.iter().any(|f| f.reason.contains("4095")),
+            "错误文案要点明 4095：{r:?}"
+        );
+        assert_eq!(
+            ocw_store::find_room(&conn, "801").unwrap().unwrap().room_index,
+            4094
+        );
+        assert!(ocw_store::find_room(&conn, "802").unwrap().is_none());
         drop(conn);
         let _ = std::fs::remove_file(path);
     }

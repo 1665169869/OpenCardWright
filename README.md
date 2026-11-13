@@ -6,7 +6,7 @@
 | 你想做什么 | 用哪个 |
 |---|---|
 | 前台日常发卡：读卡、发卡、续住、退房、房态与预定 | **OpenCardWright 发卡台**（`app/`），装 MSI 即用 |
-| 在自家 PMS 里集成发卡 | **发卡 SDK**（`sdk/`）：.NET 4.0 类库 / COM 封装 / 命令行 |
+| 在自家程序里集成发卡 | **硬件层** `rc-device`（Rust crate / 32 位 sidecar 的 NDJSON） |
 
 卡格式与逆向结论以 [`docs/`](docs/) 为唯一权威来源，代码是文档的实现。
 本轮实测基线（2026-11-10）：SDK 自检 **46/46**，产品 Rust 测试 **136 项**。
@@ -56,112 +56,70 @@ debug 构建用 `%PROGRAMDATA%\OpenCardWright-dev\`，两者互不干扰。
 
 ---
 
-## 三、方式二：SDK 集成（`sdk/`）
+## 三、方式二：把硬件层嵌进你自己的程序
 
-整个 `sdk/` 目录可原样拷到 32 位 Windows 运行，无需安装原软件。
+硬件层（驱动加载、卡字节编解码、身份证 9001 客户端）在独立仓库
+[`rc-device-sdk`](https://github.com/1665169869/rc-device-sdk)，本仓库以 git submodule 挂在
+`app/src-tauri/vendor/rc-device`。它**不含任何业务规则**（房号文本、房态、入住单），只认房间序号。
 
 | 你的技术栈 | 用哪个 | 入口 |
 |---|---|---|
-| .NET（C# / VB.NET） | `PMSLockSDK.dll` | `LockCardReader` / `CardBuilder` |
-| Delphi / C++ / VB6 | `PMSLockSDK.Com.dll` | `CreateObject("PmsLockSdk.Reader")` |
-| 任意语言 | `PMSLockCard.exe` | 命令行 + `--json` |
+| Rust | `rc-device` crate | `CardDevice` / `IdCardReader` trait |
+| 任意语言（64 位宿主） | `rc-device-sidecar.exe`（32 位） | stdin/stdout 的 NDJSON |
+| 无硬件演示 / CI | 同上加 `--sim` | 同一份协议，内存卡槽 |
 
-```csharp
-using PmsLockSdk;
+```rust
+use std::path::Path;
+use rc_device::dll::DirectDllDevice;
+use rc_device::{timestamp_card_no, CardDevice, CardIssuedAt, GuestDaySpec};
 
-var opt = LockCardOptions.Load(@"D:\PMS\LockCard\LockCard.ini",
-                               AppDomain.CurrentDomain.BaseDirectory);
-using (var r = new LockCardReader(opt))
-{
-    if (r.Open() != 0) throw new Exception("打开读卡器失败");
-    CardInfo card;
-    if (r.ReadCard(out card) == 0) Console.WriteLine(card.Describe());
-}
+let dev = DirectDllDevice::with_auto_port(Path::new("drivers/LC2000"));
+dev.open()?;
+
+let now = CardIssuedAt { year: 2026, month: 11, day: 14, hour: 15 };
+let card_no = timestamp_card_no(&now, 1)?;
+let card = dev.write_guest_day(&GuestDaySpec {
+    room_index: 15, // 12 bit；0–4094 可分配给真实房间
+    days: 1,
+    card_no,
+    lost: false,
+    issued_at: now,
+})?;
+println!("{}", card.raw_hex());
 ```
 
-- `CardBuilder` 是**静态纯函数**，可离线构包与单测；`LockCardReader` 有串口句柄，**线程不安全，一个实例一个串口**。
-- 卡号由调用方传入（`PrepareCardNo` 要求 1–0xFFFF）；SDK 不自增、不读写 `CardNo.state`。
-- COM 注册（管理员，32 位）：`regasm.exe PMSLockSDK.Com.dll /tlb /codebase`。
-- 驱动侧固定参数：写密码 `12000206`，必须走 `config_parameter(0)` 明文模式。
+- `room_index` 是硬件层唯一的身份：房号文本由业务层自己维护，读写卡时只做映射。
+- **不要分配 4095**——它与总控卡字节相同。
+- 卡片字节与 46 项黄金向量由硬件层负责；业务侧不要再写一套编码。
+- 身份证读卡器（`IdCardReader`，本机 `ws://127.0.0.1:9001`）与门锁卡是**两个独立设备**，
+  任一故障都不影响另一个。
 
----
+### 3.1 sidecar 协议（64 位宿主）
 
-## 四、CLI 参考
+`LC32RFRW.dll` 只有 x86 版本，64 位程序加载不了，所以门锁卡操作交给 32 位 sidecar，
+一行一个 JSON（NDJSON）：
 
-### 4.1 命令
+```text
+{"id":1,"op":"read_card"}
+{"id":2,"op":"write_guest_day","spec":{"roomIndex":15,"days":1,"cardNo":9220,"lost":false,"issuedAt":{"year":2026,"month":11,"day":14,"hour":15}}}
+{"id":3,"op":"write_raw","spec":{"p1":[91,236,240,0],"p2":[129,4,36,171]}}
+{"id":4,"op":"shutdown"}
+```
 
-| 命令 | 作用 | 需要硬件 |
-|---|---|---|
-| `PMSLockCard.exe ports` | 扫描 COM1–COM8，列出可用读卡器 | 读卡器 |
-| `PMSLockCard.exe read [--json]` | 读卡并解析 8 字节 | 读卡器 + 卡 |
-| `PMSLockCard.exe selftest` | 纯字节自检 46 项 | 否 |
-| `PMSLockCard.exe issue ...` | 发卡（卡型由 `--type` 选择） | 读卡器 + 空白卡 |
+响应 `{"id":2,"ok":true,"result":{...}}`；失败是
+`{"id":2,"ok":false,"error":{"kind":"no_card","sdkCode":5,"hint":"…","message":"…"}}`。
+`kind` 是稳定分类、`sdkCode` 对齐原 SDK 的 0–11、`hint` 是给现场看的中文建议。
 
-### 4.2 `issue` 卡型
-
-| `--type` | 含义 | 必需参数 |
-|---|---|---|
-| `guest`（默认）/ `day` | 日租客卡；给 `--hours` 时按钟点卡发 | `--days`（或 `--hours`）+ 卡号 |
-| `hour` | 钟点客卡 | `--hours` + 卡号 |
-| `master` | 总控卡 | 卡号。**当前 CLI 固定发 1 天**（`IssueMaster` 不接收时长；见 §八 已知限制） |
-| `reset` / `clear` | 复位卡 / 清除卡 | 卡号 |
-| `install` | 安装卡 | `--room-index`（或 `--room`）；**不需要卡号** |
-| `checkout` | 退房钟点设置卡 | `--hour` 0–23 + 卡号 |
-| `timesync` | 校时卡 | 卡号；时间取 `--datetime`（或旧式 `--room HH:MM`） |
-| `raw` | 原样写 8 字节 | `--p1` / `--p2` |
-
-**卡号怎么来**（两种，必须给一种）：
-
-1. `--room-index N --seq N --datetime "YYYY-MM-DD HH:mm"` 三者齐全时，CLI 用
-   `(日 << 11) | (时 << 6) | 序号` 算出卡号；
-2. `--serial 4B83` 显式指定十六进制卡号。
-
-缺卡号会返回退出码 6（`卡号无效`）。`--room 220` 只用于安装卡/兼容旧脚本，**不参与算卡号**。
-
-### 4.3 参数
-
-| 参数 | 说明 |
+| 启动参数 | 作用 |
 |---|---|
-| `--room-index N` | 房间序号 1–254（产品侧使用）；按 `RoomIndex.ini` 反查房号 |
-| `--room 220` | 房号字面值（安装卡必需其一）；不参与卡号计算 |
-| `--days N` / `--hours N` | 有效期；`--hours > 0` 时优先 |
-| `--seq N` | 小时内序号 **0–62**；配合 `--room-index` + `--datetime` 生成卡号 |
-| `--datetime "YYYY-MM-DD HH:mm"` | 发卡时刻，同时决定 `页2[3]` 年月；`--at` 同义 |
-| `--serial HEX` | 显式卡号（如 `4B83`）；与时间戳三件套同时给时以后者为准 |
-| `--lost` | 挂失客卡（`页1[2]` 低 4 位 = 1；仅客卡有效） |
-| `--hour N` | `checkout` 卡的退房钟点 0–23 |
-| `--json` | JSON 输出（成功/失败都可用） |
-| `--port N` / `--dir PATH` / `--ini PATH` | 串口索引 / 驱动目录 / 配置文件覆盖 |
-| `--reuse` / `--strict-cardno` / `--quiet` | 兼容旧脚本的占位参数，当前不影响卡号与输出 |
+| `--driver-dir <目录>` | 指定驱动目录（默认 exe 同目录 `drivers/LC2000`） |
+| `--sim` | 内存模拟后端，不加载驱动、不开串口 |
+| `--sim-card blank\|guest-day\|guest-hour\|none` | 模拟卡槽的初始内容 |
 
-### 4.4 JSON 输出
-
-成功：
-
-```json
-{"ok":true,"card":{"kind":"日租客卡","room":"220","roomIndex":15,"days":1,
- "hours":0,"cardNo":"0x4B83","isLost":false,"issueDay":9,"issueHour":14,
- "issueSeq":3,"cardYm":171,"raw":"5BECF00081834BAB0000..."}}
-```
-
-`cardYm` 是 `页2[3]` 原始值（2026-11 = `0xAB` = 171）。失败：
-
-```json
-{"ok":false,"error":{"code":6,"msg":"卡号无效"}}
-```
-
-### 4.5 退出码
-
-| 码 | 含义 | 来源 SDK 码 |
-|---|---|---|
-| 0 | 成功 | 0 |
-| 1 | 参数错误 | 1 |
-| 2 | 驱动 / 串口 / 握手失败 | 2、3、4 |
-| 3 | 无卡或读卡失败 | 5、6 |
-| 4 | 写卡失败 | 7 |
-| 5 | 写后回读校验失败 | 8 |
-| 6 | 卡号无效 | 9 |
-| 7 | 不支持的卡型 | 10 |
+`op` 取值：`open` / `close` / `is_open` / `read_card` / `erase_card` / `write_guest_day` /
+`write_guest_hour` / `write_master` / `write_install` / `write_reset` / `write_clear` /
+`write_checkout_hour` / `write_timesync` / `write_raw` / `probe_ports` / `set_port` /
+`selftest` / `device_info` / `shutdown`。
 
 ---
 
@@ -236,24 +194,37 @@ using (var r = new LockCardReader(opt))
 
 ## 七、构建与发布
 
-### 7.1 SDK（裸 `csc`，无 MSBuild）
+### 7.1 硬件层（`rc-device-sdk` 子模块，手动构建）
 
-在 `sdk/` 下按顺序执行（必须 `/platform:x86`）：
+不再需要 `csc` / .NET Framework，也没有构建脚本。在 `app/` 内手动执行：
 
-```bat
-csc /target:library /platform:x86 /out:PMSLockSDK.dll /doc:PMSLockSDK.xml PMSLockSDK.cs
-csc /target:exe     /platform:x86 /out:PMSLockCard.exe /r:PMSLockSDK.dll PMSLockCard.cs
-csc /target:library /platform:x86 /out:PMSLockSDK.Com.dll /r:PMSLockSDK.dll PMSLockSDK.Com.cs
+```powershell
+# 编 32 位 sidecar（驱动只有 x86）
+cargo build --manifest-path src-tauri/vendor/rc-device/Cargo.toml `
+  --bin rc-device-sidecar --release --target i686-pc-windows-msvc `
+  --target-dir src-tauri/target/sidecar
+
+# 拷到产品资源目录（sidecar 默认从 exe 同目录的 drivers/LC2000 加载驱动）
+New-Item -ItemType Directory -Force -Path src-tauri/resources/device/drivers/LC2000 | Out-Null
+Copy-Item src-tauri/target/sidecar/i686-pc-windows-msvc/release/rc-device-sidecar.exe src-tauri/resources/device/ -Force
+Copy-Item src-tauri/vendor/rc-device/drivers/LC2000/* src-tauri/resources/device/drivers/LC2000/ -Recurse -Force
+
+# 门禁：46 项黄金向量（--sim 不加载驱动）
+@('{"id":1,"op":"selftest"}','{"id":2,"op":"shutdown"}') |
+  & src-tauri/resources/device/rc-device-sidecar.exe --sim
 ```
 
-改完源码要重建并提交二进制，否则现场跑的是旧版；中文注释乱码时加 `/codepage:65001`。
+响应里必须是 `"passed":46,"failed":0`。**打包前必须做这一步**——MSI 打包的就是
+`src-tauri/resources/device`，没准备会带着模拟设备出门。
+
+改卡字节 / 驱动调用 / 超时 / 模拟：在 rc-device-sdk 仓库里改并按它的 AGENTS 提交，
+然后更新本仓库的子模块指针。
 
 ### 7.2 产品（`app/`）
 
 ```powershell
 cd app
 pnpm install
-pnpm build:sdk      # 编译 ../sdk 到 resources/sdk，跑 46 项自检门禁
 pnpm tauri dev      # 开发（前端热更新 + Tauri 壳）
 pnpm tauri build --bundles msi   # 正式包（WiX Toolset v3）
 ```
@@ -267,7 +238,7 @@ pwsh -NoProfile -File build-release.ps1
 ```
 
 产物：`app/output/OpenCardWright_<version>_x64.msi`（脚本同时打印 SHA-256）。
-环境依赖、踩坑（MSVC `D8050`、GBK 设备输出、esbuild 临时文件）见
+环境依赖、踩坑（MSVC `D8050`、esbuild 临时文件）见
 [`app/README.md`](app/README.md)。
 
 ---
@@ -287,8 +258,8 @@ pwsh -NoProfile -File build-release.ps1
 ```
 OpenCardWright/
 ├─ docs/                 卡格式、调用链、驱动逆向、抓包证据、SDK 与接口文档
-├─ sdk/                  .NET 4.0 SDK + CLI + COM + 读卡器驱动（可整目录拷走）
 ├─ app/                  OpenCardWright 发卡台（Tauri + Rust + React）
+│  └─ src-tauri/vendor/rc-device/   硬件层子模块（rc-device-sdk：驱动、卡字节、sidecar）
 ├─ data/                 原厂数据库导出（NacreHis.json）与房号↔序号表
 ├─ plan/                 建设方案、待办清单、已完成摘要与 td-xxx 详情
 ├─ vendor/125k-sdk-v4.2/ 原厂 SDK 留档，仅作分析材料

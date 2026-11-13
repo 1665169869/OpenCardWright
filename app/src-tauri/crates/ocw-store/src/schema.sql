@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS schema_version (
 
 CREATE TABLE IF NOT EXISTS room (
     room_no         TEXT PRIMARY KEY,
-    room_index      INTEGER NOT NULL UNIQUE CHECK (room_index >= 0 AND room_index <= 255),
+    -- 锁内序号是 12 bit（页1[2] 高 4 位 + 页1[3]），可分配 0–4094。
+    -- 4095 与总控卡页1（5B EC F0 FF）字节相同，绝不能分配给房间。
+    room_index      INTEGER NOT NULL UNIQUE CHECK (room_index >= 0 AND room_index <= 4094),
     building        TEXT,
     floor           INTEGER,
     room_type       TEXT,
@@ -32,6 +34,40 @@ CREATE TABLE IF NOT EXISTS operator (
     pwd_hash     TEXT NOT NULL,
     active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+-- 入住登记单（v14 / TD-220）：一间房同一时刻最多一张 open 单，关单后保留历史。
+CREATE TABLE IF NOT EXISTS checkin (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_no      TEXT NOT NULL,
+    check_in_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    check_out_at TEXT,
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    operator_id  INTEGER REFERENCES operator (id),
+    note         TEXT,
+    -- v16：这张入住单由哪条预定转正而来（null = 没有预定，直接登记）
+    reservation_id INTEGER REFERENCES reservation (id),
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+-- 同住的每位客人一行；seq 决定「首个登记人」（取最小的那条）。
+CREATE TABLE IF NOT EXISTS checkin_guest (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    checkin_id       INTEGER NOT NULL REFERENCES checkin (id) ON DELETE CASCADE,
+    seq              INTEGER NOT NULL DEFAULT 1,
+    name             TEXT,
+    gender           TEXT,
+    id_type          TEXT,
+    id_number        TEXT,
+    nation           TEXT,
+    address          TEXT,
+    birth_date       TEXT,
+    note             TEXT,
+    id_valid_from    TEXT,
+    id_valid_to      TEXT,
+    id_authority     TEXT,
+    id_device_model  TEXT,
+    id_device_serial TEXT
 );
 
 CREATE TABLE IF NOT EXISTS issuance (
@@ -59,7 +95,9 @@ CREATE TABLE IF NOT EXISTS issuance (
     -- 作废（v13 / TD-218）：挂失卡写卡成功后，同房仍有效的旧客卡在这里打时间戳。
     -- 与 checked_out_at 区分语义：退房是客人离开，作废是卡被挂失顶掉。
     invalidated_at   TEXT,
-    invalid_reason   TEXT
+    invalid_reason   TEXT,
+    -- 入住登记单（v14 / TD-220）：发卡时若该房有 open 单则回填，可空
+    checkin_id       INTEGER REFERENCES checkin (id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_issuance_card_no ON issuance (card_no);

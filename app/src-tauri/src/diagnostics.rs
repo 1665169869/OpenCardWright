@@ -1,7 +1,7 @@
 //! 诊断包导出：把排障需要的东西打成一个 zip，现场发给开发者。
 //!
 //! 内容：`manifest.json`（版本/库版本/驱动指纹/计数/日志尾）、**脱敏后的数据库副本**、
-//! `LockCard.ini`、`CardNo.state`、最近两个日志文件。
+//! 硬件层的 `manifest.json`、`CardNo.state`、最近两个日志文件。
 //!
 //! 两条硬规则：
 //! * 数据库副本里的 `operator.pwd_hash` 必须抹掉，且要 `VACUUM` —— 只 UPDATE 不 VACUUM 的话，
@@ -86,8 +86,9 @@ pub fn export(
     )
     .map_err(|e| format!("写 manifest 失败：{e}"))?;
 
-    // 4) 运行状态文件（不含秘密，但排障必需）
-    for name in ["LockCard.ini", "CardNo.state"] {
+    // 4) 运行状态文件（不含秘密，但排障必需）：硬件层 manifest 里有驱动指纹与子模块提交，
+    //    CardNo.state 是卡号计数器——两者现场都会看
+    for name in ["manifest.json", "CardNo.state"] {
         let src = runtime_dir.join(name);
         if src.is_file() {
             let _ = std::fs::copy(&src, staging.join(name));

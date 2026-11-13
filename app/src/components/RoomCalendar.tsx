@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Button, Descriptions, Empty, Modal, Select, Space, Tag, Typography } from 'antd'
-import { LeftOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
+import { EditOutlined, LeftOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
+import CheckinForm from './CheckinForm'
 import {
   api,
   describeError,
+  type CheckinGuest,
   type Reservation,
   type Room,
   type RoomStatus,
@@ -48,6 +50,10 @@ type GuestSpan = {
   plannedEnd: string
   /** 入住状态：active / checked_out / invalidated / expired */
   status: string
+  /** 关联的入住登记单（TD-221）；有值时可展开全部住客 */
+  checkinId: number | null
+  /** 登记单住客人数（没有登记单为 0） */
+  guestCount: number
   expiresAt: string
 }
 
@@ -154,6 +160,11 @@ export default function RoomCalendar({
   const [guestSpans, setGuestSpans] = useState<Record<string, GuestSpan[]>>({})
   /** 入住详情（TD-120）：点入住色块弹出；纯展示无操作 */
   const [stayDetail, setStayDetail] = useState<{ roomNo: string; span: GuestSpan } | null>(null)
+  /** 登记单住客列表（TD-221）：点色块时按 checkinId 加载，用于下拉切换 */
+  const [stayGuests, setStayGuests] = useState<CheckinGuest[]>([])
+  const [stayGuestIdx, setStayGuestIdx] = useState(0)
+  /** 编辑登记（TD-223）：从入住详情打开登记表单，改住客 / 关单 */
+  const [editOpen, setEditOpen] = useState(false)
 
   const from = month.format('YYYY-MM-DD')
   /** 视窗左界（TD-123）：含前导列（上月末日），跨月色块能画进前导格 */
@@ -233,6 +244,8 @@ export default function RoomCalendar({
             hours: s.hours,
             plannedEnd: s.plannedEnd,
             status: s.status,
+            checkinId: s.checkinId,
+            guestCount: s.guestCount,
             expiresAt: s.plannedEnd,
           })
         }
@@ -560,6 +573,14 @@ export default function RoomCalendar({
                           onClick={(ev) => {
                             ev.stopPropagation()
                             setStayDetail({ roomNo: room.roomNo, span: g })
+                            setStayGuests([])
+                            setStayGuestIdx(0)
+                            if (g.checkinId !== null) {
+                              void api
+                                .getCheckin(g.checkinId)
+                                .then((d) => setStayGuests(d?.guests ?? []))
+                                .catch(() => {})
+                            }
                           }}
                           style={{
                             position: 'absolute',
@@ -597,7 +618,11 @@ export default function RoomCalendar({
                               {st.label}
                             </span>
                           ) : null}
-                          {g.guestName ? g.guestName : `入住 ${shortRange(g.start, g.end)}`}
+                          {g.guestName
+                            ? g.guestCount > 1
+                              ? `${g.guestName} 等 ${g.guestCount} 人`
+                              : g.guestName
+                            : `入住 ${shortRange(g.start, g.end)}`}
                         </div>
                       )
                     })}
@@ -678,18 +703,70 @@ export default function RoomCalendar({
         </div>
       )}
 
-      {/* 入住详情（TD-120）：点入住色块弹出；纯展示，只有关闭 */}
+      {/* 入住详情（TD-120）：点入住色块弹出；展示为主，可跳去编辑登记单（TD-223） */}
       <Modal
         open={stayDetail !== null}
         title={`入住详情 · ${stayDetail?.roomNo ?? ''}`}
-        footer={null}
         onCancel={() => setStayDetail(null)}
+        footer={
+          <Space>
+            {stayDetail?.span.checkinId != null ? (
+              <Button icon={<EditOutlined />} type="primary" onClick={() => setEditOpen(true)}>
+                编辑登记
+              </Button>
+            ) : null}
+            <Button onClick={() => setStayDetail(null)}>关闭</Button>
+          </Space>
+        }
       >
         {stayDetail ? (
           <Descriptions bordered size="small" column={1}>
+            {stayGuests.length > 1 ? (
+              <Descriptions.Item label="住客">
+                <Select
+                  value={stayGuestIdx}
+                  onChange={(v) => setStayGuestIdx(v)}
+                  style={{ width: 240 }}
+                  options={stayGuests.map((g, i) => ({
+                    value: i,
+                    label: `${i + 1}. ${g.name ?? '未填姓名'}`,
+                  }))}
+                />
+              </Descriptions.Item>
+            ) : null}
             <Descriptions.Item label="客人">
-              {stayDetail.span.guestName ?? '（未填写）'}
+              {stayGuests[stayGuestIdx]?.name ?? stayDetail.span.guestName ?? '（未填写）'}
             </Descriptions.Item>
+            {stayGuests.length > 0 ? (
+              <>
+                <Descriptions.Item label="性别">
+                  {stayGuests[stayGuestIdx]?.gender ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="证件">
+                  {stayGuests[stayGuestIdx]?.idType ?? '—'} ·{' '}
+                  {stayGuests[stayGuestIdx]?.idNumber ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="民族">
+                  {stayGuests[stayGuestIdx]?.nation ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="出生日期">
+                  {stayGuests[stayGuestIdx]?.birthDate ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="证件有效期">
+                  {stayGuests[stayGuestIdx]?.idValidFrom || stayGuests[stayGuestIdx]?.idValidTo
+                    ? `${stayGuests[stayGuestIdx]?.idValidFrom ?? '—'} ~ ${
+                        stayGuests[stayGuestIdx]?.idValidTo ?? '—'
+                      }`
+                    : '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="签发机关">
+                  {stayGuests[stayGuestIdx]?.idAuthority ?? '—'}
+                </Descriptions.Item>
+                <Descriptions.Item label="住址">
+                  {stayGuests[stayGuestIdx]?.address ?? '—'}
+                </Descriptions.Item>
+              </>
+            ) : null}
             <Descriptions.Item label="房号">{stayDetail.roomNo}</Descriptions.Item>
             <Descriptions.Item label="卡型">{stayDetail.span.kind}</Descriptions.Item>
             <Descriptions.Item label="入住 → 到期">
@@ -718,6 +795,26 @@ export default function RoomCalendar({
           </Descriptions>
         ) : null}
       </Modal>
+
+      {/* 编辑登记（TD-223）：复用登记表单；保存后刷新住客列表与日历 */}
+      {stayDetail?.span.checkinId != null ? (
+        <CheckinForm
+          open={editOpen}
+          roomNo={stayDetail.roomNo}
+          checkinId={stayDetail.span.checkinId}
+          onClose={() => setEditOpen(false)}
+          onSaved={() => {
+            const id = stayDetail?.span.checkinId
+            if (id != null) {
+              void api
+                .getCheckin(id)
+                .then((d) => setStayGuests(d?.guests ?? []))
+                .catch(() => {})
+            }
+            setReloadToken((v) => v + 1)
+          }}
+        />
+      ) : null}
     </Space>
   )
 }

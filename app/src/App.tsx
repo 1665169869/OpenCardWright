@@ -37,6 +37,7 @@ import AuthGate from './pages/AuthGate'
 import ExpiryBell from './components/ExpiryBell'
 import appIcon from './assets/app-icon.png'
 import { playAlert, speak, unlockSound } from './utils/sound'
+import { systemNotify } from './utils/notify'
 import { expirySpeech } from './utils/reminder'
 import { listen } from '@tauri-apps/api/event'
 
@@ -76,6 +77,10 @@ export default function App() {
   const [reminder, setReminder] = useState<ReminderSettings | null>(null)
   const [reminders, setReminders] = useState<ExpiringCard[]>([])
   const alerted = useRef<Set<number>>(new Set())
+  /** 语音不可用的降级提示只记一条日志（TD-226）：避免每 30 秒刷一次 */
+  const voiceWarned = useRef(false)
+  /** 系统通知不可用的降级提示也只记一条（TD-228） */
+  const notifyDeniedLogged = useRef(false)
   /** 首启向导：登录后查一次，只在空库且没做过时弹 */
   const [needWizard, setNeedWizard] = useState(false)
   /** 关窗确认框（TD-109）：Rust 拦截 CloseRequested 后发 close-confirm，这里弹框让用户选 */
@@ -186,17 +191,44 @@ export default function App() {
           if (alerted.current.has(c.issuanceId)) continue
           alerted.current.add(c.issuanceId)
           const expired = new Date(c.expiresAt).getTime() < Date.now()
+          const title = `${expired ? '客房卡已过期' : '客房卡即将到期'}：${c.roomNo ?? '未知房号'}`
+          const body = `${c.kind} · 卡号 ${formatCardNo(c.cardNo)} · ${formatExpiry(c.expiresAt) ?? '到期时间未知'}`
+          // 双管（TD-228）：先发系统通知（窗口最小化 / 不在前台也看得到），
+          // 应用内通知保留 —— 系统通知被拒或环境不支持时它就是唯一的可见提醒。
+          void systemNotify(title, body)
+            .then((sent) => {
+              if (sent) return
+              if (!notifyDeniedLogged.current) {
+                notifyDeniedLogged.current = true
+                void api
+                  .logFrontend('warn', '到期提醒：系统通知不可用，仅显示应用内通知')
+                  .catch(() => {})
+              }
+            })
+            .catch(() => {})
           notification.warning({
             key: `expiry-${c.issuanceId}`,
-            message: `${expired ? '客房卡已过期' : '客房卡即将到期'}：${c.roomNo ?? '未知房号'}`,
-            description: `${c.kind} · 卡号 ${formatCardNo(c.cardNo)} · ${formatExpiry(c.expiresAt) ?? '到期时间未知'}`,
+            message: title,
+            description: body,
             duration: 20,
             placement: 'topRight',
           })
-          // 语音优先；语音不可用（无中文音色/合成失败）才回退提示音，避免同时响两遍
+          // 语音优先；语音不可用（无中文音色 / 音色未加载 / 合成失败）才回退提示音，避免同时响两遍
           let spoke = false
           if (reminder.voice) spoke = speak(expirySpeech(c, Date.now()))
           if (!spoke && reminder.sound) playAlert()
+          // TD-226：语音降级只记一条日志，便于现场排查"没有声音"到底卡在哪一环
+          if (!spoke && reminder.voice && !voiceWarned.current) {
+            voiceWarned.current = true
+            void api
+              .logFrontend(
+                'warn',
+                reminder.sound
+                  ? '到期提醒：系统语音不可用（无中文语音包或音色未加载），已退回提示音'
+                  : '到期提醒：系统语音不可用，且「提示声」已关闭，只有弹窗',
+              )
+              .catch(() => {})
+          }
         }
       } catch {
         // 轮询失败静默，下一轮再试；不要用弹窗骚扰前台
@@ -266,8 +298,8 @@ export default function App() {
   }
 
   const menuItems: NonNullable<MenuProps['items']> = [
-    // 房间放最前面：前台最常用的是"选房间 → 发卡/退房"，
-    // 读卡更多是偶尔核对一张卡时才用。
+    // 房间放最前面：前台最常用的是「选房间 → 发卡 / 登记 / 退房」，这些操作都在房间里完成，
+    // 所以不单开发卡 / 登记 / 日历图入口；房间里用「网格 / 列表 / 日历」切换。
     { key: 'rooms', icon: <HomeOutlined />, label: '房间' },
     { key: 'read', icon: <ScanOutlined />, label: '读卡' },
     { key: 'logs', icon: <HistoryOutlined />, label: '记录' },
@@ -380,7 +412,28 @@ export default function App() {
         </Space>
 
         <Space size="middle" align="center">
-          {info ? <Tag>v{info.version}</Tag> : null}
+          {info ? (
+            info.channel === 'dev' ? (
+              <Tooltip title="DEV 通道：数据在 %PROGRAMDATA%\OpenCardWright-dev，可与正式版同时运行">
+                <Tag color="orange" style={{ fontWeight: 600 }}>
+                  {info.version} DEV
+                </Tag>
+              </Tooltip>
+            ) : (
+              <Tooltip title="正式版：数据在 %PROGRAMDATA%\OpenCardWright">
+                <Tag
+                  style={{
+                    background: 'linear-gradient(90deg, #1677ff, #13c2c2)',
+                    border: 'none',
+                    color: '#fff',
+                    fontWeight: 600,
+                  }}
+                >
+                  {info.version} 正式版
+                </Tag>
+              </Tooltip>
+            )
+          ) : null}
           {infoLoading ? (
             <Tag icon={<LoadingOutlined spin />} color="processing">
               探测设备中…

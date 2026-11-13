@@ -8,9 +8,11 @@ import {
   FieldTimeOutlined,
   IdcardOutlined,
   LogoutOutlined,
+  MoreOutlined,
   PlusOutlined,
   ScanOutlined,
   SwapOutlined,
+  UserAddOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
@@ -26,19 +28,20 @@ import {
   Segmented,
   Select,
   Space,
+  Table,
   Tabs,
   Tag,
   Tooltip,
   Typography,
   type MenuProps,
 } from 'antd'
+import type { ColumnsType } from 'antd/es/table'
 import {
   api,
   describeError,
   formatExpiry,
   formatTime,
   type CardReadDto,
-  type GuestInput,
   type IssuanceRow,
   type Reservation,
   type Room,
@@ -49,6 +52,7 @@ import {
 import { roomNoIssue } from '../utils/validate'
 import { statusIcon } from '../components/StatusIcon'
 import IssueForm from '../components/IssueForm'
+import CheckinForm from '../components/CheckinForm'
 import { CheckoutCardModal } from '../components/CheckoutCardModal'
 import NoCardCheckoutModal from '../components/NoCardCheckoutModal'
 import { CardSnapshotView } from '../components/CardSnapshotView'
@@ -100,6 +104,13 @@ export default function RoomManager({
   const [statuses, setStatuses] = useState<RoomStatus[]>([])
   const [roomNo, setRoomNo] = useState('')
   const [index, setIndex] = useState<number | null>(null)
+  /**
+   * 高位序号（4080–4094）的二次确认值；非 null 时弹受控 Modal。
+   *
+   * 这 16 个号的页1 是 `5B EC xF FF`，与总控卡（`5B EC F0 FF`）只差 B2 的高 4 位，
+   * 门锁端会不会认成总控卡没有实测，所以不静默放行。
+   */
+  const [highIndexConfirm, setHighIndexConfirm] = useState<number | null>(null)
   const [newTypeId, setNewTypeId] = useState<number | null>(null)
   const [filterType, setFilterType] = useState<number | 'all' | 'none'>('all')
   const [filterStatus, setFilterStatus] = useState<string | 'all'>('all')
@@ -143,9 +154,18 @@ export default function RoomManager({
   const [noCheckoutRoom, setNoCheckoutRoom] = useState<Room | null>(null)
   // 发卡只从右键菜单进入，抽屉里不再放发卡表单
   const [issueRoom, setIssueRoom] = useState<Room | null>(null)
+  /** 入住登记（TD-220）：目标房号；null = 关闭 */
+  /** 入住登记目标：房号 + 预定预填（null = 空单登记，不带客人信息） */
+  const [checkinTarget, setCheckinTarget] = useState<{
+    roomNo: string
+    prefill: { name?: string; note?: string } | null
+  } | null>(null)
+  /** 待确认的「今天有预定」：先问一句，再决定是否带预订客人信息 */
+  const [checkinReserve, setCheckinReserve] = useState<{
+    roomNo: string
+    reservation: Reservation
+  } | null>(null)
   const [issueMode, setIssueMode] = useState<'new' | 'renew' | 'move'>('new')
-  /** 预定房发卡时预填的客人姓名（TD-107）；拉预定失败或无预定时为 null */
-  const [issueGuest, setIssueGuest] = useState<GuestInput | null>(null)
   /** 当天有预定时的发卡确认（TD-113）：先问「是给这位预定客人发卡吗」 */
   const [issueConfirm, setIssueConfirm] = useState<{
     room: Room
@@ -165,7 +185,6 @@ export default function RoomManager({
    */
   const openIssue = async (room: Room, mode: 'new' | 'renew') => {
     setIssueMode(mode)
-    setIssueGuest(null)
     try {
       const pad = (n: number) => String(n).padStart(2, '0')
       const now = new Date()
@@ -184,14 +203,10 @@ export default function RoomManager({
     setIssueRoom(room)
   }
 
-  /** 发卡确认框的两个出口（TD-113）：按预定客人（预填姓名）/ 手动填写（不预填）。 */
-  const confirmIssue = (useGuest: boolean) => {
+  /** 发卡确认框的两个出口（TD-113）：确认按预定客人发卡 / 手动发卡。
+   *  姓名等身份信息统一在「入住登记」里录（TD-220），这里不再预填。 */
+  const confirmIssue = () => {
     if (!issueConfirm) return
-    if (useGuest && issueConfirm.res.guestName) {
-      setIssueGuest({ name: issueConfirm.res.guestName })
-    } else {
-      setIssueGuest(null)
-    }
     setIssueMode(issueConfirm.mode)
     setIssueRoom(issueConfirm.room)
     setIssueConfirm(null)
@@ -263,6 +278,82 @@ export default function RoomManager({
   /** 房型标签颜色（在设置→房型里自定义；没设就是中性灰）。 */
   const typeColor = (typeId: number | null): string | undefined =>
     typeId === null ? undefined : (roomTypes.find((t) => t.id === typeId)?.color ?? undefined)
+
+  /** 列表视图的列：与网格卡片同源数据，只是排成表好扫。 */
+  const roomColumns: ColumnsType<Room> = [
+    {
+      title: '房号',
+      dataIndex: 'roomNo',
+      width: 100,
+      render: (v: string) => <Text strong>{v}</Text>,
+    },
+    { title: '序号', dataIndex: 'roomIndex', width: 80 },
+    {
+      title: '房态',
+      dataIndex: 'status',
+      width: 110,
+      render: (v: string) => {
+        const st = statusOf(v)
+        return <Tag color={st?.color}>{st?.label ?? v}</Tag>
+      },
+    },
+    {
+      title: '房型',
+      width: 120,
+      render: (_: unknown, r: Room) => (
+        <Tag color={typeColor(r.roomTypeId)}>{r.roomTypeName ?? '未分类'}</Tag>
+      ),
+    },
+    {
+      title: '有效卡',
+      width: 90,
+      render: (_: unknown, r: Room) =>
+        `${r.activeCards}/${r.maxCards === 0 ? '∞' : (r.maxCards ?? maxDefault)}`,
+    },
+    {
+      title: '安装卡',
+      width: 180,
+      render: (_: unknown, r: Room) =>
+        r.installCardAt ? (
+          `已制作 · ${formatTime(r.installCardAt)}`
+        ) : (
+          <Text type="secondary">未制作</Text>
+        ),
+    },
+    {
+      title: '登记人数',
+      width: 100,
+      render: (_: unknown, r: Room) =>
+        r.guestCount > 0 ? `${r.guestCount} 人` : <Text type="secondary">—</Text>,
+    },
+    {
+      title: '最晚到期',
+      width: 160,
+      render: (_: unknown, r: Room) => formatExpiry(r.activeUntil) ?? '—',
+    },
+    {
+      title: '操作',
+      width: 80,
+      fixed: 'right',
+      render: (_: unknown, r: Room) => (
+        // 下拉菜单渲染在 portal 里，但 React 合成事件仍按组件树冒泡——
+        // 这一层把菜单项的点击拦在行 onClick 之外，否则点菜单会顺带打开详情抽屉。
+        <span onClick={(e) => e.stopPropagation()}>
+          <Dropdown
+            trigger={['click']}
+            menu={{ items: roomMenu(r), onClick: ({ key }) => handleRoomMenu(r, key) }}
+          >
+            <Button
+              size="small"
+              type="text"
+              icon={<MoreOutlined />}
+              onClick={(e) => e.stopPropagation()}
+            />
+          </Dropdown>
+        </span>
+      ),
+    },
+  ]
 
   /**
    * 界面上"存在"的房间 = 未删除的房间。
@@ -518,10 +609,8 @@ export default function RoomManager({
     setCreateOpen(true)
   }
 
-  const addRoom = async () => {
-    const issue = roomNoIssue(roomNo)
-    setRoomNoErr(issue)
-    if (issue) return
+  /** 真正建房间：`addRoom` 通过校验、必要时经高位序号确认后调用。 */
+  const doCreateRoom = async () => {
     setLoading(true)
     setError(null)
     setNotice(null)
@@ -547,6 +636,23 @@ export default function RoomManager({
     } finally {
       setLoading(false)
     }
+  }
+
+  /**
+   * 新增房间入口：先校验房号；手填序号落在 4080–4094 时先弹二次确认。
+   *
+   * 这 16 个号的页1 是 `5B EC xF FF`，与总控卡（`5B EC F0 FF`）只差 B2 高 4 位，
+   * 门锁端会不会认成总控卡没有实测。取消确认时保留用户已填的房号与序号。
+   */
+  const addRoom = async () => {
+    const issue = roomNoIssue(roomNo)
+    setRoomNoErr(issue)
+    if (issue) return
+    if (index !== null && index >= 4080) {
+      setHighIndexConfirm(index)
+      return
+    }
+    await doCreateRoom()
   }
 
   /** 查某房**覆盖今天**的有效预定（TD-119）；查询失败返回 []，不阻断改房态。 */
@@ -656,10 +762,10 @@ export default function RoomManager({
   /** 日历空白格预填的入住日；卡片按钮打开时为 null（默认今天） */
   const [reserveInitialDate, setReserveInitialDate] = useState<string | null>(null)
   /** 每次打开 +1 当 key，强制重挂载弹窗（HMR 会保留组件 state） */
+  /** 房间展示形态：网格（看房态）/ 列表（快速扫全量）/ 日历（看入住区间） */
+  const [viewMode, setViewMode] = useState<'grid' | 'list' | 'calendar'>('grid')
   const [reserveSession, setReserveSession] = useState(0)
   const [reserveOpen, setReserveOpen] = useState(false)
-  /** 房间格子视图 / 房态日历（TD-203） */
-  const [viewMode, setViewMode] = useState<'rooms' | 'calendar'>('rooms')
 
   const openReserve = (room: Room, date?: string) => {
     setReserveEditing(null)
@@ -668,6 +774,13 @@ export default function RoomManager({
     setReserveOpen(true)
     setReserveSession((n) => n + 1)
   }
+  const closeReserve = () => {
+    setReserveOpen(false)
+    setReserveTarget(null)
+    setReserveEditing(null)
+    setReserveInitialDate(null)
+  }
+
   /** 日历顶部「新增预定」：不预设房间，弹窗内选择。 */
   const openNewReserve = () => {
     setReserveEditing(null)
@@ -676,18 +789,13 @@ export default function RoomManager({
     setReserveOpen(true)
     setReserveSession((n) => n + 1)
   }
+  /** 日历色块点开：编辑已有预定。 */
   const openEditReserve = (r: Reservation) => {
     setReserveEditing(r)
     setReserveTarget(null)
     setReserveInitialDate(null)
     setReserveOpen(true)
     setReserveSession((n) => n + 1)
-  }
-  const closeReserve = () => {
-    setReserveOpen(false)
-    setReserveTarget(null)
-    setReserveEditing(null)
-    setReserveInitialDate(null)
   }
 
   const doInstall = async () => {
@@ -811,24 +919,6 @@ export default function RoomManager({
     void doMove(moveFrom, target)
   }
 
-  /** 换房带入的客人信息：源房最近一张有效客卡的登记信息（全部为空则不传）。 */
-  const guestFromPreview = (): GuestInput | undefined => {
-    const l = movePreview?.latest
-    if (!l) return undefined
-    const g: GuestInput = {
-      name: l.guestName ?? undefined,
-      gender: l.guestGender ?? undefined,
-      idType: l.guestIdType ?? undefined,
-      idNumber: l.guestIdNumber ?? undefined,
-      nation: l.guestNation ?? undefined,
-      address: l.guestAddress ?? undefined,
-      birthDate: l.guestBirthDate ?? undefined,
-      note: l.guestNote ?? undefined,
-    }
-    const has = Object.values(g).some((v) => (v ?? '').trim() !== '')
-    return has ? g : undefined
-  }
-
   const typeOptions = roomTypes.map((t) => ({ value: t.id, label: t.name }))
 
   /** 房态下拉的选项（带房态自己的图标与颜色），筛选与批量改房态共用 */
@@ -869,12 +959,17 @@ export default function RoomManager({
               ),
             },
           ]),
-      // 发卡放最前面；预定入口（TD-108 按用户要求收回右键菜单；日历视图仍可点空白格直接预定）
+      // 发卡放最前面；预定入口（TD-108 按用户要求收回右键菜单，日常走「日历图」一级页面）
       { key: 'issue', icon: <IdcardOutlined />, label: '发行房卡', disabled: !canIssueCard },
       {
         key: 'reserve',
         icon: <CalendarOutlined />,
         label: '预定房间',
+      },
+      {
+        key: 'checkin',
+        icon: <UserAddOutlined />,
+        label: '入住登记',
       },
       { key: 'renew', icon: <FieldTimeOutlined />, label: '续住写卡', disabled: !canIssueCard },
       {
@@ -893,6 +988,38 @@ export default function RoomManager({
           ]
         : []),
     ]
+  }
+
+  /** 右键「入住登记」：今天有 booked 预定就先问一句，没有就直接开空单。 */
+  const openCheckin = async (room: Room) => {
+    const todays = await todaysReservationsOf(room.roomNo)
+    if (todays.length === 0) {
+      setCheckinTarget({ roomNo: room.roomNo, prefill: null })
+      return
+    }
+    setCheckinReserve({ roomNo: room.roomNo, reservation: todays[0] })
+  }
+
+  /**
+   * 房间菜单的动作分发：网格右键菜单与列表行尾下拉共用同一份逻辑，
+   * 避免两处各写一套 if/else 后行为漂移。
+   */
+  const handleRoomMenu = (room: Room, key: string) => {
+    if (key === 'multi') enterSelectMode(room.roomNo)
+    else if (key === 'checkoutCard') openCheckout(room)
+    else if (key === 'checkoutNoCard') noCardCheckout(room)
+    else if (key === 'delete') setDeleteTarget(room)
+    else if (key === 'issue') {
+      void openIssue(room, 'new')
+    } else if (key === 'renew') {
+      void openIssue(room, 'renew')
+    } else if (key === 'move') {
+      void openMove(room)
+    } else if (key === 'reserve') {
+      openReserve(room)
+    } else if (key === 'checkin') {
+      void openCheckin(room)
+    }
   }
 
   /** 逻辑删除房间。有有效卡时按钮是禁用的，这里再兜一次底。 */
@@ -930,25 +1057,15 @@ export default function RoomManager({
             </Button>
             <Segmented
               value={viewMode}
-              onChange={(v) => setViewMode(v as 'rooms' | 'calendar')}
+              onChange={(v) => setViewMode(v as 'grid' | 'list' | 'calendar')}
               options={[
-                { label: '房间', value: 'rooms' },
+                { label: '网格', value: 'grid' },
+                { label: '列表', value: 'list' },
                 { label: '日历', value: 'calendar' },
               ]}
             />
           </Space>
 
-          {viewMode === 'calendar' ? (
-            <RoomCalendar
-              rooms={liveRooms}
-              roomTypes={roomTypes}
-              statuses={statuses}
-              onNewReservation={openNewReserve}
-              onReserve={(room, date) => openReserve(room, date)}
-              onEdit={openEditReserve}
-            />
-          ) : (
-          <>
           <Tabs
             className="ocw-type-tabs"
             activeKey={typeTabKey}
@@ -1019,7 +1136,7 @@ export default function RoomManager({
           <Text type="secondary" style={{ fontSize: 12 }}>
             {selectMode
               ? '多选模式：点房间卡片勾选 / 取消，选好后挑一个房态批量应用。'
-              : '点房间卡片可改房态、退房；右键房间卡片可预定（选日期）/ 发卡 / 续卡 / 多选批量改房态 / 删除房间；日历视图点空白格可直接预定。空净房、未满房、预定房能发卡或续卡。'}
+              : '点房间卡片可改房态、退房；右键房间卡片可预定（选日期）/ 发卡 / 续卡 / 多选批量改房态 / 删除房间。空净房、未满房、预定房能发卡或续卡。'}
           </Text>
 
           {error ? <Alert type="error" showIcon message={error} /> : null}
@@ -1043,6 +1160,33 @@ export default function RoomManager({
             ) : (
               <Empty description="没有符合筛选条件的房间" />
             )
+          ) : viewMode === 'calendar' ? (
+            // 日历吃的是同一份 visible：房型 tab + 房态筛选在这里同样生效
+            <RoomCalendar
+              rooms={visible}
+              roomTypes={roomTypes}
+              statuses={statuses}
+              onNewReservation={openNewReserve}
+              onReserve={(room, date) => openReserve(room, date)}
+              onEdit={openEditReserve}
+            />
+          ) : viewMode === 'list' ? (
+            <Table<Room>
+              size="small"
+              rowKey="roomNo"
+              dataSource={visible}
+              pagination={false}
+              scroll={{ x: 960 }}
+              columns={roomColumns}
+              onRow={(room) => ({
+                onClick: (e) => {
+                  // 兜底：事件来自下拉菜单（菜单渲染在 portal 里）时，不当作行点击
+                  if ((e.target as HTMLElement).closest('.ant-dropdown')) return
+                  openRoom(room)
+                },
+                style: { cursor: 'pointer' },
+              })}
+            />
           ) : (
             <div
               style={{
@@ -1061,21 +1205,7 @@ export default function RoomManager({
                     trigger={['contextMenu']}
                     menu={{
                       items: roomMenu(room),
-                      onClick: ({ key }) => {
-                        if (key === 'multi') enterSelectMode(room.roomNo)
-                        else if (key === 'checkoutCard') openCheckout(room)
-                        else if (key === 'checkoutNoCard') noCardCheckout(room)
-                        else if (key === 'delete') setDeleteTarget(room)
-                        else if (key === 'issue') {
-                          void openIssue(room, 'new')
-                        } else if (key === 'renew') {
-                          void openIssue(room, 'renew')
-                        } else if (key === 'move') {
-                          void openMove(room)
-                        } else if (key === 'reserve') {
-                          openReserve(room)
-                        }
-                      },
+                      onClick: ({ key }) => handleRoomMenu(room, key),
                     }}
                   >
                   <Card
@@ -1129,7 +1259,16 @@ export default function RoomManager({
                       </Text>
 
                       <Text type="secondary" style={{ fontSize: 12 }}>
-                        {room.installCardAt ? '已安装' : '未制作安装卡'}
+                        登记{' '}
+                        <Text
+                          style={{
+                            fontSize: 12,
+                            color: room.guestCount > 0 ? '#595959' : '#bfbfbf',
+                          }}
+                          strong={room.guestCount > 0}
+                        >
+                          {room.guestCount > 0 ? `${room.guestCount} 人` : '无登记'}
+                        </Text>
                       </Text>
                     </Space>
                   </Card>
@@ -1137,8 +1276,6 @@ export default function RoomManager({
                 )
               })}
             </div>
-          )}
-          </>
           )}
         </Space>
       </Card>
@@ -1380,15 +1517,15 @@ export default function RoomManager({
             <Text>
               {issueConfirm.res.guestName
                 ? '是给这位预定的客人发卡吗？选「是」会把预定姓名带进发卡表单。'
-                : '该预定未填姓名，仍可发卡——客人信息在发卡表单里手动填写。'}
+                : '该预定未填姓名，仍可发卡；客人身份在「入住登记」里录。'}
             </Text>
             <Space wrap>
-              <Button type="primary" onClick={() => confirmIssue(true)}>
+              <Button type="primary" onClick={() => confirmIssue()}>
                 {issueConfirm.res.guestName
                   ? '是，按预定客人发卡'
                   : '是，继续发卡（预定未填姓名）'}
               </Button>
-              <Button onClick={() => confirmIssue(false)}>不是，手动填写</Button>
+              <Button onClick={() => confirmIssue()}>不是，手动发卡</Button>
               <Button onClick={() => setIssueConfirm(null)}>取消</Button>
             </Space>
           </Space>
@@ -1444,15 +1581,80 @@ export default function RoomManager({
             }
             renewFrom={issueMode === 'renew' ? issueRoom.activeUntil : null}
             defaultMode={issueMode === 'move' ? moveIssueDefaults().mode : 'day'}
-            initialGuest={
-              issueMode === 'move'
-                ? guestFromPreview()
-                : (issueGuest ?? undefined)
-            }
             moveNotice={issueMode === 'move'}
           />
         ) : null}
       </Modal>
+
+      {/* 预定房登记：先问是否使用预定信息（受控 Modal，不用命令式确认框） */}
+      <Modal
+        open={checkinReserve !== null}
+        title="这间房今天有预定"
+        onCancel={() => setCheckinReserve(null)}
+        footer={[
+          <Button key="cancel" onClick={() => setCheckinReserve(null)}>
+            取消
+          </Button>,
+          <Button
+            key="empty"
+            onClick={() => {
+              const target = checkinReserve
+              setCheckinReserve(null)
+              if (target) setCheckinTarget({ roomNo: target.roomNo, prefill: null })
+            }}
+          >
+            空单登记
+          </Button>,
+          <Button
+            key="use"
+            type="primary"
+            onClick={() => {
+              const target = checkinReserve
+              setCheckinReserve(null)
+              if (target) {
+                setCheckinTarget({
+                  roomNo: target.roomNo,
+                  prefill: {
+                    name: target.reservation.guestName ?? undefined,
+                    note: target.reservation.note ?? undefined,
+                  },
+                })
+              }
+            }}
+          >
+            使用预定信息
+          </Button>,
+        ]}
+      >
+        {checkinReserve ? (
+          <Space direction="vertical" size={6}>
+            <Text>
+              {checkinReserve.roomNo} 今天有预定：
+              {checkinReserve.reservation.checkIn} {checkinReserve.reservation.checkInTime} →{' '}
+              {checkinReserve.reservation.checkOut} {checkinReserve.reservation.checkOutTime}
+              {checkinReserve.reservation.guestName
+                ? `（${checkinReserve.reservation.guestName}）`
+                : '（预定未填姓名）'}
+            </Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              用这条预定的客人信息开始登记：姓名与备注会带到表单；第一位住客加成功后，
+              预定自动转为「已入住」。
+            </Text>
+          </Space>
+        ) : null}
+      </Modal>
+
+      {/* 入住登记（TD-220）：与发卡解耦，同一房间复用 open 单 */}
+      <CheckinForm
+        open={checkinTarget !== null}
+        roomNo={checkinTarget?.roomNo ?? null}
+        prefill={checkinTarget?.prefill ?? undefined}
+        onClose={() => setCheckinTarget(null)}
+        onSaved={() => {
+          void reload()
+          onRoomsChanged?.()
+        }}
+      />
 
       <Modal
         open={installOpen}
@@ -1508,9 +1710,9 @@ export default function RoomManager({
           <div>
             <Text type="secondary">锁内序号</Text>
             <InputNumber
-              placeholder="留空自动分配（0–255 中最小的空闲值）"
+              placeholder="留空自动分配（0–4094 中最小的空闲值；4095 留给总控卡）"
               min={0}
-              max={255}
+              max={4094}
               value={index ?? undefined}
               onChange={(v) => setIndex(typeof v === 'number' ? v : null)}
               style={{ display: 'block', marginTop: 4, width: '100%' }}
@@ -1533,6 +1735,30 @@ export default function RoomManager({
             序号是写进卡里的房间标识，同一个序号不能给两个房间用。
             填<Text strong>已删除房间</Text>的序号会直接复用那条记录、只改房名，不会新建。
             新增后需要「制作安装卡」并到该房门锁刷一次，锁才认这个房间。
+          </Text>
+        </Space>
+      </Modal>
+
+      {/* 高位序号（4080–4094）二次确认：受控 Modal；antd 命令式弹窗在 React 19 下会静默失效 */}
+      <Modal
+        open={highIndexConfirm !== null}
+        title={`确认使用序号 ${highIndexConfirm ?? ''}？`}
+        okText="仍然使用"
+        cancelText="返回修改"
+        onOk={() => {
+          setHighIndexConfirm(null)
+          void doCreateRoom()
+        }}
+        onCancel={() => setHighIndexConfirm(null)}
+      >
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Text>
+            序号 4080–4094 这 16 个号的页1 是 <Text code>5B EC xF FF</Text>，
+            与总控卡（<Text code>5B EC F0 FF</Text>）只差 B2 的高 4 位。
+          </Text>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            门锁端会不会把这些号认成总控卡还没有实测。如果不是确实需要这么多房间，
+            建议改用 0–4079 的序号。取消会保留你已填的房号与序号。
           </Text>
         </Space>
       </Modal>

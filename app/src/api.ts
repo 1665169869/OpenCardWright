@@ -83,6 +83,104 @@ export interface GuestInput {
 }
 
 /**
+ * 读到的身份证信息（`read_id_card` 的返回）。
+ *
+ * 字段与 Rust 端 `IdCardDto` 一一对应；解析厂商协议、连 9001 服务都在 Rust 侧，
+ * 前端拿到的是已经归一好的字段，不需要知道读卡器型号或报文格式。
+ */
+export interface IdCardInfo {
+  name: string | null
+  gender: string | null
+  nation: string | null
+  /** 出生日期，`YYYY-MM-DD` */
+  birthDate: string | null
+  address: string | null
+  idNumber: string | null
+  /** 证件有效期起 / 止，厂商原样格式（多为 `YYYYMMDD`） */
+  idValidFrom: string | null
+  idValidTo: string | null
+  idAuthority: string | null
+  deviceModel: string | null
+  deviceSerial: string | null
+}
+
+/** 入住登记单（TD-220）：一间房同一时刻最多一张 open。 */
+export interface Checkin {
+  id: number
+  roomNo: string
+  checkInAt: string
+  checkOutAt: string | null
+  status: string
+  operatorId: number | null
+  note: string | null
+  createdAt: string
+}
+
+/** 同住的客人（`seq` 决定「首个登记人」）。 */
+export interface CheckinGuest {
+  id: number
+  checkinId: number
+  seq: number
+  name: string | null
+  gender: string | null
+  idType: string | null
+  idNumber: string | null
+  nation: string | null
+  address: string | null
+  birthDate: string | null
+  note: string | null
+  idValidFrom: string | null
+  idValidTo: string | null
+  idAuthority: string | null
+  deviceModel: string | null
+  deviceSerial: string | null
+}
+
+/** 登记单关联的一张卡（登记 → 卡的反向可见）。 */
+export interface CheckinCard {
+  id: number
+  /** 16 位卡号位域（`DDHHII`），只做内部核对，界面不显示十六进制 */
+  cardNo: number | null
+  /** 10 位作业流水号 `YYMMDDHHII`，界面用这个；不占号的卡型为 null */
+  workNo: string | null
+  kind: string
+  rawHex: string | null
+  expiresAt: string | null
+  result: string
+  checkedOutAt: string | null
+  invalidatedAt: string | null
+}
+
+/** 追加住客的结果：`reservationConverted` 非空表示顺手把预定转成了入住。 */
+export interface AddGuestResult {
+  guestId: number
+  reservationConverted: number | null
+}
+
+export interface CheckinDetail {
+  /** 该房号当前的锁内序号；房间记录缺失时为 null */
+  roomIndex: number | null
+  checkin: Checkin
+  guests: CheckinGuest[]
+  /** 这张登记单关联的发卡记录；退房关单的判据就是这批卡是否都已失效 */
+  cards: CheckinCard[]
+}
+
+/** 列表行：首个登记人 + 人数。 */
+export interface CheckinRow {
+  id: number
+  roomNo: string
+  /** 该房号当前的锁内序号；房间记录缺失时为 null（同房间多次入住会重复，分组看单号） */
+  roomIndex: number | null
+  checkInAt: string
+  checkOutAt: string | null
+  status: string
+  guestCount: number
+  firstGuestName: string | null
+  note: string | null
+}
+
+/**
  * 证件类型：按拼音 A–Z 排序。
  * 需求里"社会保障卡""军官证"重复给了两次，这里去重。
  */
@@ -137,6 +235,8 @@ export interface Room {
   createdAt: string
   /** 当前仍有效的客卡张数（按卡号去重、已退房不算） */
   activeCards: number
+  /** 当前 open 登记单的住客数；没有 open 单为 0（登记 ≠ 发卡，人数 ≠ 卡数） */
+  guestCount: number
   /** 当前有效卡里最晚的到期时间（ISO UTC）；续住写卡用它算默认天数 */
   activeUntil: string | null
 }
@@ -177,6 +277,13 @@ export interface CheckoutHourResult {
   recalculated: number
 }
 
+/** 凌晨房归属时间（TD-225）：改完会重算在用日租卡 */
+export interface MorningCutoffResult {
+  /** 规范化后的 `HH:mm` */
+  cutoff: string
+  recalculated: number
+}
+
 /** 预定记录。日期是本地日期（YYYY-MM-DD），退房日不含（住 1 晚 = 今天→明天）。 */
 export interface Reservation {
   id: number
@@ -209,6 +316,10 @@ export interface GuestStay {
   plannedEnd: string
   /** 入住状态：active / checked_out / invalidated / expired（过期未退房不再算在住） */
   status: string
+  /** 关联的入住登记单（TD-221）；详情可展开全部住客 */
+  checkinId: number | null
+  /** 登记单住客人数（没有登记单为 0） */
+  guestCount: number
 }
 
 export interface ReservationFilter {
@@ -253,6 +364,8 @@ export interface IssuanceRow {
   guestNote: string | null
   operatorName: string | null
   result: string
+  /** 统一状态（TD-229）：active / expired / checked_out / voided / failed，由后端算好 */
+  status: string
   expiresAt: string | null
   checkedOutAt: string | null
   durationMs: number | null
@@ -445,8 +558,10 @@ export interface AppInfo {
   port: number
   /** SDK 来源：env / resource / dev */
   sdkSource: string | null
-  /** tauri dev 构建为 true */
+  /** 调试构建（tauri dev / cargo run）为 true */
   dev: boolean
+  /** 发布通道：dev = 调试构建或 DEV 安装包；release = 正式版 */
+  channel: 'dev' | 'release'
 }
 
 export interface SelfTestDto {
@@ -507,6 +622,8 @@ export const api = {
   logout: () => invoke<AuthStatus>('logout'),
   appInfo: () => invoke<AppInfo>('app_info'),
   readCard: () => invoke<CardReadDto>('read_card'),
+  /** 读身份证（9001 服务）。失败只影响自动填表，手填照样能登记。 */
+  readIdCard: () => invoke<IdCardInfo>('read_id_card'),
   listRooms: () => invoke<Room[]>('list_rooms'),
   createRoom: (roomNo: string, roomIndex?: number, roomTypeId?: number) =>
     invoke<RoomUpsert>('create_room', { roomNo, roomIndex: roomIndex ?? null, roomTypeId: roomTypeId ?? null }),
@@ -529,7 +646,8 @@ export const api = {
     invoke<void>('set_room_status', { roomNo, status }),
   updateRoomStatusStyle: (key: string, icon: string, color: string) =>
     invoke<void>('update_room_status_style', { key, icon, color }),
-  checkoutRoom: (roomNo: string) => invoke<CheckoutResult>('checkout_room', { roomNo }),
+  checkoutRoom: (roomNo: string, clearCheckin = true) =>
+    invoke<CheckoutResult>('checkout_room', { roomNo, clearCheckin }),
   /** 列出与 [from, to) 相交的有效预定（YYYY-MM-DD） */
   listReservations: (from: string, to: string, roomNo?: string | null) =>
     invoke<Reservation[]>('list_reservations', { from, to, roomNo: roomNo ?? null }),
@@ -645,6 +763,8 @@ export const api = {
   /** 同一卡号的全部写入记录 */
   /** 导出当前筛选为 CSV（管理员）：后端落盘并返回路径 */
   /** 导出 CSV；`guestOnly=true` 时只导出填了身份信息的发卡（入住记录，TD-165） */
+  /** 导出在用房间的「序号 ↔ 房号」对照表（`room_index.json`，管理员） */
+  exportRoomIndexJson: () => invoke<CsvResult>('export_room_index_json'),
   exportIssuancesCsv: (f: LogFilter, guestOnly = false) =>
     invoke<CsvResult>('export_issuances_csv', {
       roomNo: f.roomNo ?? null,
@@ -669,6 +789,52 @@ export const api = {
       to: f.to ?? null,
     }),
 
+  /** 入住登记（TD-220）：建单；同房已有 open 单会直接复用 */
+  createCheckin: (roomNo: string, note?: string | null) =>
+    invoke<Checkin>('create_checkin', { roomNo, note: note ?? null }),
+  /** 取该房当前 open 的登记单（没有返回 null） */
+  getOpenCheckin: (roomNo: string) => invoke<Checkin | null>('get_open_checkin', { roomNo }),
+  /** 登记单列表：房号 / 状态 / 入住日区间 + 分页 */
+  listCheckins: (f: {
+    roomNo?: string | null
+    status?: string | null
+    from?: string | null
+    to?: string | null
+    page?: number
+    pageSize?: number
+  }) =>
+    invoke<Page<CheckinRow>>('list_checkins', {
+      roomNo: f.roomNo ?? null,
+      status: f.status ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+      page: f.page ?? 1,
+      pageSize: f.pageSize ?? 20,
+    }),
+  /** 登记单详情（含全部住客，按 seq 排序） */
+  getCheckin: (id: number) => invoke<CheckinDetail | null>('get_checkin', { id }),
+  /** 追加住客（seq 自动递增） */
+  addCheckinGuest: (checkinId: number, guest: GuestInput) =>
+    invoke<AddGuestResult>('add_checkin_guest', { checkinId, guest }),
+  updateCheckinGuest: (id: number, guest: GuestInput) =>
+    invoke<void>('update_checkin_guest', { id, guest }),
+  deleteCheckinGuest: (id: number) => invoke<void>('delete_checkin_guest', { id }),
+  /** 关闭登记单（退房会自动关，这里给手动关用） */
+  closeCheckin: (id: number) => invoke<void>('close_checkin', { id }),
+  /** 导出登记单 CSV（管理员）：一张单 × 一位住客一行 */
+  exportCheckinsCsv: (f: {
+    roomNo?: string | null
+    status?: string | null
+    from?: string | null
+    to?: string | null
+  }) =>
+    invoke<CsvResult>('export_checkins_csv', {
+      roomNo: f.roomNo ?? null,
+      status: f.status ?? null,
+      from: f.from ?? null,
+      to: f.to ?? null,
+    }),
+
   /** 自动备份设置（管理员） */
   getBackupSettings: () => invoke<BackupSettings>('get_backup_settings'),
   setBackupSettings: (intervalMinutes: number, keep: number) =>
@@ -684,18 +850,21 @@ export const api = {
     cardNo?: number | null
     issuanceId?: number | null
     noDevice?: boolean
+    /** 退房时顺带关闭该房入住登记单（只关单，住客档案保留） */
+    clearCheckin?: boolean
   }) =>
     invoke<CheckoutCardResult>('checkout_card', {
       cardNo: input.cardNo ?? null,
       issuanceId: input.issuanceId ?? null,
       noDevice: input.noDevice ?? false,
+      clearCheckin: input.clearCheckin ?? false,
     }),
   /**
    * 强制退房：卡不是本系统发的，本地没有发卡记录，按前端从卡片里读出的房号
    * 直接写入退房数据（关闭该房全部有效卡 + 改房态）。调用前必须让用户二次确认。
    */
-  forceCheckoutCard: (roomNo: string, erase = true) =>
-    invoke<CheckoutResult>('force_checkout_card', { roomNo, erase }),
+  forceCheckoutCard: (roomNo: string, erase = true, clearCheckin = true) =>
+    invoke<CheckoutResult>('force_checkout_card', { roomNo, erase, clearCheckin }),
   /** 退房后要转成的房态 key（设置项） */
   getCheckoutStatus: () => invoke<string>('get_checkout_status'),
   setCheckoutStatus: (status: string) => invoke<void>('set_checkout_status', { status }),
@@ -739,6 +908,10 @@ export const api = {
   getCheckoutHour: () => invoke<number>('get_checkout_hour'),
   setCheckoutHour: (hour: number) =>
     invoke<CheckoutHourResult>('set_checkout_hour', { hour }),
+  /** 凌晨房归属时间（TD-225）：`HH:mm`，默认 06:00 */
+  getMorningCutoff: () => invoke<string>('get_morning_cutoff'),
+  setMorningCutoff: (cutoff: string) =>
+    invoke<MorningCutoffResult>('set_morning_cutoff', { cutoff }),
   setReminderSettings: (enabled: boolean, minutes: number, sound: boolean, voice?: boolean) =>
     invoke<ReminderSettings>('set_reminder_settings', {
       enabled,
@@ -754,7 +927,6 @@ export const api = {
     roomNo: string,
     duration: { days: number } | { hours: number },
     idempotencyKey: string,
-    guest?: GuestInput,
     /** 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效 */
     lost?: boolean,
   ) =>
@@ -763,7 +935,6 @@ export const api = {
       days: 'days' in duration ? duration.days : null,
       hours: 'hours' in duration ? duration.hours : null,
       idempotencyKey,
-      guest: guest ?? null,
       lost: lost ?? false,
     }),
   issueAdminCard: (request: AdminCardRequest, confirm: boolean) =>

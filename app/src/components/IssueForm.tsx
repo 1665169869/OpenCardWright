@@ -1,23 +1,18 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Card, Checkbox, Descriptions, Input, Radio, Select, Space, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Checkbox, Descriptions, Radio, Select, Space, Tag, Typography } from 'antd'
 import {
   api,
   dayOptions,
   describeError,
   formatExpiry,
   formatTime,
-  GENDERS,
   hourOptions,
   GUEST_MAX_DAYS,
   GUEST_MAX_HOURS,
-  ID_TYPES,
-  type GuestInput,
   type IssuedCard,
   type Room,
 } from '../api'
-import { readIdCard } from '../idcard'
 
-const { TextArea } = Input
 const { Text } = Typography
 
 type Mode = 'day' | 'hour'
@@ -33,7 +28,6 @@ export default function IssueForm({
   onIssued,
   defaultDays = 1,
   renewFrom,
-  initialGuest,
   defaultMode = 'day',
   moveNotice = false,
 }: {
@@ -43,8 +37,6 @@ export default function IssueForm({
   defaultDays?: number
   /** 续住时的"当前有效期至"，只用于提示 */
   renewFrom?: string | null
-  /** 换房带入的客人信息（只存库，不写卡） */
-  initialGuest?: GuestInput
   /** 换房带入的时长模式（日租 / 钟点） */
   defaultMode?: Mode
   /** 换房场景：提示旧卡仍能开源房的门，需收回 */
@@ -55,55 +47,43 @@ export default function IssueForm({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<IssuedCard | null>(null)
-  const [guest, setGuest] = useState<GuestInput>(initialGuest ?? {})
-  /** 身份证读卡（TD-135）：独立设备，按钮 loading 与失败提示 */
-  const [idBusy, setIdBusy] = useState(false)
-  const [idError, setIdError] = useState<string | null>(null)
   /** 挂失卡（TD-150）：页1[2] 低 4 位 = 1，让该房间在用卡失效 */
   const [lost, setLost] = useState(false)
   /** 预计退房时刻（HH:mm）。**只影响展示与估算**，不改变写入卡内的天数。
    *  TD-126：初值读「退房钟点」设置项（默认 12），只读展示，改配置去设置页。 */
   const [checkoutTime, setCheckoutTime] = useState('12:00')
+  /** 凌晨房归属时间（TD-225）：早于该时刻开卡，归属日算前一天 */
+  const [morningCutoff, setMorningCutoff] = useState('06:00')
   useEffect(() => {
     void api
       .getCheckoutHour()
       .then((h) => setCheckoutTime(`${String(h).padStart(2, '0')}:00`))
       .catch(() => {})
+    void api
+      .getMorningCutoff()
+      .then(setMorningCutoff)
+      .catch(() => {})
   }, [])
-  const setGuestField = (key: keyof GuestInput, value: string) => {
-    setGuest((prev) => ({ ...prev, [key]: value }))
-  }
-
-  /**
-   * 读身份证（TD-135）：走独立设备的本地 WebSocket，与发卡读卡器无关。
-   * 读到就填表（证件类型固定「身份证」），读不到只提示，不影响手填与发卡。
-   */
-  const onReadIdCard = async () => {
-    setIdBusy(true)
-    setIdError(null)
-    try {
-      const info = await readIdCard()
-      setGuest((prev) => ({ ...prev, ...info, idType: '身份证' }))
-    } catch (e) {
-      setIdError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setIdBusy(false)
-    }
-  }
-
-  const guestHasInput = Object.values(guest).some((v) => (v ?? '').trim() !== '')
   const options = mode === 'day' ? dayOptions(GUEST_MAX_DAYS) : hourOptions(GUEST_MAX_HOURS)
 
-  // 预计退房时间：日租按"入住当天 + N 天的中午 12:00"，钟点按"现在 + N 小时"。
+  // 预计退房时间：日租按"归属日 + N 天的退房钟点"，钟点按"现在 + N 小时"。
   // 这只是估算 —— 卡里只有时长码，锁是从首次刷卡开始计时的。
+  // TD-225：凌晨（早于 morningCutoff）开卡时归属日算前一天，
+  // 所以凌晨 2 点开 1 天卡的预计退房是**当天** 12:00，而不是次日。
   const pad = (n: number) => String(n).padStart(2, '0')
   const fmt = (d: Date) =>
     `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
   const startAt = new Date()
+  /** 当前时刻是否落在凌晨房区间（早于归属时间） */
+  const isEarlyMorning = (() => {
+    const [ch, cm] = morningCutoff.split(':').map((v) => Number(v) || 0)
+    return startAt.getHours() * 60 + startAt.getMinutes() < ch * 60 + cm
+  })()
   const checkoutAt = (() => {
     if (mode === 'hour') return new Date(startAt.getTime() + amount * 3600_000)
     const d = new Date(startAt)
-    d.setDate(d.getDate() + amount)
+    // 归属日：凌晨房从「昨天」起算，于是 +N 天落在当天
+    d.setDate(d.getDate() + amount + (isEarlyMorning ? -1 : 0))
     const [hh, mm] = checkoutTime.split(':').map((v) => Number(v) || 0)
     d.setHours(hh, mm, 0, 0)
     return d
@@ -126,11 +106,9 @@ export default function IssueForm({
         room.roomNo,
         duration,
         crypto.randomUUID(),
-        guestHasInput ? guest : undefined,
         lost,
       )
       setResult(issued)
-      setGuest({})
       onIssued?.()
     } catch (e) {
       setError(describeError(e))
@@ -202,6 +180,15 @@ export default function IssueForm({
           </Space>
         ) : null}
 
+        {mode === 'day' && isEarlyMorning ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={`凌晨入住（早于 ${morningCutoff}）：按前一天归属，1 天卡到「今天」${checkoutTime} 退房`}
+            description="归属时间可在「设置 → 退房钟点 → 凌晨房归属时间」调整。"
+          />
+        ) : null}
+
         <Alert
           type="info"
           showIcon
@@ -218,83 +205,13 @@ export default function IssueForm({
         />
 
         <Space wrap align="center">
-          <Text type="secondary">客人身份（可选，填写后进入入住记录）</Text>
-          <Button size="small" loading={idBusy} onClick={() => void onReadIdCard()}>
-            读取身份证
-          </Button>
           <Checkbox checked={lost} onChange={(e) => setLost(e.target.checked)}>
             挂失卡（让本房间在用卡失效）
           </Checkbox>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            客人身份请在「入住登记」里登记，发卡不再收集
+          </Text>
         </Space>
-        {idError ? (
-          <Alert
-            type="warning"
-            showIcon
-            closable
-            message="读取身份证失败（可以手动填写）"
-            description={idError}
-            onClose={() => setIdError(null)}
-          />
-        ) : null}
-
-        <Space wrap>
-          <Input
-            placeholder="姓名"
-            style={{ width: 130 }}
-            value={guest.name ?? ''}
-            onChange={(e) => setGuestField('name', e.target.value)}
-          />
-          <Select
-            placeholder="性别"
-            allowClear
-            style={{ width: 90 }}
-            value={guest.gender}
-            onChange={(v) => setGuestField('gender', v ?? '')}
-            options={GENDERS.map((g) => ({ value: g, label: g }))}
-          />
-          <Select
-            placeholder="证件类型"
-            allowClear
-            showSearch
-            style={{ width: 190 }}
-            value={guest.idType}
-            onChange={(v) => setGuestField('idType', v ?? '')}
-            options={ID_TYPES.map((t) => ({ value: t, label: t }))}
-          />
-          <Input
-            placeholder="证件号码"
-            style={{ width: 190 }}
-            value={guest.idNumber ?? ''}
-            onChange={(e) => setGuestField('idNumber', e.target.value)}
-          />
-        </Space>
-        <Space wrap>
-          <Input
-            placeholder="民族"
-            style={{ width: 100 }}
-            value={guest.nation ?? ''}
-            onChange={(e) => setGuestField('nation', e.target.value)}
-          />
-          <Input
-            type="date"
-            title="出生日期"
-            style={{ width: 150 }}
-            value={guest.birthDate ?? ''}
-            onChange={(e) => setGuestField('birthDate', e.target.value)}
-          />
-          <Input
-            placeholder="住址"
-            style={{ width: 300 }}
-            value={guest.address ?? ''}
-            onChange={(e) => setGuestField('address', e.target.value)}
-          />
-        </Space>
-        <TextArea
-          rows={2}
-          placeholder="备注"
-          value={guest.note ?? ''}
-          onChange={(e) => setGuestField('note', e.target.value)}
-        />
 
         {!room.active ? <Alert type="warning" showIcon message="该房间已停用，不能发卡" /> : null}
 

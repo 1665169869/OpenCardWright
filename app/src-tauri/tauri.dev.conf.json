@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "门锁发卡台 Dev",
+  "identifier": "io.opencardwright.desktop.dev",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "门锁发卡台 Dev",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1024,
+        "minHeight": 700
+      }
+    ]
+  },
+  "bundle": {
+    "windows": {
+      "wix": {
+        "upgradeCode": "3c9a7f21-6b48-4e2d-8a15-7f0c2b9d4e63"
+      }
+    }
+  }
+}

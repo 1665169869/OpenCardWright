@@ -14,7 +14,24 @@ export default function RoomsPanel({ onChanged }: { onChanged?: () => void }) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [report, setReport] = useState<ImportReport | null>(null)
+  const [exportBusy, setExportBusy] = useState(false)
+  const [exportMsg, setExportMsg] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
+
+  /** 导出在用房间的序号对照表：给外部脚本按 room_index 反查房号用。 */
+  const exportIndex = async () => {
+    setExportBusy(true)
+    setErr(null)
+    setExportMsg(null)
+    try {
+      const r = await api.exportRoomIndexJson()
+      setExportMsg(`已导出 ${r.rows} 条房间序号 → ${r.path}`)
+    } catch (e) {
+      setErr(describeError(e))
+    } finally {
+      setExportBusy(false)
+    }
+  }
 
   const pick = async (file: File | null) => {
     if (!file) return
@@ -43,14 +60,17 @@ export default function RoomsPanel({ onChanged }: { onChanged?: () => void }) {
           留空时序号自动分配。首行写「房号,…」会当表头跳过。
         </Paragraph>
         <Paragraph style={{ marginBottom: 0 }}>
-          <Text strong>ini</Text>：<Text code>房号=序号</Text>（与运行目录的 `RoomIndex.ini` 同格式），
-          `;`/`#` 开头是注释。
+          <Text strong>ini</Text>：<Text code>房号=序号</Text>（与旧版 `RoomIndex.ini` 同格式，
+          仅作导入模板；程序运行时不读任何 ini），`;`/`#` 开头是注释。
         </Paragraph>
       </Card>
 
       <Space wrap>
         <Button type="primary" loading={busy} onClick={() => fileRef.current?.click()}>
           选择文件并导入…
+        </Button>
+        <Button loading={exportBusy} onClick={() => void exportIndex()}>
+          导出 room_index.json
         </Button>
         <input
           ref={fileRef}
@@ -65,6 +85,8 @@ export default function RoomsPanel({ onChanged }: { onChanged?: () => void }) {
       </Space>
 
       {err ? <Alert type="error" showIcon message="导入失败" description={err} /> : null}
+
+      {exportMsg ? <Alert type="success" showIcon message={exportMsg} /> : null}
 
       {report ? (
         <Card size="small" title="导入结果">

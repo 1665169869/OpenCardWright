@@ -94,7 +94,7 @@ pub fn import_nacre_rooms(conn: &DbConnection, path: &Path) -> Result<usize, Str
         let index = row
             .get("FFhbh")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.trim().parse::<u8>().ok())
+            .and_then(|s| s.trim().parse::<u16>().ok())
             // 序号已被占用就让 insert_room 自动分配下一个
             .filter(|i| matches!(ocw_store::find_room_by_index(conn, *i), Ok(None)));
 

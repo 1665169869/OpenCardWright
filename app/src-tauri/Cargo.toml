@@ -1,6 +1,6 @@
 [package]
 name = "opencardwright"
-version = "26.11.1012"
+version = "1.4.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
@@ -8,6 +8,10 @@ description = "Open-source card issuing console for 125 kHz hotel door locks"
 
 [workspace]
 members = ["crates/ocw-device", "crates/ocw-store"]
+# 硬件兼容层以 git submodule 引入（vendor/rc-device）。它是独立仓库、独立版本节奏，
+# 不加入本 workspace：否则 `cargo test --workspace` 会连带跑它的 32 位真机测试，
+# 而且两边的 clippy/lint 配置也不该互相牵制。
+exclude = ["vendor/rc-device"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -15,6 +19,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2"
+# 到期提醒走 Windows 原生 toast（TD-228）；与 tauri-plugin-single-instance 同一大版本
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 argon2 = "0.5"
@@ -24,8 +30,15 @@ chrono = { version = "0.4", features = ["clock"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 # CSV 导出目录：走 Windows Known Folder（桌面可能被重定向到 D 盘 / OneDrive）
 dirs = "7"
+# 房号 CSV 导入：Excel 在中文 Windows 上写 GBK，需要 UTF-8 失败后回落解码
+encoding_rs = "0.8"
+# 驱动指纹：打开 LC32RFRW.dll 现算 SHA-256（硬件层不再生成 manifest.json）
+sha2 = "0.10"
 ocw-device = { path = "crates/ocw-device" }
 ocw-store = { path = "crates/ocw-store" }
+# 硬件兼容层（门锁卡驱动 + 身份证读卡器 + 卡字节编解码）。以 git submodule 引入，
+# 产品侧只通过它的 typed API 与 sidecar 协议接触硬件，不再自己维护卡格式。
+rc-device = { path = "vendor/rc-device" }
 
 [features]
 # 发布构建必须带上：不打这个 feature，程序会当成 dev 壳去连 devUrl（localhost:5173），
